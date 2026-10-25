@@ -1,122 +1,93 @@
 # 策环（cehuan-quant）
 
-策环是一个本地运行的 A 股量化研究与人工审核命令行工具。第一阶段支持 AKShare 历史日线适配、数据质量检查、技术基线回测、交易计划文件和华泰导出 CSV 复盘模板。
+策环是一个面向 A 股的个人量化研究项目。它希望把分散的研究步骤连成一条可复核的链路：
 
-**系统只生成研究材料和待审核计划，不连接华泰账户、不读取账户凭据、不自动下单。** 回测、模拟、研究候选和真实账户结果分别记录。任何收益指标都不代表未来表现。
+**行情数据 → 特征与候选 → 历史验证 → 人工审核计划 → 手动交易 → 成交复盘 → 下一轮研究**
 
-## 一页实施方案与技术风险
+项目关注的是研究过程是否清楚、假设是否明确、结果是否可复现。它不承诺收益，也不把模型输出包装成确定的价格预测。
 
-| 顺序 | 实施范围 | 选择 |
-|---|---|---|
-| 1 | 数据底座 | Python 3.11、`uv` 锁依赖；AKShare 通过适配器提供统一字段 |
-| 2 | 可复现技术基线 | 20 日动量排名、配置化调仓/仓位/费用/交易单位；信号取收盘后数据，回测最早下一交易日开盘执行 |
-| 3 | 审核计划和人工复盘 | 独立 CSV/Markdown 文件；成交模板按计划汇总未成交、成交数量、VWAP 差异与费用 |
-| 4 | Qlib/RD-Agent 和可选插件 | Qlib 用隔离 extra 验证静态数据加载；RD-Agent 独立环境，待数据和样本外流程稳定后再接入；TradingAgents、TradingView 保持关闭 |
+## 交易预测如何生成
 
-主要技术风险：AKShare/Eastmoney 是公开网页数据接口，字段或访问可能变化；日线数据按 AKShare 文档应收盘后取用；单只行情接口不提供历史 ST、上市状态、停牌日和交易所日历，股票池必须有时点正确的证券状态才能形成可执行计划；不同板块及 ST 的涨跌幅随证券类别和规则日期变化；只使用当前股票列表会有幸存者偏差；未建模的分红、送转等公司行动会影响按原始价格结算的回测。系统会保留未知状态并阻止其成为可直接审核下单的候选，不把缺失状态默认为正常股票。
+当前基线是一个可解释的动量排名流程，用于验证数据和研究链路，不代表经过验证的盈利策略。
 
-## 环境实测记录
+### 1. 统一行情与交易状态
 
-当前执行环境实测为 **Arch Linux x86_64、系统 Python 3.14.6、uv 0.11.32**，不是 macOS；目录最初为空、没有 Git 仓库。Qlib 官方 README 列出的支持范围为 Python 3.8–3.12，Qlib 在 Apple Silicon 上构建 LightGBM 可能需要 `brew install libomp`。本项目因此固定 Python 3.11；仓库在 Linux 实测，macOS 需在你的 MacBook 上执行下方安装命令复核。
+AKShare 的历史日线经适配后转换为统一字段。原始未复权 OHLC 用于参考价格和回测成交模拟；后复权收盘价用于减少公司行动对动量连续性的影响。成交量统一为股，证券代码统一为带交易所前缀的形式。
 
-## 安装
+行情本身不能证明某个日期的 ST、上市、停牌、板块或涨跌幅状态。相关信息需通过带生效日期和来源的证券主数据提供。缺少这些信息时，候选会进入 `VERIFY` 或 `HOLD`，不会被当作可执行买卖建议。
 
-需要 `uv` 和 Git。项目 Python 版本由 `.python-version` 固定为 3.11，`uv.lock` 固定解析依赖版本。
+### 2. 计算并排名信号
 
-```bash
-cd ~/Projects/cehuan-quant
-uv sync
-uv run cehuan --help
+对每只符合配置条件的证券，基线计算过去 *L* 个交易日的后复权动量：
+
+```text
+momentum(i, t, L) = adjusted_close(i, t) / adjusted_close(i, t-L) - 1
 ```
 
-安装可选 Qlib 读取器（不安装 RD-Agent、TradingAgents 或 TradingView 客户端）：
+再按动量从高到低排序，并应用配置中的最小动量门槛、最大持仓数和股票状态过滤。当前默认窗口为 20 个交易日；窗口、筛选条件和持仓规则都可配置。
 
-```bash
-uv sync --extra qlib
-uv run cehuan qlib-check --data examples/demo_daily.csv
-uv run cehuan qlib-signals --data examples/demo_daily.csv
+这个信号是相对强弱排名，不是对未来价格或收益的保证，也不单独决定是否应当交易。
+
+### 3. 从排名形成目标仓位
+
+选中证券按组合风险配置分配目标权重：
+
+```text
+单只目标权重 = min(单只仓位上限, 总敞口上限 / 入选证券数)
 ```
 
-Apple Silicon 如果 Qlib 安装时 LightGBM 编译失败，先 `brew install libomp` 再运行 `uv sync --extra qlib`。当前没有在 macOS 主机实测该步骤。
+目标股数根据用户提供的现金、持仓快照和参考价格估算，并按证券当日有效的买入数量规则取整。卖出计划受持仓快照中的可卖数量约束，以避免超过 T+1 可卖股数。没有用户提供的资金或风险偏好时，系统不会代替用户设定账户规模；配置中的示例数值只是技术占位参数。
 
-## 从 MacBook SSH 使用 Arch 上的项目
+### 4. 标注信号时点与执行边界
 
-从 MacBook 登录 Arch 后直接运行 CLI，研究数据与输出保存在 Arch 项目目录：
+日线策略只使用截至 *t* 日收盘的数据。收盘数据按 15:00 后可用处理，因此 *t* 日信号最早在下一交易日审核和执行。计划中的最近收盘价只是参考价；交易日历、开盘价格、停复牌、涨跌停和实际可成交情况仍需人工复核。
 
-```bash
-ssh 用户名@Arch服务器地址
-cd ~/Projects/cehuan-quant
-uv run cehuan --help
+交易计划列出证券、动作、目标股数、目标权重、参考价、触发依据、数据截止时间和主要风险。计划只写入 CSV/Markdown 文件，不连接华泰账户、不读取账户凭据，也不会自动下单。
+
+## 回测与实际交易如何区分
+
+回测用 *t* 日收盘产生的信号，在下一交易日开盘价模拟执行；信号使用后复权价格，成交模拟使用原始 OHLC，并读取可配置的费用、滑点、交易单位和价格限制。日线数据无法还原盘口队列，因此模拟成交不等于真实可成交。
+
+每次实验记录策略配置和哈希、数据快照哈希、代码提交、数据区间、交易明细、阻断订单、权益曲线和评估指标。固定规则基线会输出按时间顺序划分的开发、验证和测试区间；它没有训练模型，也尚未实现滚动样本外检验。时间切分本身不能消除研究者事后调参带来的偏差。
+
+导入成交 CSV 后，复盘会对照计划与实际成交，统计未成交数量、成交均价偏差和费用；若提供持仓快照，还会核对持仓数量与计划目标，并在成本价和现价齐全时计算浮动盈亏。复盘结论只解释输入数据支持的事实，不会因单次盈亏自动切换策略。
+
+回测结果、研究候选、模拟结果和真实账户结果分别保存。它们不能互相替代，也不能据历史收益推断未来表现。
+
+## 市场规则与研究风险
+
+不同板块、风险状态和规则生效日期可能有不同的涨跌幅及申报数量要求。项目将 `has_price_limit`、`price_limit_pct`、买卖最小数量和递增单位保存在有效日期证券主数据中，不把统一的 10% 涨跌幅或 100 股交易单位套用到所有证券。配置默认值只允许作为明确标注的回测假设。
+
+当前研究链路仍有以下限制：
+
+- AKShare/Eastmoney 接口可能变化或暂时无法连接，必须检查数据更新时间、字段和质量。
+- 历史停牌行、ST 状态、板块变化和证券规则需要可靠的点时数据；当前股票列表不能代替历史股票池，幸存者偏差尚未解决。
+- 初版回测未完整处理现金分红、送转、配股、退市和历史指数成分。
+- 日线 OHLC 无法准确模拟涨跌停队列、流动性、滑点和真实成交。
+- 当前 Qlib 接入用于读取标准数据和计算基线动量特征，尚未训练模型；RD-Agent、TradingAgents 和 TradingView 仍是待验证的可选研究组件。
+- 华泰成交和持仓目前通过用户导出的 CSV 导入；没有假设账户具备程序化交易权限。
+
+费用、风险参数、策略窗口和市场规则均为可更新配置。正式研究前应核实交易所当期规则、华泰账户实际费用和数据来源。市场规则的来源与字段说明见[市场规则口径](docs/market-rules.md)，数据时点和字段约定见[数据规范](docs/data-contract.md)。
+
+## 示例结果的边界
+
+仓库中的 `examples/demo_daily.csv` 是 4 个虚构证券、720 行的合成行情，只用于验证程序链路。该样例的全区间基线累计收益约 3.40%，输入股票池等权比较基准约 11.04%；两者都不是 A 股实盘或真实历史策略的结果。完整样例、复盘输出和限制见[合成闭环示例](docs/example-run.md)。
+
+## 项目结构
+
+```text
+src/cehuan/
+  data/           数据源适配、规范化和质量检查
+  signals/        动量排名与人工审核交易计划
+  backtest/       规则基线回测与区间评估
+  research/       Qlib 静态数据与特征接入
+  review/         成交和持仓 CSV 复盘
+  integrations/   可选研究插件入口
+  cli/            本地命令入口
+configs/          策略、费用、风险和列映射配置
+docs/             架构、数据口径和集成说明
+examples/         合成行情与 CSV 模板
+tests/            时间边界、交易规则和数据转换用例
 ```
 
-当前阶段通过 CLI 执行任务，SSH 会话退出后已生成的文件仍保存在 Arch 项目目录。
-
-## 运行闭环示例
-
-仓库带有**合成演示数据**，其中 SIM 开头的代码不是 A 股代码：
-
-```bash
-uv run cehuan backtest --data examples/demo_daily.csv --cash 100000
-uv run cehuan plan --data examples/demo_daily.csv --cash 100000
-uv run cehuan review --plan outputs/latest_plan.csv --fills examples/fills_template.csv
-```
-
-如果同时导入成交后持仓快照，可附加 `--positions <持仓CSV>`；报告会增加实际股数与计划目标差异，以及输入成本价/现价可计算的浮动盈亏。
-
-输出写入 `outputs/`（Git 忽略），包括 `backtest_metrics.json`、`trades.csv`、`latest_plan.csv`、`latest_plan.md`、`review.csv` 和 `review.md`。演示用的 100,000 元仅为合成样例输入，不是对你账户资金的假设。
-
-获取单只股票日线示例：
-
-```bash
-uv run cehuan fetch --symbol 600519 --start 20250101 --end 20251231
-```
-
-有限股票池在 `configs/stock_pool_template.csv` 中填入代码和名称后，可一次按顺序获取；默认最多 50 个代码，完整性或质量检查失败时不会写入新的池数据文件：
-
-```bash
-uv run cehuan fetch-pool --universe configs/stock_pool_template.csv \
-  --start 20250101 --end 20251231 \
-  --security-master data/private/security_master.csv
-```
-
-AKShare 文档说明该接口数据按日更新，当日收盘价应在收盘后取得；返回量单位是“手”，适配器转成“股”，成交额单位为元。接口使用原始价和后复权价两次读取：原始价用于计划参考价/成交价格约束，后复权收盘价用于连续性较好的动量特征。单只股票抓取结果缺少历史 ST 和上市状态，所以这条命令仅验证行情接口与规范化；状态未知的标的不能进入可执行计划。
-
-## 配置和研究口径
-
-股票池、动量窗口、调仓节奏、仓位上限、回测缺省涨跌幅与交易单位、费用、现金和基准口径均在 `configs/default.toml`。证券实际交易规则应通过带有效期和来源的证券主数据提供；规则缺失时计划只给出 `VERIFY`，不能作为下单依据。默认值是技术占位假设，配置不会从华泰账户读取资金。
-
-日线基线的时间顺序：收盘后读取日期为 *t* 的日线并计算信号，最早于下一交易日 *t+1* 开盘审核执行。AKShare 日线没有历史停牌行时，不能仅靠行情表准确构建交易所日历；历史 ST、涨跌幅区间和板块交易单位需带生效日期的证券主数据。现阶段计划会在这些规则不全时输出 `VERIFY`/`HOLD`，回测缺失规则时则使用显式标注的研究配置假设。配置费用、板块规则与交易单位并非固定真值，使用前要核对当日交易所规则、华泰订单限制和账户实际费率，详见 [市场规则口径](docs/market-rules.md)。
-
-Qlib 暂以官方 `StaticDataLoader` 读取项目导出的 Parquet 多级索引数据，避免把 Qlib 原始行情文件格式混入业务层；它是 Qlib 数据层接入示例，不声称已完成模型训练或成熟的组合回测。RD-Agent 的 fin_quant 模板需要其自己的 Qlib provider 数据路径、实验配置和模型服务；目前仅记录集成入口，不克隆/安装上游仓库、不把候选直接转成交易指令。TradingAgents 原版依赖 Yahoo Finance 等外部时点数据，未证明 A 股历史时点适配前禁用；tradingview-mcp 亦待验证 A 股覆盖与时间戳后再接入。
-
-## 华泰 CSV 模板
-
-- `examples/fills_template.csv`：成交日期、委托/成交编号、代码、方向、数量、成交价、费用、计划编号、成本价（卖出计算已实现盈亏用）。
-- `examples/positions_template.csv`：快照日期、代码、名称、持仓数量、可卖数量、成本价、最新价；复盘时用 `--positions` 导入。
-- `examples/security_master_template.csv`：代码、名称、板块、有效起止日期、ST/上市/停牌状态、是否有限价、涨跌幅、买卖数量规则及来源。
-- `configs/stock_pool_template.csv`：你维护的有限证券池，包含代码和名称。
-
-实际华泰导出文件格式未知，所以先用通用 CSV 列模板；`configs/huatai_columns.toml` 提供成交与持仓的列名别名及买卖值映射，按你的导出表头编辑后使用 `--mapping configs/huatai_columns.toml`。证券主数据需由你提供带有效日期的可靠来源，不要把当前状态向历史回填。不要把真实成交、持仓、账户资料、密钥或大体量行情放进 Git。
-
-将真实状态文件保存在 Git 忽略的本地目录后，可这样应用：
-
-```bash
-uv run cehuan fetch --symbol 600519 --start 20250101 --end 20251231 \
-  --security-master data/private/security_master.csv
-uv run cehuan plan --data data/private/raw/600519_daily.csv --cash 100000 \
-  --security-master data/private/security_master.csv --positions data/private/positions.csv
-```
-
-示例中的现金数值须替换为你主动设定的研究预算；程序不会读取账户余额。
-
-## 阶段验收
-
-1. `uv run cehuan fetch ...` 返回规范字段且重复/价格检查无错误；失败时保存错误信息，不静默生成计划。
-2. `uv run cehuan backtest ...` 输出带数据区间、调仓成本、样本限制和基准口径的回测文件。
-3. `uv run cehuan plan ...` 生成独立审核文件、明确数据截止时间和最早执行时点。
-4. `uv run cehuan review ...` 对照计划和成交模板，报告偏差并保留缺失字段。
-5. `uv run pytest` 检查时间边界、交易单位、涨跌停阻断和计划成交汇总。
-6. `uv run cehuan qlib-check ...`（安装 qlib extra 后）使用 Qlib StaticDataLoader 读取同一标准化数据。
-
-详见 [架构说明](docs/architecture.md)、[数据口径](docs/data-contract.md) 和 [实验记录规范](docs/experiments.md)。
-另见 [完整合成示例结果](docs/example-run.md)、[RD-Agent fin_quant 调查](docs/rdagent-integration.md) 和 [可选 Agent/行情插件核验清单](docs/optional-integrations.md)。
+更多设计背景见[架构说明](docs/architecture.md)、[实验记录规范](docs/experiments.md)、[RD-Agent 接入调查](docs/rdagent-integration.md)和[可选插件核验清单](docs/optional-integrations.md)。
