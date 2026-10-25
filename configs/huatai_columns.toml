@@ -1,0 +1,24 @@
+# Update the aliases below to match the column headers in your own Huatai CSV export.
+# Keep the canonical names (trade_date, symbol, side, quantity, price, ...) as the values.
+
+[fills]
+trade_date = ["成交日期", "成交时间", "日期"]
+order_id = ["委托编号", "委托合同号", "成交编号"]
+symbol = ["证券代码", "股票代码"]
+side = ["买卖方向", "买卖标志", "操作类型", "direction"]
+quantity = ["成交数量", "成交股数", "成交总量"]
+price = ["成交价格", "成交均价", "成交单价"]
+fees_cny = ["费用", "手续费", "佣金税费"]
+cost_basis_per_share = ["成本价", "持仓成本价", "摊薄成本价"]
+
+[positions]
+symbol = ["证券代码", "股票代码"]
+shares = ["持仓数量", "股票余额", "当前持仓"]
+available_to_sell = ["可用数量", "可卖数量", "股份可用余额"]
+average_cost = ["成本价", "持仓成本价", "摊薄成本价"]
+last_price = ["最新价", "市价", "当前价"]
+name = ["证券名称", "股票名称"]
+
+[side_values]
+B = "BUY"
+S = "SELL"

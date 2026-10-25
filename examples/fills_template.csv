@@ -1,0 +1,2 @@
+trade_date,order_id,symbol,side,quantity,price,fees_cny,cost_basis_per_share
+2025-09-01,DEMO-001,SIM001,BUY,100,20.00,5.01,

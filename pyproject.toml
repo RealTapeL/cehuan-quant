@@ -1,0 +1,31 @@
+[project]
+name = "cehuan-quant"
+version = "0.1.0"
+description = "A local, human-reviewed A-share quantitative research workbench"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "akshare==1.19.3",
+    "numpy>=1.26,<3",
+    "pandas>=2.2,<3",
+]
+
+[project.optional-dependencies]
+qlib = ["pyqlib==0.9.7", "pyarrow>=17,<26"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+cehuan = "cehuan.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cehuan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
