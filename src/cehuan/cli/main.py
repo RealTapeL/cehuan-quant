@@ -10,7 +10,7 @@ import pandas as pd
 
 from cehuan.backtest.engine import run_backtest
 from cehuan.config import load_config
-from cehuan.data.akshare_adapter import AKShareProvider
+from cehuan.data.akshare_adapter import make_akshare_provider
 from cehuan.data.canonical import read_bars, write_bars
 from cehuan.data.quality import check_data_quality
 from cehuan.data.pool import fetch_pool_daily
@@ -34,6 +34,11 @@ def _write_json(value: object, path: Path) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
+def _provider_for(config: dict[str, object], source: str | None):
+    configured = str(config.get("data", {}).get("provider", "eastmoney"))
+    return make_akshare_provider(source or configured)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cehuan", description="策环：本地量化研究与人工审核工具")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -43,6 +48,9 @@ def _parser() -> argparse.ArgumentParser:
     fetch.add_argument("--start", required=True, help="YYYYMMDD")
     fetch.add_argument("--end", required=True, help="YYYYMMDD")
     fetch.add_argument("--name")
+    fetch.add_argument("--source", choices=("eastmoney", "tencent"), help="行情来源；默认读取配置")
+    fetch.add_argument("--max-age-days", type=int, help="可选的最大日历日滞后；未提供交易日历时仅作粗略检查")
+    fetch.add_argument("--calendar", help="可选交易日历 CSV，用于检查行情日期覆盖")
     fetch.add_argument("--output")
     fetch.add_argument("--security-master", help="带有效日期的证券状态 CSV")
 
@@ -51,10 +59,15 @@ def _parser() -> argparse.ArgumentParser:
     fetch_pool.add_argument("--start", required=True, help="YYYYMMDD")
     fetch_pool.add_argument("--end", required=True, help="YYYYMMDD")
     fetch_pool.add_argument("--security-master")
+    fetch_pool.add_argument("--source", choices=("eastmoney", "tencent"), help="行情来源；默认读取配置")
+    fetch_pool.add_argument("--max-age-days", type=int, help="可选的最大日历日滞后；未提供交易日历时仅作粗略检查")
+    fetch_pool.add_argument("--calendar", help="可选交易日历 CSV，用于检查行情日期覆盖")
     fetch_pool.add_argument("--output", default="data/private/raw/pool_daily.csv")
 
     quality = subs.add_parser("quality", help="检查规范化日线 CSV")
     quality.add_argument("--data", required=True)
+    quality.add_argument("--max-age-days", type=int, help="可选的最大日历日滞后；未提供交易日历时仅作粗略检查")
+    quality.add_argument("--calendar", help="交易日历 CSV，用于检查行情日期覆盖")
 
     backtest = subs.add_parser("backtest", help="运行技术基线回测")
     backtest.add_argument("--data", required=True)
@@ -68,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--positions")
     plan.add_argument("--config")
     plan.add_argument("--security-master")
+    plan.add_argument("--calendar", help="可选交易日历 CSV；提供后标记下一个开市日")
     plan.add_argument("--mapping")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
@@ -93,10 +107,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "fetch":
-            bars = AKShareProvider().fetch_daily(args.symbol, args.start, args.end, name=args.name)
+            config = load_config()
+            bars = _provider_for(config, args.source).fetch_daily(args.symbol, args.start, args.end, name=args.name)
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
-            quality = check_data_quality(bars, large_change_warning=float(load_config()["data"]["large_daily_price_change_warning"]))
+            quality = check_data_quality(
+                bars,
+                max_age_days=args.max_age_days,
+                large_change_warning=float(config["data"]["large_daily_price_change_warning"]),
+                calendar=pd.read_csv(args.calendar, dtype=str) if args.calendar else None,
+            )
             output = Path(args.output) if args.output else REPO_ROOT / "data" / "private" / "raw" / f"{args.symbol}_daily.csv"
             write_bars(bars, output)
             print(json.dumps({"saved_to": str(output), "quality": quality}, ensure_ascii=False, indent=2))
@@ -106,13 +126,18 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             universe = pd.read_csv(args.universe, dtype={"symbol": str})
             bars = fetch_pool_daily(
-                AKShareProvider(), universe, args.start, args.end,
+                _provider_for(config, args.source), universe, args.start, args.end,
                 max_symbols=int(config["data"].get("max_symbols_per_fetch", 50)),
                 delay_seconds=float(config["data"].get("request_delay_seconds", 0.25)),
             )
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
-            quality = check_data_quality(bars, large_change_warning=float(config["data"]["large_daily_price_change_warning"]))
+            quality = check_data_quality(
+                bars,
+                max_age_days=args.max_age_days,
+                large_change_warning=float(config["data"]["large_daily_price_change_warning"]),
+                calendar=pd.read_csv(args.calendar, dtype=str) if args.calendar else None,
+            )
             if not quality["healthy"]:
                 raise ValueError("股票池数据质量检查未通过：" + "；".join(quality["errors"]))
             output = Path(args.output)
@@ -124,7 +149,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "quality":
             config = load_config()
-            quality = check_data_quality(read_bars(args.data), large_change_warning=float(config["data"]["large_daily_price_change_warning"]))
+            quality = check_data_quality(
+                read_bars(args.data),
+                max_age_days=args.max_age_days,
+                large_change_warning=float(config["data"]["large_daily_price_change_warning"]),
+                calendar=pd.read_csv(args.calendar, dtype=str) if args.calendar else None,
+            )
             print(json.dumps(quality, ensure_ascii=False, indent=2))
             return 0 if quality["healthy"] else 2
 
@@ -154,7 +184,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
             positions = read_positions(args.positions, args.mapping) if args.positions else None
-            plan_frame = generate_plan(bars, args.cash, config, positions)
+            calendar = pd.read_csv(args.calendar, dtype=str) if args.calendar else None
+            plan_frame = generate_plan(bars, args.cash, config, positions, calendar=calendar)
             plan_id = str(plan_frame["plan_id"].iloc[0]) if not plan_frame.empty else "empty-plan"
             folder = REPO_ROOT / "outputs" / "plans" / plan_id
             folder.mkdir(parents=True, exist_ok=True)

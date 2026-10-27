@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import re
 
+from cehuan.data.adjustment import select_signal_prices
+from cehuan.data.calendar import validate_bars_against_calendar
 from cehuan.data.canonical import PRICE_COLUMNS, REQUIRED_BAR_COLUMNS, normalize_bar_frame
 
 
@@ -10,6 +12,7 @@ def check_data_quality(
     frame: pd.DataFrame,
     max_age_days: int | None = None,
     large_change_warning: float = 0.50,
+    calendar: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     data = normalize_bar_frame(frame)
     errors: list[str] = []
@@ -34,6 +37,17 @@ def check_data_quality(
     duplicate_count = int(data.duplicated(["trade_date", "symbol"]).sum())
     if duplicate_count:
         errors.append(f"交易日与证券代码重复 {duplicate_count} 行")
+    if data["data_source"].notna().any():
+        mixed_sources: list[str] = []
+        for symbol, group in data.groupby("symbol", sort=False):
+            sources = sorted(set(group["data_source"].dropna().astype(str)))
+            if len(sources) > 1:
+                mixed_sources.append(f"{symbol} ({', '.join(sources)})")
+        if mixed_sources:
+            errors.append(
+                "同一证券混用了多个行情来源，禁止直接拼接价格/复权序列："
+                + "; ".join(mixed_sources[:10])
+            )
     null_required = sum(missing_counts.values())
     if null_required:
         errors.append(f"必需行情字段存在 {null_required} 个空值")
@@ -73,12 +87,33 @@ def check_data_quality(
             warnings.append(f"{label}缺失；不能生成可执行计划，回测仅可按配置假设")
     if data["adjusted_close"].isna().all():
         warnings.append("没有后复权收盘价；动量信号将回退到原始收盘价，需检查公司行动影响")
+    else:
+        _, adjustment_modes = select_signal_prices(data)
+        unusable_adjustment = [
+            symbol for symbol, mode in adjustment_modes.items()
+            if mode == "unusable_mixed_or_nonpositive_adjustment"
+        ]
+        if unusable_adjustment:
+            warnings.append(
+                "部分股票的后复权收盘价有缺失或非正值；这些股票的信号暂不计算，须核对复权数据："
+                + ", ".join(unusable_adjustment[:10])
+            )
+    available_at = pd.to_datetime(data["available_at"], errors="coerce", utc=True)
+    retrieved_at = pd.to_datetime(data["retrieved_at_utc"], errors="coerce", utc=True)
+    retrieved_before_available = available_at.notna() & retrieved_at.notna() & (retrieved_at < available_at)
+    if retrieved_before_available.any():
+        warnings.append(
+            f"有 {int(retrieved_before_available.sum())} 行在标记的日线可用时间前已拉取；最新交易日数据需收盘后重新获取"
+        )
     as_of = data["trade_date"].max().isoformat() if not data.empty and data["trade_date"].notna().any() else None
     if max_age_days is not None and as_of:
         age = (pd.Timestamp.now(tz="Asia/Shanghai").date() - pd.Timestamp(as_of).date()).days
         if age > max_age_days:
             warnings.append(f"最新行情日期距今天数为 {age}，请确认数据更新")
     retrieved = data["retrieved_at_utc"].dropna()
+    calendar_result = validate_bars_against_calendar(data, calendar) if calendar is not None else None
+    if calendar_result is not None:
+        errors.extend(calendar_result["errors"])
     return {
         "healthy": not errors,
         "row_count": int(len(data)),
@@ -87,8 +122,10 @@ def check_data_quality(
         "missing_required": missing_counts,
         "as_of": as_of,
         "retrieved_at_utc": str(retrieved.max()) if not retrieved.empty else None,
+        "retrieved_before_available_count": int(retrieved_before_available.sum()),
         "errors": errors,
         "warnings": warnings,
         "calendar_note": "未提供交易所交易日历时，不对非交易日缺口作结论。",
+        "calendar_validation": calendar_result,
         "large_daily_price_change_warning": large_change_warning,
     }

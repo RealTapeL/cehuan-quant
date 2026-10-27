@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from cehuan.data.adjustment import select_signal_prices
 from cehuan.data.canonical import normalize_bar_frame
 
 
@@ -15,10 +16,11 @@ def export_qlib_frame(frame: pd.DataFrame, target: str | Path) -> Path:
     available in canonical data and are not used as live order prices.
     """
     data = normalize_bar_frame(frame)
-    factor = data["adjusted_close"].div(data["close"]).where(data["adjusted_close"].notna(), 1.0)
+    signal_prices, _ = select_signal_prices(data)
+    factor = signal_prices.div(data["close"]).where(data["close"] > 0)
     qlib = pd.DataFrame({
         "open": data["open"] * factor,
-        "close": data["adjusted_close"].where(data["adjusted_close"].notna(), data["close"]),
+        "close": signal_prices,
         "high": data["high"] * factor,
         "low": data["low"] * factor,
         "volume": data["volume_shares"].div(factor),

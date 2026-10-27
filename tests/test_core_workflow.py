@@ -7,7 +7,9 @@ import pandas as pd
 
 from cehuan.backtest.engine import run_backtest
 from cehuan.config import load_config
-from cehuan.data.akshare_adapter import normalize_akshare_history
+from cehuan.data.adjustment import select_signal_prices
+from cehuan.data.akshare_adapter import normalize_akshare_history, normalize_tencent_history
+from cehuan.data.calendar import next_open_session, validate_bars_against_calendar
 from cehuan.data.canonical import canonical_symbol
 from cehuan.data.pool import fetch_pool_daily
 from cehuan.review.reconcile import (
@@ -18,6 +20,7 @@ from cehuan.review.reconcile import (
 )
 from cehuan.research.qlib_bridge import calculate_qlib_momentum
 from cehuan.signals.plan import generate_plan
+from cehuan.signals.strategy import add_momentum
 
 
 def bars(days: int = 16, locked_buy_day: int | None = None, st_unknown: bool = False) -> pd.DataFrame:
@@ -200,6 +203,91 @@ def test_akshare_volume_units_and_unknown_history_flags_are_preserved() -> None:
     assert pd.isna(row["is_suspended"])
     assert "15:00:00" in row["available_at"]
     assert row["symbol"] == "SH600519"
+
+
+def test_tencent_history_normalizes_share_volume_and_distinct_column_names() -> None:
+    raw = pd.DataFrame([{
+        "date": "2026-10-23", "open": 1311.84, "high": 1343.88,
+        "low": 1310.0, "close": 1335.0, "volume": 5_768_600,
+        "turnover": 0.0046, "amount": 7_677_216_283.0,
+    }])
+    adjusted = pd.DataFrame([{"date": "2026-10-23", "close": 9316.38}])
+    result = normalize_tencent_history(
+        raw, adjusted, "sh600519", "贵州茅台", "2026-10-27T02:00:00+00:00"
+    )
+    row = result.iloc[0]
+    assert row["symbol"] == "SH600519"
+    assert row["volume_shares"] == 5_768_600
+    assert row["amount_cny"] == 7_677_216_283.0
+    assert row["adjusted_close"] == 9316.38
+    assert row["data_source"] == "akshare.stock_zh_a_hist_tx"
+
+
+def test_partial_adjusted_prices_do_not_mix_with_raw_prices_for_signals() -> None:
+    data = bars(16)
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-08"), "adjusted_close"] = pd.NA
+    selected, modes = select_signal_prices(data)
+    assert modes["SIM001"] == "unusable_mixed_or_nonpositive_adjustment"
+    assert selected.loc[data["symbol"] == "SIM001"].isna().all()
+    signalled = add_momentum(data, 3)
+    assert signalled.loc[signalled["symbol"] == "SIM001", "momentum"].isna().all()
+    assert signalled.loc[signalled["symbol"] == "SIM002", "momentum"].notna().any()
+
+
+def test_data_quality_rejects_mixed_price_sources_for_one_security() -> None:
+    data = bars(4)
+    data.loc[data["symbol"] == "SIM001", "data_source"] = "synthetic_source_a"
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-04"), "data_source"] = "synthetic_source_b"
+    from cehuan.data.quality import check_data_quality
+
+    quality = check_data_quality(data)
+    assert quality["healthy"] is False
+    assert any("混用了多个行情来源" in message for message in quality["errors"])
+
+
+def test_calendar_validates_bar_dates_and_resolves_next_open_session() -> None:
+    data = bars(3)
+    calendar = pd.DataFrame({
+        "cal_date": [20250101, 20250102, 20250103, 20250104, 20250106],
+        "is_open": [1, 1, 1, 0, 1],
+        "pretrade_date": [pd.NA, 20250101, 20250102, 20250103, 20250103],
+        "source": ["synthetic_calendar"] * 5,
+    })
+    result = validate_bars_against_calendar(data, calendar)
+    assert result["healthy"] is True
+    assert result["bar_date_count"] == 3
+    assert next_open_session(calendar, "2025-01-03") == ("2025-01-06", "synthetic_calendar")
+
+
+def test_plan_records_next_open_day_and_calendar_source() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    data = bars(16)
+    dates = pd.date_range("2025-01-01", periods=17, freq="D")
+    calendar = pd.DataFrame({
+        "trade_date": dates.strftime("%Y-%m-%d"),
+        "is_open": True,
+        "source": "synthetic_calendar",
+    })
+    plan = generate_plan(data, 100_000, config, calendar=calendar)
+    assert not plan.empty
+    assert plan["effective_time"].str.contains("2025-01-17").all()
+    assert plan["calendar_source"].eq("synthetic_calendar").all()
+
+
+def test_plan_rejects_snapshot_fetched_before_close_even_if_plan_runs_after_close() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    data = bars()
+    data["available_at"] = data["trade_date"].map(lambda value: f"{value}T15:00:00+08:00")
+    data["retrieved_at_utc"] = "2025-01-16T06:00:00+00:00"
+    after_close = datetime(2025, 1, 16, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    try:
+        generate_plan(data, 100_000, config, now=after_close)
+    except ValueError as exc:
+        assert "收盘可用时间前获取" in str(exc)
+    else:
+        raise AssertionError("a pre-close snapshot must not be used after the close without refetching")
 
 
 def test_a_share_code_forms_are_normalized() -> None:

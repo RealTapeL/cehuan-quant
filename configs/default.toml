@@ -1,5 +1,5 @@
 [data]
-provider = "akshare"
+provider = "eastmoney"
 daily_endpoint = "stock_zh_a_hist"
 adjustment_for_signals = "hfq"
 execution_prices = "unadjusted"

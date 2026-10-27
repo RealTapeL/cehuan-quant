@@ -1,13 +1,13 @@
 # 架构与运行边界
 
 ```text
-AKShare ──> data adapter ──> canonical daily bars ──┬──> baseline signals/backtest
+AKShare Eastmoney/Tencent ──> explicit source adapters ──> canonical daily bars ──┬──> baseline signals/backtest
                                                     ├──> Qlib StaticDataLoader / momentum feature (optional extra)
                                                     ├──> review plan CSV/Markdown ──> manual Huatai import
                                                     └──> actual fills/positions CSV ──> review report
 ```
 
-- 行情源：`src/cehuan/data/akshare_adapter.py` 对 AKShare 原始中文列做字段映射；策略只消费规范列。
+- 行情源：`src/cehuan/data/akshare_adapter.py` 分别适配 AKShare 东方财富与腾讯端点，对字段和成交量单位做映射；来源选择显式配置，策略只消费规范列。
 - 研究：技术基线按后复权收盘计算动量；Qlib 静态数据读取与动量特征命令可独立运行。它未训练模型，也不能把技术基线描述为已验证盈利策略。
 - 回测：信号在收盘后形成，下一交易日开盘模拟；费用、滑点、交易单位、价格阈值来自 TOML。数据不足时记录阻断原因。
 - 输出：每次回测按 experiment ID 写独立目录；交易计划是独立文件，有数据截止和生效时间；计划不是券商委托。

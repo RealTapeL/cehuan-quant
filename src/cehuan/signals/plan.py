@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from cehuan.data.canonical import canonical_symbol, normalize_bar_frame
+from cehuan.data.calendar import next_open_session, validate_bars_against_calendar
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
@@ -15,7 +16,7 @@ from cehuan.signals.strategy import (
 
 
 PLAN_COLUMNS = [
-    "plan_id", "generated_at", "data_cutoff_time", "effective_time", "symbol", "name",
+    "plan_id", "generated_at", "data_cutoff_time", "effective_time", "calendar_source", "symbol", "name",
     "action", "current_shares", "target_shares", "planned_shares", "target_weight",
     "reference_price", "price_condition", "trigger_basis", "major_risks", "manual_review_required",
     "board", "market_rule_source", "market_rule_valid_from", "market_rule_valid_to",
@@ -30,6 +31,7 @@ def generate_plan(
     config: dict[str, object],
     positions: pd.DataFrame | None = None,
     now: datetime | None = None,
+    calendar: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a separate plan artifact for a person to review and place manually."""
     if cash_cny <= 0:
@@ -50,7 +52,25 @@ def generate_plan(
         if latest_cutoff.to_pydatetime() > current_time:
             raise ValueError(f"最新日线标记为 {latest_cutoff.isoformat()} 才可用；此时尚不能生成计划")
     as_of = data["trade_date"].max()
+    effective_time = "next_trading_session_open; verify exchange calendar manually"
+    calendar_source = ""
+    if calendar is not None:
+        calendar_validation = validate_bars_against_calendar(data, calendar)
+        if not calendar_validation["healthy"]:
+            raise ValueError("交易日历校验未通过：" + "; ".join(calendar_validation["errors"]))
+        next_session = next_open_session(calendar, as_of)
+        if next_session is None:
+            raise ValueError("交易日历未包含最新数据日之后的下一个开市日")
+        next_date, calendar_source = next_session
+        effective_time = f"{next_date} 开盘前；下一个开市日来自交易日历"
     current = data.loc[data["trade_date"] == as_of].copy()
+    latest_available = pd.to_datetime(current["available_at"], errors="coerce", utc=True)
+    latest_retrieved = pd.to_datetime(current["retrieved_at_utc"], errors="coerce", utc=True)
+    fetched_too_early = (
+        latest_available.notna() & latest_retrieved.notna() & (latest_retrieved < latest_available)
+    )
+    if fetched_too_early.any():
+        raise ValueError("最新交易日行情快照在标记的收盘可用时间前获取；请在收盘后重新拉取数据再生成计划")
     current = current.sort_values(["momentum", "symbol"], ascending=[False, True])
     current_by_symbol = {str(row["symbol"]): row for _, row in current.iterrows()}
     existing: dict[str, dict[str, float]] = {}
@@ -133,7 +153,8 @@ def generate_plan(
             "plan_id": plan_id,
             "generated_at": generated,
             "data_cutoff_time": data_cutoff,
-            "effective_time": "next_trading_session_open; verify exchange calendar manually",
+            "effective_time": effective_time,
+            "calendar_source": calendar_source,
             "symbol": symbol,
             "name": row.get("name", "") if hasattr(row, "get") else "",
             "action": action,

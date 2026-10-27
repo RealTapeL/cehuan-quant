@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from cehuan.data.adjustment import select_signal_prices
 from cehuan.data.canonical import normalize_bar_frame
 
 
@@ -54,9 +55,7 @@ def add_momentum(frame: pd.DataFrame, lookback_sessions: int) -> pd.DataFrame:
     if lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须大于 0")
     data = normalize_bar_frame(frame)
-    data["signal_price"] = data["adjusted_close"].where(
-        data["adjusted_close"].notna(), data["close"]
-    )
+    data["signal_price"], _ = select_signal_prices(data)
     data["momentum"] = data.groupby("symbol", sort=False)["signal_price"].transform(
         lambda values: values.div(values.shift(lookback_sessions)).sub(1.0)
     )
