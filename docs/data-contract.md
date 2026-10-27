@@ -4,11 +4,11 @@
 
 | 字段 | 含义 |
 |---|---|
-| `trade_date`, `symbol`, `name` | 交易日、交易所前缀代码（如 `SH600519`、`SZ000001`、`BJ830799`）、可选名称；六位代码和 `.SH/.SS/.SZ/.BJ` 输入会统一 |
+| `trade_date`, `symbol`, `name` | 交易日、交易所前缀代码（如 `SH600519`、`SZ000001`、`BJ830799`；指数如 `SH000300`）、可选名称；六位股票代码和 `.SH/.SS/.SZ/.BJ` 输入会统一 |
 | `open`, `high`, `low`, `close` | 原始未复权价格；用于参考价与初版成交约束 |
 | `adjusted_close` | 后复权收盘价；用于技术基线连续性较好的收益特征 |
 | `volume_shares`, `amount_cny` | 股、元；AKShare 返回成交量单位为手，适配器乘 100 |
-| `is_suspended`, `is_st` | 点时上市/停牌/ST 状态；AKShare 单股日线不提供，缺失保留未知 |
+| `is_listed`, `is_suspended`, `is_st` | 点时上市/停牌/ST 状态；AKShare 单股日线不提供，缺失保留未知；BaoStock 快照可映射上市日期及日线停牌/ST 字段 |
 | `has_price_limit`, `price_limit_pct` | 当日是否有限价及其阈值；需来自有效日期证券主数据，IPO 等无涨跌幅限制日期可设 `has_price_limit=false` |
 | `buy_min_shares`, `buy_step_shares`, `sell_min_shares`, `sell_step_shares` | 按板块和当日规则配置的数量约束；不可把全市场假设成同一手数 |
 | `board`, `market_rule_source`, `market_rule_valid_from`, `market_rule_valid_to` | 板块、规则证据来源及有效期，用于追溯点时规则 |
@@ -20,13 +20,21 @@
 
 同一证券的行若包含多个 `data_source`，质量检查会报错，避免将不同供应商的价格/复权序列直接拼接。可以用 `--max-age-days` 加一个粗略的日历日新鲜度阈值；未提供官方交易日历时，这个检查不能替代“距最近开市日”的判断。
 
+## BaoStock 私有快照适配器
+
+BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `uv sync --extra baostock` 后，可执行 `cehuan snapshot --symbols SH600519,SZ000001 --start 20100101 --end 20261026`。命令保存未复权日线、`adjustflag=1` 后复权日线、复权因子、全量股票基础表、原始交易日历和规范化交易日历，并生成 `bars.csv`、质量报告、`manifest.json` 和 SHA-256 文件清单。指定的指数基准另存为 `benchmark.csv`，不会加入选股池；回测使用 `--benchmark-data` 显式加载。
+
+BaoStock 的 `volume` 映射为股、`amount` 映射为元；`tradestatus=0` 映射为停牌，`isST` 映射为 ST。`ipoDate/outDate` 用于判断请求日期是否在挂牌区间内。日线不含逐日涨跌停阈值或交易单位，快照保持这些字段未知。当前适配器仅限制首轮快照最多 30 个明确指定代码；这不是全市场历史股票池。快照保存在 Git 忽略的 `data/private/snapshots/`，拒绝覆盖已存在的快照 ID。
+
+实测覆盖、权限状态、接口限制和本地快照版本见 [数据源审计](data-provider-audit.md) 与 [真实数据基线报告](real-data-baseline.md)。
+
 ## 交易日历与点时主数据
 
 `examples/trading_calendar_template.csv` 接受 `trade_date,is_open,previous_trade_date,source,retrieved_at_utc`，也识别 Tushare 风格的 `cal_date` 和 `pretrade_date` 列。`quality --calendar` 会检查每个行情日期是否为已知开市日；`plan --calendar` 会校验历史行情覆盖，并标注日历给出的下一个开市日期。请保留文件版本和来源，模板本身不包含真实交易日。
 
-目前没有接入需要 Token/积分的历史状态供应商。Tushare 文档列出股票基础信息的上市/退市日期和状态、交易日历、每日停复牌、每日涨跌停价及每日 ST 名单；其接口权限分别要求积分（如股票基础信息、交易日历和涨跌停价为 2000 起，历史 ST 名单为 3000 起）。这是一条可评估的可选数据路径，不能假定当前账户已有权限或覆盖满足历史研究要求。证券主数据仍通过有效日期 CSV 输入，数据缺项保持未知。
+BaoStock 快照现在可以为明确指定的证券提供日线 ST/停牌状态以及上市、退市日期，但本项目尚未建立完整全市场的历史证券状态表，也没有接入 Tushare。Tushare 文档列出上市/退市、交易日历、停复牌、涨跌停及历史 ST 接口，权限按端点分别控制；本机没有 Token，账户积分和实际覆盖未知。证券交易规则仍通过有效日期 CSV 输入，缺项保持未知。
 
-参考文档：[AKShare A 股历史行情与复权说明](https://akshare.akfamily.xyz/data/stock/stock.html)、[AKShare 数据风险提示](https://github.com/akfamily/akshare/blob/main/docs/data_tips.md)；[Tushare 股票基础信息](https://tushare.pro/document/1?doc_id=25)、[交易日历](https://tushare.pro/document/2?doc_id=26)、[每日停复牌](https://tushare.pro/document/2?doc_id=214)、[每日涨跌停价](https://tushare.pro/document/2?doc_id=183)、[历史 ST 名单](https://tushare.pro/document/2?doc_id=397)、[复权因子](https://tushare.pro/document/2?doc_id=28)。
+参考文档：[AKShare A 股历史行情与复权说明](https://akshare.akfamily.xyz/data/stock/stock.html)、[AKShare 数据风险提示](https://github.com/akfamily/akshare/blob/main/docs/data_tips.md)；[BaoStock API](https://www.baostock.com/api/)、[证券基本资料](https://www.baostock.com/mainContent?file=stockBasic.md)、[复权因子](https://www.baostock.com/mainContent?file=factorInfo.md)；[Tushare 股票基础信息](https://tushare.pro/document/1?doc_id=25)、[交易日历](https://tushare.pro/document/2?doc_id=26)、[每日停复牌](https://tushare.pro/document/2?doc_id=214)、[每日涨跌停价](https://tushare.pro/document/2?doc_id=183)、[历史 ST 名单](https://tushare.pro/document/2?doc_id=397)、[复权因子](https://tushare.pro/document/2?doc_id=28)。
 
 ## 防泄漏规则
 
