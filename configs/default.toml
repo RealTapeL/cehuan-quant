@@ -39,6 +39,8 @@ slippage_bps = 5.0
 [backtest]
 development_fraction = 0.60
 validation_fraction = 0.20
+rolling_window_sessions = 60
+rolling_step_sessions = 20
 
 [plan]
 cash_cny = 0.0

@@ -85,6 +85,20 @@ def test_backtest_reports_ordered_development_validation_test_periods() -> None:
     assert periods["test"]["trade_count"] >= 0
 
 
+def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    config["backtest"].update({"rolling_window_sessions": 10, "rolling_step_sessions": 5})
+    result = run_backtest(bars(40), 100_000, config)
+    rolling = result["metrics"]["chronological_evaluation"]["rolling_fixed_rule_diagnostics"]
+    assert rolling["available"] is True
+    assert rolling["method"].startswith("fixed-rule continuous")
+    assert len(rolling["windows"]) == 7
+    assert rolling["windows"][0]["start"] < rolling["windows"][0]["end"]
+    assert rolling["windows"][0]["end"] > rolling["windows"][1]["start"]
+    assert "不属于" in rolling["interpretation"]
+
+
 def test_locked_limit_up_open_blocks_buy() -> None:
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 20, "max_positions": 1})

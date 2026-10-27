@@ -112,12 +112,18 @@ def _chronological_evaluation(
     trades: pd.DataFrame,
     development_fraction: float,
     validation_fraction: float,
+    rolling_window_sessions: int,
+    rolling_step_sessions: int,
 ) -> dict[str, Any]:
     count = len(curve)
     if not 0 < development_fraction < 1 or not 0 < validation_fraction < 1:
         raise ValueError("回测 development_fraction 与 validation_fraction 必须在 0 和 1 之间")
     if development_fraction + validation_fraction >= 1:
         raise ValueError("development_fraction 与 validation_fraction 之和必须小于 1")
+    if rolling_window_sessions < 2:
+        raise ValueError("rolling_window_sessions 必须至少为 2")
+    if rolling_step_sessions < 1:
+        raise ValueError("rolling_step_sessions 必须大于 0")
     if count < 5:
         return {"available": False, "reason": "少于 5 个日期点，无法形成三个非空时间区间"}
 
@@ -142,6 +148,52 @@ def _chronological_evaluation(
         result = _metrics(equity, returns, turnover, peer)
         result.update({"start": start_date, "end": end_date, "trade_count": int(len(period_trades))})
         periods[label] = result
+    rolling: dict[str, Any] = {
+        "available": False,
+        "method": "fixed-rule continuous portfolio diagnostics; no parameter fitting or fold reset",
+        "window_sessions": rolling_window_sessions,
+        "step_sessions": rolling_step_sessions,
+        "windows": [],
+        "reason": (
+            f"当前只有 {count} 个日期点，少于滚动窗口所需的 {rolling_window_sessions} 个日期点"
+            if count < rolling_window_sessions else None
+        ),
+        "interpretation": "用于观察固定规则组合在连续时间窗中的表现稳定性；不属于模型训练、参数滚动选择或滚动样本外验证。",
+    }
+    if count >= rolling_window_sessions:
+        rolling_windows: list[dict[str, Any]] = []
+        trade_dates = trades["trade_date"].astype(str) if not trades.empty else pd.Series(dtype=str)
+        for window_number, start in enumerate(
+            range(0, count - rolling_window_sessions + 1, rolling_step_sessions),
+            start=1,
+        ):
+            end = start + rolling_window_sessions
+            window_curve = curve["equity_cny"].iloc[start:end].reset_index(drop=True)
+            # The first point establishes the window's capital base. Subsequent
+            # returns are aligned to the remaining equity observations.
+            window_returns = curve["return"].iloc[start + 1:end].reset_index(drop=True)
+            window_benchmark = benchmark.iloc[start:end].reset_index(drop=True)
+            start_date = str(curve.iloc[start]["trade_date"])
+            end_date = str(curve.iloc[end - 1]["trade_date"])
+            window_trades = (
+                trades.loc[trade_dates.gt(start_date) & trade_dates.le(end_date)]
+                if not trades.empty else trades
+            )
+            turnover = (
+                float(window_trades["notional_cny"].sum()) / max(float(window_curve.mean()), 1.0)
+                if not window_trades.empty else 0.0
+            )
+            result = _metrics(window_curve, window_returns, turnover, window_benchmark)
+            result.update({
+                "window": window_number,
+                "start": start_date,
+                "end": end_date,
+                "start_session_index": start,
+                "end_session_index_exclusive": end,
+                "trade_count": int(len(window_trades)),
+            })
+            rolling_windows.append(result)
+        rolling.update({"available": bool(rolling_windows), "windows": rolling_windows, "reason": None})
     return {
         "available": True,
         "method": "chronological development/validation/test slices of one fixed-rule simulation",
@@ -149,6 +201,7 @@ def _chronological_evaluation(
         "validation_fraction": validation_fraction,
         "test_fraction": 1.0 - development_fraction - validation_fraction,
         "periods": periods,
+        "rolling_fixed_rule_diagnostics": rolling,
         "interpretation": "固定规则基线无模型训练；时间留出指标不代表参数未被研究者事后选择，也不是滚动样本外验证。",
     }
 
@@ -350,6 +403,8 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
         pd.DataFrame(trades, columns=["trade_date", "notional_cny"]),
         float(config.get("backtest", {}).get("development_fraction", 0.60)),
         float(config.get("backtest", {}).get("validation_fraction", 0.20)),
+        int(config.get("backtest", {}).get("rolling_window_sessions", 60)),
+        int(config.get("backtest", {}).get("rolling_step_sessions", 20)),
     )
     metrics = _metrics(equity_series, curve["return"], total_turnover / max(float(equity_series.mean()), 1.0), benchmark)
     metrics.update({
@@ -367,7 +422,7 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
         "label": "none; rule-based baseline",
         "model": "none; rank-based technical baseline",
         "training_interval": "not applicable",
-        "sample_evaluation": "full-period summary plus chronological development/validation/test slices; no fitted model and no rolling out-of-sample claim",
+        "sample_evaluation": "full-period summary, chronological development/validation/test slices, and rolling fixed-rule stability diagnostics; no fitted model and no rolling out-of-sample claim",
         "chronological_evaluation": chronological,
         "runtime_seconds": round(time.perf_counter() - started, 6),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
