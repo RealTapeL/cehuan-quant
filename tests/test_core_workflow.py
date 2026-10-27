@@ -88,6 +88,35 @@ def test_backtest_reports_ordered_development_validation_test_periods() -> None:
     assert periods["test"]["trade_count"] >= 0
 
 
+def test_backtest_uses_independent_configured_index_benchmark():
+    config = load_config()
+    config["benchmark"]["symbol"] = "SH000300"
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    stock_data = bars(16)
+    index_data = stock_data.drop_duplicates("trade_date").copy().sort_values("trade_date")
+    index_data["symbol"] = "SH000300"
+    index_data["name"] = "CSI 300"
+    index_data["open"] = 100.0
+    index_data["high"] = [100 + i for i in range(len(index_data))]
+    index_data["low"] = 100.0
+    index_data["close"] = [100 + i for i in range(len(index_data))]
+    index_data["adjusted_close"] = index_data["close"]
+    index_data["is_listed"] = False
+    index_data["is_suspended"] = False
+    index_data["is_st"] = False
+    index_data["has_price_limit"] = False
+    index_data["data_source"] = "synthetic_index_test"
+
+    result = run_backtest(stock_data, 100_000, config, benchmark_frame=index_data)
+
+    expected_return = float(index_data["close"].iloc[-1] / index_data["close"].iloc[0] - 1)
+    assert result["metrics"]["benchmark_method"] == "configured_index_close_return:SH000300"
+    assert abs(result["metrics"]["peer_benchmark_return"] - expected_return) < 1e-12
+    assert abs(result["metrics"]["benchmark_return"] - expected_return) < 1e-12
+    assert "SH000300" not in result["metrics"]["universe_symbols"]
+    assert result["metrics"]["benchmark_data_version_sha256"]
+
+
 def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
@@ -294,6 +323,7 @@ def test_a_share_code_forms_are_normalized() -> None:
     assert canonical_symbol("600519") == "SH600519"
     assert canonical_symbol("000001.SZ") == "SZ000001"
     assert canonical_symbol("830799.BJ") == "BJ830799"
+    assert canonical_symbol("SH000300") == "SH000300"
     assert canonical_symbol("900001") == "900001"  # Shanghai B share: do not mislabel as Beijing A share.
     assert canonical_symbol("200001.SZ") == "200001"  # Shenzhen B share: outside this A-share adapter.
 

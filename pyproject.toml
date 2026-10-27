@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 qlib = ["pyqlib==0.9.7", "pyarrow>=17,<26"]
+baostock = ["baostock==0.9.4"]
 
 [dependency-groups]
 dev = ["pytest>=8,<9"]

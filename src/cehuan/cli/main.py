@@ -11,6 +11,7 @@ import pandas as pd
 from cehuan.backtest.engine import run_backtest
 from cehuan.config import load_config
 from cehuan.data.akshare_adapter import make_akshare_provider
+from cehuan.data.baostock_adapter import BaoStockSession, create_baostock_snapshot
 from cehuan.data.canonical import read_bars, write_bars
 from cehuan.data.quality import check_data_quality
 from cehuan.data.pool import fetch_pool_daily
@@ -32,6 +33,22 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def _write_json(value: object, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def _console_metrics_summary(metrics: dict[str, object]) -> dict[str, object]:
+    """Keep the saved experiment complete without dumping hundreds of rolling windows."""
+    summary = dict(metrics)
+    evaluation = summary.get("chronological_evaluation")
+    if isinstance(evaluation, dict):
+        evaluation_summary = dict(evaluation)
+        rolling = evaluation_summary.get("rolling_fixed_rule_diagnostics")
+        if isinstance(rolling, dict):
+            rolling_summary = dict(rolling)
+            windows = rolling_summary.pop("windows", [])
+            rolling_summary["window_count"] = len(windows)
+            evaluation_summary["rolling_fixed_rule_diagnostics"] = rolling_summary
+        summary["chronological_evaluation"] = evaluation_summary
+    return summary
 
 
 def _provider_for(config: dict[str, object], source: str | None):
@@ -64,6 +81,14 @@ def _parser() -> argparse.ArgumentParser:
     fetch_pool.add_argument("--calendar", help="可选交易日历 CSV，用于检查行情日期覆盖")
     fetch_pool.add_argument("--output", default="data/private/raw/pool_daily.csv")
 
+    snapshot = subs.add_parser("snapshot", help="获取带原始响应和哈希清单的 BaoStock 私有数据快照")
+    snapshot.add_argument("--symbols", required=True, help="逗号分隔的沪深代码，例如 SH600519,SZ000001")
+    snapshot.add_argument("--start", required=True, help="YYYYMMDD 或 YYYY-MM-DD")
+    snapshot.add_argument("--end", required=True, help="YYYYMMDD 或 YYYY-MM-DD")
+    snapshot.add_argument("--snapshot-id", help="可选的快照版本名；已存在时拒绝覆盖")
+    snapshot.add_argument("--benchmark-symbol", default="SH000300", help="指数基准代码；独立保存，不进入股票池")
+    snapshot.add_argument("--output", default="data/private/snapshots", help="私有快照根目录")
+
     quality = subs.add_parser("quality", help="检查规范化日线 CSV")
     quality.add_argument("--data", required=True)
     quality.add_argument("--max-age-days", type=int, help="可选的最大日历日滞后；未提供交易日历时仅作粗略检查")
@@ -74,6 +99,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--cash", type=float, required=True)
     backtest.add_argument("--config")
     backtest.add_argument("--security-master")
+    backtest.add_argument("--benchmark-data", help="可选独立基准规范日线 CSV")
 
     plan = subs.add_parser("plan", help="生成独立的人工审核交易计划")
     plan.add_argument("--data", required=True)
@@ -147,6 +173,33 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"saved_to": str(output), "quality": quality}, ensure_ascii=False, indent=2))
             return 0
 
+        if args.command == "snapshot":
+            symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()]
+            output = Path(args.output)
+            if not output.is_absolute():
+                output = REPO_ROOT / output
+            with BaoStockSession() as session:
+                result = create_baostock_snapshot(
+                    session,
+                    symbols=symbols,
+                    start_date=args.start,
+                    end_date=args.end,
+                    root=output,
+                    snapshot_id=args.snapshot_id,
+                    benchmark_symbol=args.benchmark_symbol,
+                )
+            print(json.dumps({
+                "snapshot_path": result["snapshot_path"],
+                "snapshot_id": result["snapshot_id"],
+                "date_range": result["date_range"],
+                "universe": result["universe"],
+                "benchmark": result["benchmark"],
+                "coverage": result["coverage"],
+                "normalized_bars_sha256": result["normalized_bars_sha256"],
+                "manifest": str(Path(result["snapshot_path"]) / "manifest.json"),
+            }, ensure_ascii=False, indent=2))
+            return 0
+
         if args.command == "quality":
             config = load_config()
             quality = check_data_quality(
@@ -163,7 +216,8 @@ def main(argv: list[str] | None = None) -> int:
             bars = read_bars(args.data)
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
-            result = run_backtest(bars, args.cash, config)
+            benchmark = read_bars(args.benchmark_data) if args.benchmark_data else None
+            result = run_backtest(bars, args.cash, config, benchmark_frame=benchmark)
             experiment = str(result["metrics"]["experiment_id"])
             folder = REPO_ROOT / "outputs" / "experiments" / experiment
             folder.mkdir(parents=True, exist_ok=True)
@@ -175,7 +229,10 @@ def main(argv: list[str] | None = None) -> int:
             _write_json(result["metrics"], REPO_ROOT / "outputs" / "backtest_metrics.json")
             shutil.copyfile(folder / "trades.csv", REPO_ROOT / "outputs" / "trades.csv")
             shutil.copyfile(folder / "equity_curve.csv", REPO_ROOT / "outputs" / "equity_curve.csv")
-            print(json.dumps({"experiment_dir": str(folder), "metrics": result["metrics"]}, ensure_ascii=False, indent=2))
+            print(json.dumps({
+                "experiment_dir": str(folder),
+                "metrics": _console_metrics_summary(result["metrics"]),
+            }, ensure_ascii=False, indent=2))
             return 0
 
         if args.command == "plan":

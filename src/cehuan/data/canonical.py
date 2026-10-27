@@ -53,7 +53,11 @@ def canonical_symbol(value: object) -> str:
         return None
 
     if symbol.startswith(("SH", "SZ", "BJ")) and len(symbol) == 8 and symbol[2:].isdigit():
-        return symbol if inferred_exchange(symbol[2:]) == symbol[:2] else symbol[2:]
+        # Shanghai equity indices use 000xxx codes, which collide with SZ stock
+        # codes when the exchange prefix is ignored (e.g. SH000001 vs SZ000001).
+        if inferred_exchange(symbol[2:]) == symbol[:2] or (symbol[:2] == "SH" and symbol[2:].startswith("000")):
+            return symbol
+        return symbol[2:]
     if "." in symbol:
         code, suffix = symbol.rsplit(".", 1)
         exchange = {"SH": "SH", "SS": "SH", "SZ": "SZ", "BJ": "BJ"}.get(suffix)

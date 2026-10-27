@@ -100,6 +100,9 @@ def _metrics(equity: pd.Series, returns: pd.Series, turnover: float, benchmark: 
         "daily_win_rate": float((valid_returns > 0).mean()) if len(valid_returns) else None,
         "turnover_over_average_equity": turnover,
         "sharpe_zero_risk_free": sharpe,
+        "benchmark_return": benchmark_return,
+        "excess_return_vs_benchmark": total_return - benchmark_return if benchmark_return is not None else None,
+        # Legacy aliases retained for existing experiment consumers.
         "peer_benchmark_return": benchmark_return,
         "excess_return_vs_peer_benchmark": total_return - benchmark_return if benchmark_return is not None else None,
         "return_period_count": periods,
@@ -206,7 +209,12 @@ def _chronological_evaluation(
     }
 
 
-def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str, Any]) -> dict[str, Any]:
+def run_backtest(
+    frame: pd.DataFrame,
+    initial_cash_cny: float,
+    config: dict[str, Any],
+    benchmark_frame: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
     It uses unadjusted OHLC for execution/valuation, adjusted close for signal
@@ -362,11 +370,27 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
     close_returns = data.sort_values(["symbol", "trade_date"]).groupby("symbol")["close"].pct_change()
     data["raw_close_return"] = close_returns
     benchmark_symbol = str(config.get("benchmark", {}).get("symbol", ""))
-    benchmark_rows = data.loc[data["symbol"] == benchmark_symbol] if benchmark_symbol else pd.DataFrame()
-    if not benchmark_rows.empty:
-        benchmark_values = benchmark_rows.set_index(benchmark_rows["trade_date"].astype(str))["raw_close_return"]
+    benchmark_data: pd.DataFrame | None = None
+    if benchmark_frame is not None:
+        benchmark_data = normalize_bar_frame(benchmark_frame)
+        benchmark_quality = check_data_quality(
+            benchmark_data,
+            large_change_warning=float(config.get("data", {}).get("large_daily_price_change_warning", 0.50)),
+        )
+        if not benchmark_quality["healthy"]:
+            raise ValueError("基准数据质量检查未通过：" + "；".join(benchmark_quality["errors"]))
+        benchmark_rows = benchmark_data.loc[benchmark_data["symbol"] == benchmark_symbol]
+        if benchmark_rows.empty:
+            raise ValueError(f"独立基准数据不包含配置标的 {benchmark_symbol}")
+        benchmark_rows = benchmark_rows.sort_values("trade_date")
+        benchmark_values = benchmark_rows.set_index(benchmark_rows["trade_date"].astype(str))["close"].pct_change()
         benchmark_method = f"configured_index_close_return:{benchmark_symbol}"
     else:
+        benchmark_rows = data.loc[data["symbol"] == benchmark_symbol] if benchmark_symbol else pd.DataFrame()
+    if benchmark_frame is None and not benchmark_rows.empty:
+        benchmark_values = benchmark_rows.set_index(benchmark_rows["trade_date"].astype(str))["raw_close_return"]
+        benchmark_method = f"configured_index_close_return:{benchmark_symbol}"
+    elif benchmark_frame is None:
         allowed = data.apply(lambda row: status_is_eligible(row, market, require_order_rules=False)[0], axis=1)
         data["peer_return_eligible"] = allowed & data["raw_close_return"].notna()
         benchmark_values = data.loc[data["peer_return_eligible"]].assign(
@@ -386,8 +410,21 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
     data_digest = hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
     ).hexdigest()
-    data_sources = sorted(str(value) for value in data["data_source"].dropna().unique())
-    retrieved_values = data["retrieved_at_utc"].dropna()
+    benchmark_data_digest = None
+    if benchmark_data is not None:
+        benchmark_data_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(benchmark_data[BAR_COLUMNS], index=False).values.tobytes()
+        ).hexdigest()
+        data_digest = hashlib.sha256(
+            f"{data_digest}:{benchmark_data_digest}".encode("utf-8")
+        ).hexdigest()
+    source_frames = [data] + ([benchmark_data] if benchmark_data is not None else [])
+    data_sources = sorted({
+        str(value)
+        for source_frame in source_frames
+        for value in source_frame["data_source"].dropna().unique()
+    })
+    retrieved_values = pd.concat([source_frame["retrieved_at_utc"] for source_frame in source_frames]).dropna()
     missing_units = data[[
         "buy_min_shares", "buy_step_shares", "sell_min_shares", "sell_step_shares",
     ]].isna().any(axis=1)
@@ -412,6 +449,7 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
         "strategy_id": str(strategy["name"]),
         "config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
         "data_version_sha256": data_digest,
+        "benchmark_data_version_sha256": benchmark_data_digest,
         "code_version": __version__,
         **_git_metadata(),
         "data_sources": data_sources,
@@ -428,6 +466,8 @@ def run_backtest(frame: pd.DataFrame, initial_cash_cny: float, config: dict[str,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "data_start": str(dates[0]),
         "data_end": str(dates[-1]),
+        "benchmark_data_start": str(benchmark_rows["trade_date"].min()) if not benchmark_rows.empty else None,
+        "benchmark_data_end": str(benchmark_rows["trade_date"].max()) if not benchmark_rows.empty else None,
         "initial_cash_cny": initial_cash_cny,
         "trade_count": len(trades),
         "blocked_order_count": len(blocked_orders),
