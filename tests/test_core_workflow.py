@@ -10,8 +10,9 @@ from cehuan.config import load_config
 from cehuan.data.adjustment import select_signal_prices
 from cehuan.data.akshare_adapter import normalize_akshare_history, normalize_tencent_history
 from cehuan.data.calendar import next_open_session, validate_bars_against_calendar
-from cehuan.data.canonical import canonical_symbol
+from cehuan.data.canonical import canonical_symbol, read_bars
 from cehuan.data.pool import fetch_pool_daily
+from cehuan.data.quality import check_data_quality
 from cehuan.review.reconcile import (
     compare_plan_and_fills,
     compare_positions_to_plan,
@@ -409,3 +410,27 @@ def test_plan_refuses_daily_bar_before_its_available_time() -> None:
         assert "尚不能生成计划" in str(exc)
     else:
         raise AssertionError("plan should reject a daily bar before its availability time")
+
+
+def test_compact_prevalidated_backtest_matches_standard_run(tmp_path) -> None:
+    frame = bars(days=50)
+    path = tmp_path / "bars.csv"
+    frame.to_csv(path, index=False)
+    config = load_config()
+    standard = run_backtest(frame, 100_000, config)
+    compact = read_bars(path, compact=True)
+    compact_quality = check_data_quality(frame)
+    compact_result = run_backtest(
+        compact,
+        100_000,
+        config,
+        prevalidated_quality=compact_quality,
+        source_data_sha256="test-file-hash",
+        mutate_input=True,
+    )
+
+    assert compact["symbol"].dtype.name == "category"
+    assert compact["trade_date"].dtype.name == "category"
+    assert compact_result["metrics"]["total_return"] == standard["metrics"]["total_return"]
+    assert compact_result["metrics"]["max_drawdown"] == standard["metrics"]["max_drawdown"]
+    pd.testing.assert_frame_equal(compact_result["trades"], standard["trades"])

@@ -46,7 +46,15 @@ def round_order_quantity(
     return minimum + ((quantity - minimum) // step) * step
 
 
-def add_momentum(frame: pd.DataFrame, lookback_sessions: int) -> pd.DataFrame:
+def add_momentum(
+    frame: pd.DataFrame,
+    lookback_sessions: int,
+    *,
+    normalized: bool = False,
+    copy_frame: bool = True,
+    compact: bool = False,
+    assume_sorted: bool = False,
+) -> pd.DataFrame:
     """Calculate close-to-close momentum using adjusted close where available.
 
     Every value on date t uses observations up to and including the close on t.
@@ -54,9 +62,14 @@ def add_momentum(frame: pd.DataFrame, lookback_sessions: int) -> pd.DataFrame:
     """
     if lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须大于 0")
-    data = normalize_bar_frame(frame)
+    data = frame if normalized else normalize_bar_frame(
+        frame,
+        copy_frame=copy_frame,
+        compact=compact,
+        assume_sorted=assume_sorted,
+    )
     data["signal_price"], _ = select_signal_prices(data)
-    data["momentum"] = data.groupby("symbol", sort=False)["signal_price"].transform(
+    data["momentum"] = data.groupby("symbol", sort=False, observed=True)["signal_price"].transform(
         lambda values: values.div(values.shift(lookback_sessions)).sub(1.0)
     )
     return data
@@ -127,8 +140,21 @@ def rank_at_close(
 ) -> pd.DataFrame:
     data = add_momentum(frame, int(strategy["lookback_sessions"]))
     day = data.loc[data["trade_date"].astype(str) == str(as_of)].copy()
+    return rank_precomputed_day(day, strategy, market, require_order_rules)
+
+
+def rank_precomputed_day(
+    day: pd.DataFrame,
+    strategy: dict[str, object],
+    market: dict[str, object],
+    require_order_rules: bool = True,
+) -> pd.DataFrame:
+    """Rank one day's rows when momentum has already been computed for history."""
     if day.empty:
         return day.assign(rank=pd.Series(dtype="Int64"))
+    if "momentum" not in day:
+        raise ValueError("rank_precomputed_day 需要预先计算的 momentum 列")
+    day = day.reset_index(drop=True)
     eligibility = day.apply(lambda row: status_is_eligible(row, market, require_order_rules)[0], axis=1)
     day = day.loc[eligibility & day["momentum"].notna()]
     day = day.loc[day["momentum"] >= float(strategy.get("min_momentum", 0.0))]

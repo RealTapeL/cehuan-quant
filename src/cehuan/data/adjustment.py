@@ -16,7 +16,7 @@ def select_signal_prices(frame: pd.DataFrame) -> tuple[pd.Series, dict[str, str]
         raise ValueError("信号价格选择需要 symbol/close/adjusted_close 字段")
     selected = pd.Series(float("nan"), index=frame.index, dtype="float64", name="signal_price")
     modes: dict[str, str] = {}
-    for symbol, group in frame.groupby("symbol", sort=False, dropna=False):
+    for symbol, group in frame.groupby("symbol", sort=False, dropna=False, observed=True):
         indices = group.index
         adjusted = pd.to_numeric(group["adjusted_close"], errors="coerce")
         raw = pd.to_numeric(group["close"], errors="coerce")

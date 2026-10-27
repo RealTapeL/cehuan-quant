@@ -20,7 +20,7 @@ from cehuan.data.quality import check_data_quality
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
-    rank_at_close,
+    rank_precomputed_day,
     round_order_quantity,
     status_is_eligible,
 )
@@ -214,6 +214,10 @@ def run_backtest(
     initial_cash_cny: float,
     config: dict[str, Any],
     benchmark_frame: pd.DataFrame | None = None,
+    *,
+    prevalidated_quality: dict[str, Any] | None = None,
+    source_data_sha256: str | None = None,
+    mutate_input: bool = False,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -224,10 +228,18 @@ def run_backtest(
     started = time.perf_counter()
     if initial_cash_cny <= 0:
         raise ValueError("回测资金必须大于 0；请显式传入演示或研究资金")
-    data = normalize_bar_frame(frame)
-    quality = check_data_quality(data, large_change_warning=float(config.get("data", {}).get("large_daily_price_change_warning", 0.50)))
-    if not quality["healthy"]:
-        raise ValueError("数据质量检查未通过：" + "；".join(quality["errors"]))
+    data = normalize_bar_frame(
+        frame,
+        copy_frame=not mutate_input,
+        compact=mutate_input,
+        assume_sorted=mutate_input,
+    )
+    quality = prevalidated_quality or check_data_quality(
+        data,
+        large_change_warning=float(config.get("data", {}).get("large_daily_price_change_warning", 0.50)),
+    )
+    if not quality.get("healthy", False):
+        raise ValueError("数据质量检查未通过：" + "; ".join(quality.get("errors", [])))
     strategy = config["strategy"]
     market = config["market"]
     costs = config["costs"]
@@ -236,9 +248,13 @@ def run_backtest(
     if rebalance_sessions < 1:
         raise ValueError("rebalance_sessions 必须大于 0")
 
-    data = add_momentum(data, lookback)
-    data["previous_close"] = data.groupby("symbol", sort=False)["close"].shift(1)
-    dates = sorted(data["trade_date"].dropna().unique())
+    data = add_momentum(data, lookback, normalized=True)
+    data["previous_close"] = data.groupby("symbol", sort=False, observed=True)["close"].shift(1)
+    trade_dates = data["trade_date"].to_numpy()
+    boundaries = np.flatnonzero(trade_dates[1:] != trade_dates[:-1]) + 1
+    day_starts = np.concatenate(([0], boundaries))
+    day_ends = np.concatenate((boundaries, [len(data)]))
+    dates = [data.iloc[start]["trade_date"] for start in day_starts]
     if len(dates) <= lookback + 1:
         raise ValueError(f"至少需要 {lookback + 2} 个交易日，当前只有 {len(dates)} 天")
 
@@ -252,19 +268,19 @@ def run_backtest(
     total_turnover = 0.0
     slippage = float(costs.get("slippage_bps", 0.0)) / 10000.0
 
-    for index, date in enumerate(dates):
-        day = data.loc[data["trade_date"] == date].set_index("symbol", drop=False)
-        day_map = {symbol: row for symbol, row in day.iterrows()}
+    for index, (date, start, end) in enumerate(zip(dates, day_starts, day_ends)):
+        day = data.iloc[start:end].set_index("symbol", drop=False)
+        day_date = pd.Timestamp(date).strftime("%Y-%m-%d")
 
         if pending_targets is not None:
             estimate_equity = cash
             for symbol, shares in holdings.items():
-                row = day_map.get(symbol)
+                row = day.loc[symbol] if symbol in day.index else None
                 mark = float(row["open"]) if row is not None and pd.notna(row["open"]) else last_prices.get(symbol, 0.0)
                 estimate_equity += shares * mark
             target_shares: dict[str, int] = {}
             for symbol, weight in pending_targets.items():
-                row = day_map.get(symbol)
+                row = day.loc[symbol] if symbol in day.index else None
                 if row is None or pd.isna(row["open"]) or float(row["open"]) <= 0:
                     continue
                 target_amount = estimate_equity * weight
@@ -277,10 +293,10 @@ def run_backtest(
                 current = holdings.get(symbol, 0)
                 desired = target_shares.get(symbol, 0)
                 quantity = max(0, current - desired)
-                row = day_map.get(symbol)
+                row = day.loc[symbol] if symbol in day.index else None
                 if row is None:
                     if quantity:
-                        blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
+                        blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
                     continue
                 minimum, step = order_constraints(row, "SELL", market, allow_fallback=True)
                 quantity = round_order_quantity(
@@ -291,11 +307,11 @@ def run_backtest(
                     continue
                 eligible, reason = status_is_eligible(row, market, require_order_rules=False)
                 if not eligible:
-                    blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": reason})
+                    blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": reason})
                     continue
                 limit_reason = _price_limit_block(row, row.get("previous_close"), "SELL", market)
                 if limit_reason:
-                    blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": limit_reason})
+                    blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": limit_reason})
                     continue
                 reference = float(row["open"])
                 fill_price = reference * (1.0 - slippage)
@@ -304,17 +320,17 @@ def run_backtest(
                 cash += notional - fees
                 holdings[symbol] = current - quantity
                 total_turnover += notional
-                trades.append({"trade_date": str(date), "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "目標排名/權重調整；次交易日開盤模擬"})
+                trades.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "目標排名/權重調整；次交易日開盤模擬"})
                 if holdings[symbol] <= 0:
                     holdings.pop(symbol, None)
 
             for symbol, desired in target_shares.items():
                 current = holdings.get(symbol, 0)
                 quantity = desired - current
-                row = day_map.get(symbol)
+                row = day.loc[symbol] if symbol in day.index else None
                 if row is None:
                     if quantity > 0:
-                        blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
+                        blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
                     continue
                 minimum, step = order_constraints(row, "BUY", market, allow_fallback=True)
                 quantity = round_order_quantity(quantity, minimum, step)
@@ -322,11 +338,11 @@ def run_backtest(
                     continue
                 eligible, reason = status_is_eligible(row, market, require_order_rules=False)
                 if not eligible:
-                    blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": reason})
+                    blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": reason})
                     continue
                 limit_reason = _price_limit_block(row, row.get("previous_close"), "BUY", market)
                 if limit_reason:
-                    blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": limit_reason})
+                    blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": limit_reason})
                     continue
                 reference = float(row["open"])
                 fill_price = reference * (1.0 + slippage)
@@ -337,24 +353,25 @@ def run_backtest(
                         break
                     quantity -= step
                 if quantity < minimum:
-                    blocked_orders.append({"trade_date": str(date), "symbol": symbol, "side": "BUY", "quantity": desired - current, "reason": "可用現金不足，按買入單位縮減後仍無法成交"})
+                    blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": desired - current, "reason": "可用現金不足，按買入單位縮減後仍無法成交"})
                     continue
                 notional = quantity * fill_price
                 fees = _fees(notional, "BUY", costs)
                 cash -= notional + fees
                 holdings[symbol] = current + quantity
                 total_turnover += notional
-                trades.append({"trade_date": str(date), "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "收盤排名入選；次交易日開盤模擬"})
+                trades.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "收盤排名入選；次交易日開盤模擬"})
             pending_targets = None
 
-        for symbol, row in day_map.items():
-            if pd.notna(row["close"]) and float(row["close"]) > 0:
+        for symbol in holdings:
+            row = day.loc[symbol] if symbol in day.index else None
+            if row is not None and pd.notna(row["close"]) and float(row["close"]) > 0:
                 last_prices[symbol] = float(row["close"])
         equity = cash + sum(shares * last_prices.get(symbol, 0.0) for symbol, shares in holdings.items())
-        equity_rows.append({"trade_date": str(date), "equity_cny": equity, "cash_cny": cash, "holdings_count": len(holdings)})
+        equity_rows.append({"trade_date": day_date, "equity_cny": equity, "cash_cny": cash, "holdings_count": len(holdings)})
 
         if index >= lookback and (index - lookback) % rebalance_sessions == 0 and index + 1 < len(dates):
-            ranked = rank_at_close(data, date, strategy, market, require_order_rules=False)
+            ranked = rank_precomputed_day(day, strategy, market, require_order_rules=False)
             selected = ranked.head(int(strategy["max_positions"]))
             if not selected.empty:
                 target_weight = min(
@@ -367,7 +384,7 @@ def run_backtest(
 
     curve = pd.DataFrame(equity_rows)
     curve["return"] = curve["equity_cny"].pct_change().fillna(0.0)
-    close_returns = data.sort_values(["symbol", "trade_date"]).groupby("symbol")["close"].pct_change()
+    close_returns = data.groupby("symbol", sort=False, observed=True)["close"].pct_change()
     data["raw_close_return"] = close_returns
     benchmark_symbol = str(config.get("benchmark", {}).get("symbol", ""))
     benchmark_data: pd.DataFrame | None = None
@@ -407,7 +424,7 @@ def run_backtest(
 
     compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
     config_json = json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str)
-    data_digest = hashlib.sha256(
+    data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
     ).hexdigest()
     benchmark_data_digest = None
@@ -424,7 +441,13 @@ def run_backtest(
         for source_frame in source_frames
         for value in source_frame["data_source"].dropna().unique()
     })
-    retrieved_values = pd.concat([source_frame["retrieved_at_utc"] for source_frame in source_frames]).dropna()
+    retrieved_values: list[str] = []
+    for source_frame in source_frames:
+        values = source_frame["retrieved_at_utc"]
+        candidates = values.cat.categories if isinstance(values.dtype, pd.CategoricalDtype) else values.dropna().unique()
+        parsed_candidates = [str(value) for value in candidates if not pd.isna(value)]
+        if parsed_candidates:
+            retrieved_values.append(max(parsed_candidates))
     missing_units = data[[
         "buy_min_shares", "buy_step_shares", "sell_min_shares", "sell_step_shares",
     ]].isna().any(axis=1)
@@ -464,7 +487,7 @@ def run_backtest(
         "code_version": __version__,
         **_git_metadata(),
         "data_sources": data_sources,
-        "data_retrieved_at_utc": str(retrieved_values.max()) if not retrieved_values.empty else None,
+        "data_retrieved_at_utc": max(retrieved_values) if retrieved_values else None,
         "universe_symbols": sorted(str(value) for value in data["symbol"].unique()),
         "universe_filter": "status-known, listed and not suspended; ST excluded when configured; momentum threshold from config",
         "features": [f"{lookback}-session adjusted-close momentum"],

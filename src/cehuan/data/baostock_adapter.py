@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import heapq
 import json
 import os
 import tempfile
@@ -14,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from cehuan.data.calendar import normalize_trading_calendar
-from cehuan.data.canonical import canonical_symbol, normalize_bar_frame, write_bars
+from cehuan.data.canonical import BAR_COLUMNS, canonical_symbol, normalize_bar_frame, write_bars
 from cehuan.data.quality import check_data_quality
 
 
@@ -35,7 +37,15 @@ def _vendor_code(symbol: object) -> str:
 
 def _canonical_vendor_symbol(value: object) -> str:
     """BaoStock uses `sh.600519`; project data uses `SH600519`."""
-    return canonical_symbol(str(value).strip().replace(".", ""))
+    raw = str(value).strip().upper()
+    if "." in raw:
+        left, right = raw.rsplit(".", 1)
+        exchanges = {"SH": "SH", "SS": "SH", "SZ": "SZ", "BJ": "BJ"}
+        if left in exchanges and right.isdigit() and len(right) == 6:
+            return f"{exchanges[left]}{right}"
+        if right in exchanges and left.isdigit() and len(left) == 6:
+            return f"{exchanges[right]}{left}"
+    return canonical_symbol(raw)
 
 
 def _query_frame(response: Any, endpoint: str) -> pd.DataFrame:
@@ -101,6 +111,14 @@ class BaoStockSession:
 
     def stock_basic(self) -> pd.DataFrame:
         return self._query("query_stock_basic", self.bs.query_stock_basic)
+
+    def all_stocks(self, day: str) -> pd.DataFrame:
+        """Return BaoStock's date-specific securities list for one market day."""
+        parsed_day = _parse_date(day)
+        return self._query(
+            f"query_all_stock({parsed_day})",
+            lambda: self.bs.query_all_stock(day=parsed_day),
+        )
 
     def history(
         self,
@@ -261,12 +279,73 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _merge_sorted_bar_chunks(chunk_files: list[Path], output_path: Path) -> dict[str, Any]:
+    """Merge date/symbol-sorted CSV chunks without loading the full history in memory."""
+    if not chunk_files:
+        raise ValueError("没有可合并的日线分块")
+    handles = []
+    readers = []
+    try:
+        header: list[str] | None = None
+        for path in chunk_files:
+            handle = path.open("r", encoding="utf-8", newline="")
+            handles.append(handle)
+            reader = csv.reader(handle)
+            current_header = next(reader, None)
+            if current_header is None:
+                continue
+            if header is None:
+                header = current_header
+            elif current_header != header:
+                raise ValueError(f"分块行情字段不一致：{path}")
+            readers.append((path, reader))
+        if header is None or "trade_date" not in header or "symbol" not in header:
+            raise ValueError("分块行情缺少 trade_date 或 symbol")
+        date_index, symbol_index = header.index("trade_date"), header.index("symbol")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rows_written = 0
+        symbols: set[str] = set()
+        dates: set[str] = set()
+        previous_key: tuple[str, str] | None = None
+        with output_path.open("w", encoding="utf-8", newline="") as output_handle:
+            writer = csv.writer(output_handle)
+            writer.writerow(header)
+            merged = heapq.merge(
+                *(reader for _, reader in readers),
+                key=lambda row: (row[date_index], row[symbol_index]),
+            )
+            for row in merged:
+                key = (row[date_index], row[symbol_index])
+                if previous_key == key:
+                    raise ValueError(f"合并行情存在重复 trade_date/symbol：{key}")
+                if previous_key is not None and key < previous_key:
+                    raise ValueError(f"分块行情排序异常：{key} 出现在 {previous_key} 之前")
+                writer.writerow(row)
+                rows_written += 1
+                symbols.add(key[1])
+                dates.add(key[0])
+                previous_key = key
+        if not rows_written:
+            raise ValueError("所有快照批次均无有效日线，无法形成研究数据集")
+        return {
+            "row_count": rows_written,
+            "symbol_count": len(symbols),
+            "symbol_set": symbols,
+            "date_set": dates,
+            "bar_start": min(dates),
+            "bar_end": max(dates),
+        }
+    finally:
+        for handle in handles:
+            handle.close()
+
+
 def _parse_date(value: str) -> str:
     parsed = pd.to_datetime(value, format="%Y%m%d" if value.isdigit() and len(value) == 8 else None, errors="raise")
     return parsed.strftime("%Y-%m-%d")
 
 
-def create_baostock_snapshot(
+def _create_baostock_snapshot_chunk(
     session: BaoStockSession,
     symbols: list[str],
     start_date: str,
@@ -274,6 +353,9 @@ def create_baostock_snapshot(
     root: str | Path,
     snapshot_id: str | None = None,
     benchmark_symbol: str | None = None,
+    shared_calendar: pd.DataFrame | None = None,
+    shared_basics: pd.DataFrame | None = None,
+    metadata_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fetch an immutable, provenance-rich snapshot into a private local folder."""
     start = _parse_date(start_date)
@@ -284,7 +366,7 @@ def create_baostock_snapshot(
     if not normalized_symbols:
         raise ValueError("至少提供一个证券代码")
     if len(normalized_symbols) > 30:
-        raise ValueError("首轮真实数据快照最多支持 30 个代码；扩大股票池前请先审查调用和覆盖")
+        raise ValueError("单个 BaoStock 快照批次最多支持 30 个代码")
 
     created_at = datetime.now(timezone.utc)
     identifier = snapshot_id or f"baostock-{start.replace('-', '')}-{end.replace('-', '')}-{created_at:%Y%m%dT%H%M%SZ}"
@@ -300,12 +382,13 @@ def create_baostock_snapshot(
     raw_dir = temp_path / "raw"
     raw_dir.mkdir()
     try:
-        calendar = session.trade_calendar(start, end)
-        basics = session.stock_basic()
+        calendar = shared_calendar.copy() if shared_calendar is not None else session.trade_calendar(start, end)
+        basics = shared_basics.copy() if shared_basics is not None else session.stock_basic()
         if calendar.empty:
             raise RuntimeError("BaoStock 未返回请求区间的交易日历")
+        metadata_log = metadata_requests if metadata_requests is not None else session.request_log
         calendar_request = next(
-            (entry for entry in session.request_log if entry["endpoint"] == "query_trade_dates"),
+            (entry for entry in metadata_log if entry["endpoint"] == "query_trade_dates"),
             {},
         )
         calendar_normalized = normalize_baostock_calendar(
@@ -334,6 +417,7 @@ def create_baostock_snapshot(
 
         bars: list[pd.DataFrame] = []
         skipped_rows: dict[str, int] = {}
+        missing_symbol_reasons: dict[str, str] = {}
         for symbol in normalized_symbols:
             safe_symbol = symbol.lower()
             basic = basic_by_symbol[symbol]
@@ -346,9 +430,14 @@ def create_baostock_snapshot(
             retrieved = datetime.now(timezone.utc).isoformat(timespec="seconds")
             normalized, skipped = normalize_baostock_history(unadjusted, back_adjusted, basic, retrieved)
             if normalized.empty:
-                raise RuntimeError(f"BaoStock 未返回 {symbol} 的有效原始 OHLC 行")
+                missing_symbol_reasons[symbol] = "NO_VALID_OHLC_ROWS_IN_REQUESTED_PERIOD"
+                skipped_rows[symbol] = skipped
+                continue
             bars.append(normalized)
             skipped_rows[symbol] = skipped
+
+        if not bars:
+            raise RuntimeError("所选代码在请求区间内均未返回有效原始 OHLC 行")
 
         normalized_benchmark: pd.DataFrame | None = None
         benchmark_quality: dict[str, Any] | None = None
@@ -382,9 +471,11 @@ def create_baostock_snapshot(
                 encoding="utf-8",
             )
 
-        normalized_bars = normalize_bar_frame(pd.concat(bars, ignore_index=True))
+        normalized_bars = normalize_bar_frame(
+            pd.concat(bars, ignore_index=True) if bars else pd.DataFrame(columns=BAR_COLUMNS)
+        )
         quality = check_data_quality(normalized_bars, calendar=calendar_normalized)
-        if not quality["healthy"]:
+        if not quality["healthy"] and not normalized_bars.empty:
             raise ValueError("规范行情/交易日历质量检查未通过：" + "; ".join(quality["errors"]))
         bars_path = temp_path / "bars.csv"
         write_bars(normalized_bars, bars_path)
@@ -421,6 +512,7 @@ def create_baostock_snapshot(
             "coverage": {
                 "normalized_bar_rows": int(len(normalized_bars)),
                 "symbols_with_bars": int(normalized_bars["symbol"].nunique()),
+                "symbols_without_valid_bars": missing_symbol_reasons,
                 "bar_start": str(normalized_bars["trade_date"].min()),
                 "bar_end": str(normalized_bars["trade_date"].max()),
                 "raw_rows_by_symbol": {
@@ -464,3 +556,267 @@ def create_baostock_snapshot(
 
         shutil.rmtree(temp_path, ignore_errors=True)
         raise
+
+
+def create_baostock_snapshot(
+    session: BaoStockSession,
+    symbols: list[str],
+    start_date: str,
+    end_date: str,
+    root: str | Path,
+    snapshot_id: str | None = None,
+    benchmark_symbol: str | None = None,
+    batch_size: int = 30,
+    max_batches: int | None = None,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Create a fixed-symbol snapshot, splitting large requests into resumable chunks."""
+    start, end = _parse_date(start_date), _parse_date(end_date)
+    if start > end:
+        raise ValueError("start_date 必须不晚于 end_date")
+    normalized_symbols = list(dict.fromkeys(canonical_symbol(symbol) for symbol in symbols))
+    if not normalized_symbols:
+        raise ValueError("至少提供一个证券代码")
+    if not 1 <= batch_size <= 30:
+        raise ValueError("batch_size 必须在 1 到 30 之间")
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches 必须大于 0")
+    if resume and not snapshot_id:
+        raise ValueError("续跑必须指定与初次运行相同的 --snapshot-id")
+
+    created_at = datetime.now(timezone.utc)
+    identifier = snapshot_id or f"baostock-{start.replace('-', '')}-{end.replace('-', '')}-{created_at:%Y%m%dT%H%M%SZ}"
+    if not identifier or any(part in identifier for part in ("/", "\\", "..")):
+        raise ValueError("snapshot_id 只能使用路径安全的名称")
+    # Keep the historic one-folder shape for small, one-shot snapshots.
+    if len(normalized_symbols) <= batch_size and max_batches is None and not resume:
+        return _create_baostock_snapshot_chunk(
+            session, normalized_symbols, start, end, root, identifier, benchmark_symbol,
+        )
+
+    parent = Path(root).expanduser().resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    destination = parent / identifier
+    partial = parent / f".{identifier}.partial"
+    if destination.exists():
+        raise FileExistsError(f"快照已完成，拒绝覆盖：{destination}")
+    request = {
+        "snapshot_id": identifier,
+        "start_date": start,
+        "end_date": end,
+        "symbols": normalized_symbols,
+        "benchmark_symbol": canonical_symbol(benchmark_symbol) if benchmark_symbol else None,
+        "batch_size": batch_size,
+    }
+    checkpoint_path = partial / "batch_checkpoint.json"
+    if resume:
+        if not partial.exists() or not checkpoint_path.exists():
+            raise FileNotFoundError(f"找不到可续跑快照：{partial}")
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint.get("request") != request:
+            raise ValueError("续跑参数必须与初次运行一致（日期、代码、基准和批大小）")
+    else:
+        if partial.exists():
+            raise FileExistsError(f"发现未完成快照；请添加 --resume：{partial}")
+        partial.mkdir()
+        checkpoint = {"request": request, "created_at_utc": created_at.isoformat(timespec="seconds")}
+        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    shared_dir = partial / "shared"
+    shared_dir.mkdir(exist_ok=True)
+    shared_calendar_path = shared_dir / "trade_calendar.csv"
+    shared_basics_path = shared_dir / "stock_basic_all_types.csv"
+    if not shared_calendar_path.exists() or not shared_basics_path.exists():
+        session.request_log.clear()
+        shared_calendar = session.trade_calendar(start, end)
+        shared_basics = session.stock_basic()
+        if shared_calendar.empty:
+            raise RuntimeError("BaoStock 未返回请求区间的交易日历")
+        _write_source_csv(shared_calendar, shared_calendar_path)
+        _write_source_csv(shared_basics, shared_basics_path)
+        checkpoint["metadata_requests"] = list(session.request_log)
+        session.request_log.clear()
+        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    else:
+        shared_calendar = pd.read_csv(shared_calendar_path, dtype=str)
+        shared_basics = pd.read_csv(shared_basics_path, dtype=str, keep_default_na=False)
+    metadata_requests = list(checkpoint.get("metadata_requests", []))
+
+    chunks = [normalized_symbols[i:i + batch_size] for i in range(0, len(normalized_symbols), batch_size)]
+    completed_this_call = 0
+    chunk_summaries: list[dict[str, Any]] = []
+    for index, chunk_symbols in enumerate(chunks, start=1):
+        chunk_id = f"chunk-{index:05d}"
+        chunk_path = partial / chunk_id
+        if (chunk_path / "manifest.json").exists():
+            chunk_manifest = json.loads((chunk_path / "manifest.json").read_text(encoding="utf-8"))
+            chunk_summaries.append({
+                "chunk_id": chunk_id,
+                "symbols": chunk_symbols,
+                "snapshot_path": chunk_id,
+                "normalized_bar_rows": chunk_manifest["coverage"]["normalized_bar_rows"],
+                "requests": chunk_manifest["requests"],
+            })
+            continue
+        if max_batches is not None and completed_this_call >= max_batches:
+            break
+        session.request_log.clear()
+        chunk_result = _create_baostock_snapshot_chunk(
+            session,
+            chunk_symbols,
+            start,
+            end,
+            partial,
+            chunk_id,
+            benchmark_symbol if index == 1 else None,
+            shared_calendar=shared_calendar,
+            shared_basics=shared_basics,
+            metadata_requests=metadata_requests,
+        )
+        chunk_summaries.append({
+            "chunk_id": chunk_id,
+            "symbols": chunk_symbols,
+            "snapshot_path": chunk_id,
+            "normalized_bar_rows": chunk_result["coverage"]["normalized_bar_rows"],
+            "requests": chunk_result["requests"],
+        })
+        completed_this_call += 1
+        checkpoint["completed_chunks"] = [item["chunk_id"] for item in chunk_summaries]
+        checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    completed_ids = {item["chunk_id"] for item in chunk_summaries}
+    missing_chunks = [f"chunk-{i:05d}" for i in range(1, len(chunks) + 1) if f"chunk-{i:05d}" not in completed_ids]
+    if missing_chunks:
+        return {
+            "state": "partial",
+            "snapshot_id": identifier,
+            "partial_path": str(partial),
+            "completed_chunks": len(completed_ids),
+            "total_chunks": len(chunks),
+            "next_chunks": missing_chunks[:5],
+            "resume_command": f"cehuan snapshot --snapshot-id {identifier} --resume ...",
+        }
+
+    chunk_summaries.sort(key=lambda item: item["chunk_id"])
+    first_chunk = partial / chunk_summaries[0]["chunk_id"]
+    calendar_path = first_chunk / "trading_calendar.csv"
+    calendar = pd.read_csv(calendar_path)
+    merge_summary = _merge_sorted_bar_chunks(
+        [partial / item["chunk_id"] / "bars.csv" for item in chunk_summaries],
+        partial / "bars.csv",
+    )
+    chunk_manifests = [
+        json.loads((partial / item["chunk_id"] / "manifest.json").read_text(encoding="utf-8"))
+        for item in chunk_summaries
+    ]
+    chunk_qualities = [item.get("quality", {}) for item in chunk_manifests]
+    calendar_dates = set(
+        pd.to_datetime(calendar["trade_date"], errors="coerce").dropna().dt.strftime("%Y-%m-%d")
+    )
+    is_open = calendar["is_open"].astype(str).str.lower().isin({"true", "1"})
+    open_dates = set(pd.to_datetime(calendar.loc[is_open, "trade_date"], errors="coerce").dropna().dt.strftime("%Y-%m-%d"))
+    missing_calendar_dates = sorted(merge_summary["date_set"] - calendar_dates)
+    bars_on_closed_dates = sorted((merge_summary["date_set"] & calendar_dates) - open_dates)
+    calendar_errors = []
+    if missing_calendar_dates:
+        calendar_errors.append("行情日期不在导入的交易日历中：" + ", ".join(missing_calendar_dates[:10]))
+    if bars_on_closed_dates:
+        calendar_errors.append("行情出现在日历标记的休市日：" + ", ".join(bars_on_closed_dates[:10]))
+    errors = [error for item in chunk_qualities for error in item.get("errors", [])] + calendar_errors
+    warnings = sorted({warning for item in chunk_qualities for warning in item.get("warnings", [])})
+    retrieved_values = [item.get("retrieved_at_utc") for item in chunk_qualities if item.get("retrieved_at_utc")]
+    required_names = ("trade_date", "symbol", "open", "high", "low", "close", "volume_shares")
+    quality = {
+        "healthy": not errors,
+        "row_count": merge_summary["row_count"],
+        "symbol_count": merge_summary["symbol_count"],
+        "duplicate_count": 0,
+        "missing_required": {column: 0 for column in required_names},
+        "as_of": merge_summary["bar_end"],
+        "retrieved_at_utc": max(retrieved_values) if retrieved_values else None,
+        "retrieved_before_available_count": sum(int(item.get("retrieved_before_available_count", 0)) for item in chunk_qualities),
+        "errors": errors,
+        "warnings": warnings,
+        "calendar_note": "未提供交易所交易日历时，不对非交易日缺口作结论。",
+        "calendar_validation": {
+            "healthy": not calendar_errors,
+            "calendar_source": ", ".join(sorted(set(calendar.get("source", pd.Series(dtype=str)).dropna().astype(str)))),
+            "calendar_start": str(calendar["trade_date"].min()) if not calendar.empty else None,
+            "calendar_end": str(calendar["trade_date"].max()) if not calendar.empty else None,
+            "bar_date_count": len(merge_summary["date_set"]),
+            "missing_calendar_dates": missing_calendar_dates,
+            "bars_on_closed_dates": bars_on_closed_dates,
+            "errors": calendar_errors,
+        },
+    }
+    if not quality["healthy"]:
+        raise ValueError("合并快照质量检查未通过：" + "; ".join(errors))
+    _write_source_csv(calendar, partial / "trading_calendar.csv")
+    (partial / "quality.json").write_text(json.dumps(quality, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    benchmark_file = next((partial / item["chunk_id"] / "benchmark.csv" for item in chunk_summaries if (partial / item["chunk_id"] / "benchmark.csv").exists()), None)
+    benchmark_manifest = next((json.loads((partial / item["chunk_id"] / "manifest.json").read_text(encoding="utf-8")) for item in chunk_summaries if (partial / item["chunk_id"] / "manifest.json").exists() and item["chunk_id"] == "chunk-00001"), {})
+    if benchmark_file is not None:
+        _write_source_csv(pd.read_csv(benchmark_file), partial / "benchmark.csv")
+        benchmark_quality_path = partial / "chunk-00001" / "benchmark_quality.json"
+        if benchmark_quality_path.exists():
+            (partial / "benchmark_quality.json").write_bytes(benchmark_quality_path.read_bytes())
+    files = [p for p in sorted(partial.rglob("*")) if p.is_file() and p.name not in {"manifest.json", "batch_checkpoint.json"}]
+    hashes = {str(p.relative_to(partial)): _sha256(p) for p in files}
+    requests = metadata_requests + [request for chunk in chunk_summaries for request in chunk["requests"]]
+    manifest = {
+        "snapshot_id": identifier,
+        "created_at_utc": checkpoint.get("created_at_utc"),
+        "manifest_generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "provider": "BaoStock",
+        "provider_package_version": session.package_version,
+        "api_endpoints": ["query_trade_dates", "query_stock_basic", "query_history_k_data_plus", "query_adjust_factor"],
+        "date_range": {"start": start, "end": end},
+        "universe": {
+            "selection": "explicit fixed symbols supplied to snapshot; each symbol is processed in resumable chunks",
+            "symbols": normalized_symbols,
+            "security_basic_type_filter": "type=1 (stock)",
+            "batch_size": batch_size,
+            "chunks": [{k: v for k, v in item.items() if k != "requests"} for item in chunk_summaries],
+        },
+        "benchmark": {
+            "symbol": canonical_symbol(benchmark_symbol) if benchmark_symbol else None,
+            "row_count": len(pd.read_csv(partial / "benchmark.csv")) if (partial / "benchmark.csv").exists() else None,
+            "file": "benchmark.csv" if (partial / "benchmark.csv").exists() else None,
+            "price_field": "unadjusted index close; no constituent or dividend return adjustment",
+        },
+        "coverage": {
+            "normalized_bar_rows": merge_summary["row_count"],
+            "symbols_with_bars": merge_summary["symbol_count"],
+            "symbols_without_valid_bars": {
+                symbol: reason
+                for item in chunk_summaries
+                for symbol, reason in json.loads(
+                    (partial / item["chunk_id"] / "manifest.json").read_text(encoding="utf-8")
+                )["coverage"].get("symbols_without_valid_bars", {}).items()
+            },
+            "bar_start": merge_summary["bar_start"],
+            "bar_end": merge_summary["bar_end"],
+            "calendar_rows": int(len(calendar)),
+            "open_sessions": int(calendar["is_open"].astype(bool).sum()) if calendar["is_open"].dtype == bool else int(calendar["is_open"].astype(str).str.lower().eq("true").sum()),
+        },
+        "field_mapping": {
+            "volume": "shares; amount: CNY",
+            "execution_prices": "unadjusted OHLC",
+            "signal_price": "adjustflag=1 back-adjusted close",
+            "is_suspended": "tradestatus=0",
+            "is_st": "isST",
+            "historical_universe": "not provided by this fixed-symbol snapshot; use universe-snapshot for date-specific membership",
+            "price_limit_state_and_pct": "unknown",
+            "share_lot_rules": "unknown",
+        },
+        "requests": requests,
+        "quality": quality,
+        "benchmark_quality": benchmark_manifest.get("benchmark_quality"),
+        "file_sha256": hashes,
+        "normalized_bars_sha256": hashes["bars.csv"],
+        "data_scope_warning": "Fixed-symbol bars only; this snapshot does not on its own remove survivorship bias.",
+    }
+    (partial / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(partial, destination)
+    return {"snapshot_path": str(destination), **manifest}

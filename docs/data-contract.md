@@ -24,9 +24,15 @@
 
 BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `uv sync --extra baostock` 后，可执行 `cehuan snapshot --symbols SH600519,SZ000001 --start 20100101 --end 20261026`。命令保存未复权日线、`adjustflag=1` 后复权日线、复权因子、全量股票基础表、原始交易日历和规范化交易日历，并生成 `bars.csv`、质量报告、`manifest.json` 和 SHA-256 文件清单。指定的指数基准另存为 `benchmark.csv`，不会加入选股池；回测使用 `--benchmark-data` 显式加载。
 
-BaoStock 的 `volume` 映射为股、`amount` 映射为元；`tradestatus=0` 映射为停牌，`isST` 映射为 ST。`ipoDate/outDate` 用于判断请求日期是否在挂牌区间内。日线不含逐日涨跌停阈值或交易单位，快照保持这些字段未知。当前适配器仅限制首轮快照最多 30 个明确指定代码；这不是全市场历史股票池。快照保存在 Git 忽略的 `data/private/snapshots/`，拒绝覆盖已存在的快照 ID。
+`snapshot` 支持 `--symbols-file`、`--batch-size`（每批 1–30 只）、`--max-batches` 和 `--resume`。大任务的每批行情与复权因子独立保存；中断后用相同的代码清单、日期、基准、批大小和 `--snapshot-id ... --resume` 接着运行。最终快照以有序分块归并生成 `bars.csv`，避免把全历史行情一次性装入内存，并保留每批原始响应。未指定 `--max-batches` 时会顺序完成全部批次。
 
-实测覆盖、权限状态、接口限制和本地快照版本见 [数据源审计](data-provider-audit.md) 与 [真实数据基线报告](real-data-baseline.md)。
+`cehuan universe-snapshot --start ... --end ... --snapshot-id ...` 按交易日请求 `query_all_stock(day)`，每个日期的原始列表单独保存，支持 `--batch-size N` 与 `--resume`。最终 `securities_by_date.csv` 按日追加写出，避免将全历史成员记录长期保存在内存；同时保留日期列表成员、最新基础资料类型、挂牌区间核对、当日 `tradeStatus`、ST 状态来源以及候选资格状态。`reconciliation.csv` 列出基础资料挂牌区间认为在市、但日期列表未出现的证券；`daily_coverage.csv` 汇总证券类型、交易状态、ST 未知、行情覆盖和已退市样本覆盖。`universe-audit` 也按日期流式对齐行情和成员名单。可用 `--bars data/private/snapshots/.../bars.csv` 核对行情覆盖。股票池成员由日期列表确定，但类型来自单独查询的基础资料；基础资料类型缺失的证券保留为 `UNKNOWN_TYPE` 并排除，不会推断成股票。
+
+大快照核验通过后，可将生成的点时行情 CSV 交给 `backtest --prevalidated-quality <point_in_time_quality.json>`。该报告由 `universe-audit` 生成，绑定过滤后文件的 SHA-256，并继承源快照质量结果。该模式按类别编码日期、代码和低基数元数据节省内存；不得用它跳过质量或股票池校验。
+
+BaoStock 的 `volume` 映射为股、`amount` 映射为元；`tradestatus=0` 映射为停牌，日线 `isST` 映射为 ST。`query_all_stock(day)` 不提供 ST 字段，缺少匹配历史日线的 ST 状态保持未知，不会被认作可交易。`ipoDate/outDate` 用于挂牌区间交叉核对，不覆盖日期列表成员事实。日线不含逐日涨跌停阈值或交易单位，快照保持这些字段未知。快照保存在 Git 忽略的 `data/private/`，拒绝覆盖已完成的快照 ID；部分任务保留在隐藏的 `.partial` 目录供续跑。
+
+实测覆盖、权限状态、接口限制和本地快照版本见 [数据源审计](data-provider-audit.md)、[真实数据基线报告](real-data-baseline.md) 与[点时股票池核验记录](point-in-time-universe-validation.md)。
 
 ## 交易日历与点时主数据
 

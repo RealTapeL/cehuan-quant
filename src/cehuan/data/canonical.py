@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 
 BAR_COLUMNS = [
@@ -85,9 +86,63 @@ def parse_optional_bool(series: pd.Series) -> pd.Series:
     return series.map(parse).astype("boolean")
 
 
-def normalize_bar_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _map_categorical_values(series: pd.Series, mapper) -> pd.Series:
+    categorical = series.astype("category")
+    mapped = [mapper(value) for value in categorical.cat.categories]
+    if len(set(mapped)) != len(mapped):
+        return series.map(mapper)
+    return pd.Series(
+        pd.Categorical.from_codes(
+            categorical.cat.codes,
+            categories=mapped,
+            ordered=categorical.cat.ordered,
+        ),
+        index=series.index,
+        name=series.name,
+    )
+
+
+def _parse_categorical_bool(series: pd.Series) -> pd.Series:
+    categorical = series.astype("category")
+    parsed = [parse_optional_bool(pd.Series([value])).iloc[0] for value in categorical.cat.categories]
+    codes = categorical.cat.codes.to_numpy(copy=True)
+    remap = np.full(len(parsed), -1, dtype=np.int8)
+    for index, value in enumerate(parsed):
+        if not pd.isna(value):
+            remap[index] = int(bool(value))
+    valid = codes >= 0
+    output_codes = np.full(len(codes), -1, dtype=np.int8)
+    output_codes[valid] = remap[codes[valid]]
+    values = pd.Categorical.from_codes(output_codes, categories=[False, True])
+    return pd.Series(values, index=series.index, name=series.name).astype("boolean")
+
+
+def _parse_categorical_date(series: pd.Series) -> pd.Series:
+    categorical = series.astype("category")
+    parsed = pd.to_datetime(pd.Series(categorical.cat.categories), errors="coerce").dt.date.tolist()
+    categories = sorted({value for value in parsed if value is not pd.NaT and not pd.isna(value)})
+    remap = {value: index for index, value in enumerate(categories)}
+    category_codes = np.asarray([remap.get(value, -1) for value in parsed], dtype=np.int32)
+    old_codes = categorical.cat.codes.to_numpy(copy=False)
+    codes = np.full(len(old_codes), -1, dtype=np.int32)
+    valid = old_codes >= 0
+    codes[valid] = category_codes[old_codes[valid]]
+    return pd.Series(
+        pd.Categorical.from_codes(codes, categories=categories, ordered=True),
+        index=series.index,
+        name=series.name,
+    )
+
+
+def normalize_bar_frame(
+    frame: pd.DataFrame,
+    *,
+    copy_frame: bool = True,
+    compact: bool = False,
+    assume_sorted: bool = False,
+) -> pd.DataFrame:
     """Normalize project CSV data to the canonical schema and safe dtypes."""
-    data = frame.copy()
+    data = frame.copy() if copy_frame else frame
     data.columns = [str(column).strip() for column in data.columns]
     if "date" in data.columns and "trade_date" not in data.columns:
         data = data.rename(columns={"date": "trade_date"})
@@ -99,27 +154,61 @@ def normalize_bar_frame(frame: pd.DataFrame) -> pd.DataFrame:
     for column in BAR_COLUMNS:
         if column not in data.columns:
             data[column] = pd.NA
-    data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.date
-    data["symbol"] = data["symbol"].map(canonical_symbol).astype("string")
+    if compact and isinstance(data["trade_date"].dtype, pd.CategoricalDtype):
+        data["trade_date"] = _parse_categorical_date(data["trade_date"])
+    else:
+        data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.date
+        if compact:
+            data["trade_date"] = data["trade_date"].astype("category")
+    if compact and isinstance(data["symbol"].dtype, pd.CategoricalDtype):
+        data["symbol"] = _map_categorical_values(data["symbol"], canonical_symbol)
+    else:
+        data["symbol"] = data["symbol"].map(canonical_symbol).astype("string")
+        if compact:
+            data["symbol"] = data["symbol"].astype("category")
     for column in PRICE_COLUMNS + [
         "volume_shares", "amount_cny", "price_limit_pct", "buy_min_shares",
         "buy_step_shares", "sell_min_shares", "sell_step_shares",
     ]:
         data[column] = pd.to_numeric(data[column], errors="coerce")
-    data["is_listed"] = parse_optional_bool(data["is_listed"])
-    data["is_suspended"] = parse_optional_bool(data["is_suspended"])
-    data["is_st"] = parse_optional_bool(data["is_st"])
-    data["has_price_limit"] = parse_optional_bool(data["has_price_limit"])
-    data["board"] = data["board"].astype("string")
-    data["market_rule_source"] = data["market_rule_source"].astype("string")
+    for column in ("is_listed", "is_suspended", "is_st", "has_price_limit"):
+        if compact and isinstance(data[column].dtype, pd.CategoricalDtype):
+            data[column] = _parse_categorical_bool(data[column])
+        else:
+            data[column] = parse_optional_bool(data[column])
+    if compact:
+        for column in ("board", "market_rule_source", "name", "data_source", "retrieved_at_utc", "available_at"):
+            data[column] = data[column].astype("category")
+    else:
+        data["board"] = data["board"].astype("string")
+        data["market_rule_source"] = data["market_rule_source"].astype("string")
     for column in ("market_rule_valid_from", "market_rule_valid_to"):
-        data[column] = pd.to_datetime(data[column], errors="coerce").dt.date
-    data = data[BAR_COLUMNS].sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+        if compact and isinstance(data[column].dtype, pd.CategoricalDtype):
+            data[column] = _parse_categorical_date(data[column])
+        else:
+            data[column] = pd.to_datetime(data[column], errors="coerce").dt.date
+            if compact:
+                data[column] = data[column].astype("category")
+    data = data[BAR_COLUMNS]
+    if not assume_sorted:
+        data = data.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
     return data
 
 
-def read_bars(path: str | Path) -> pd.DataFrame:
-    return normalize_bar_frame(pd.read_csv(path))
+def read_bars(path: str | Path, *, compact: bool = False) -> pd.DataFrame:
+    if not compact:
+        return normalize_bar_frame(pd.read_csv(path))
+    dtype: dict[str, object] = {
+        column: "category"
+        for column in (
+            "trade_date", "symbol", "name", "board", "market_rule_source",
+            "market_rule_valid_from", "market_rule_valid_to", "data_source",
+            "retrieved_at_utc", "available_at",
+        )
+    }
+    dtype.update({column: "category" for column in ("is_listed", "is_suspended", "is_st", "has_price_limit")})
+    frame = pd.read_csv(path, dtype=dtype)
+    return normalize_bar_frame(frame, copy_frame=False, compact=True, assume_sorted=True)
 
 
 def write_bars(frame: pd.DataFrame, path: str | Path) -> Path:
