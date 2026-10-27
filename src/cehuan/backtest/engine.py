@@ -444,6 +444,17 @@ def run_backtest(
         int(config.get("backtest", {}).get("rolling_step_sessions", 20)),
     )
     metrics = _metrics(equity_series, curve["return"], total_turnover / max(float(equity_series.mean()), 1.0), benchmark)
+    limitations = [
+        "基线以收盘 t 的信号在下一交易日开盘模拟；不代表可成交价格。",
+        "日线 OHLC 无法重建开盘队列、盘口流动性、真实停牌日与部分涨跌停成交。",
+        "使用原始价结算，没有现金分红、送转、配股、退市与历史成分股处理；结果仅为技术验证。",
+        "配置中的费用费率统一应用于整段历史，不代表历史逐年费率或个人账户实际佣金。",
+        "缺失的涨跌幅阈值、是否限价状态或交易单位使用配置回退假设；成交结果仅用于研究，计划生成要求完整点时证券规则。",
+    ]
+    if benchmark_data is not None:
+        limitations.append("沪深300基准采用价格指数收盘价，不含成分股分红的总回报。")
+    else:
+        limitations.append("没有独立指数行情时，使用输入股票池等权收益作参照；该参照不是市场指数，也不修正幸存者偏差。")
     metrics.update({
         "experiment_id": f"chq-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}",
         "strategy_id": str(strategy["name"]),
@@ -481,13 +492,7 @@ def run_backtest(
         "benchmark_method": benchmark_method,
         "result_type": "research_backtest_not_simulated_or_real_account",
         "quality_warnings": quality["warnings"],
-        "limitations": [
-            "基线以收盘 t 的信号在下一交易日开盘模拟；不代表可成交价格。",
-            "日线 OHLC 无法重建开盘队列、盘口流动性、真实停牌日与部分涨跌停成交。",
-            "使用原始价结算，没有现金分红、送转、配股、退市与历史成分股处理；结果仅为技术验证。",
-            "缺失的涨跌幅阈值、是否限价状态或交易单位使用配置回退假设；成交结果仅用于研究，计划生成要求完整点时证券规则。",
-            "等权输入股票池基准不是指数，不修正幸存者偏差。",
-        ],
+        "limitations": limitations,
     })
     return {
         "metrics": metrics,

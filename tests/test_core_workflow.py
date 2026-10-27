@@ -115,6 +115,8 @@ def test_backtest_uses_independent_configured_index_benchmark():
     assert abs(result["metrics"]["benchmark_return"] - expected_return) < 1e-12
     assert "SH000300" not in result["metrics"]["universe_symbols"]
     assert result["metrics"]["benchmark_data_version_sha256"]
+    assert any("价格指数" in item for item in result["metrics"]["limitations"])
+    assert not any("输入股票池等权" in item for item in result["metrics"]["limitations"])
 
 
 def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
