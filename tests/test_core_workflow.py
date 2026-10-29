@@ -245,7 +245,8 @@ def test_backtest_records_no_position_for_registered_event_without_fake_order():
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 20, "max_positions": 1})
     events = pd.DataFrame([{
-        "event_id": "TEST-1", "old_symbol": "SZ300114", "new_symbol": "SZ302132",
+        "event_id": "TEST-1", "event_type": "CODE_CHANGE_1_TO_1",
+        "old_symbol": "SZ300114", "new_symbol": "SZ302132",
         "effective_date": "2025-01-07", "share_ratio": "1.0",
         "ratio_basis": "old_shares_to_new_shares", "security_identity": "test issuer",
         "event_status": "CONFIRMED", "evidence_type": "test_fixture",
@@ -578,21 +579,35 @@ def test_compact_prevalidated_backtest_matches_standard_run(tmp_path) -> None:
     pd.testing.assert_frame_equal(compact_result["trades"], standard["trades"])
 
 
-def test_prevalidated_point_in_time_data_cannot_run_backtest_before_baseline_gates():
+def test_direct_formal_backtest_requires_the_same_readiness_gate():
     config = load_config()
-    quality = {
-        "healthy": True,
-        "result_type": "prevalidated_source_snapshot_after_streaming_point_in_time_audit",
-        "baseline_ready": False,
-        "baseline_blockers": ["CORPORATE_ACTIONS_INCOMPLETE"],
-    }
-    with pytest.raises(ValueError, match="正式基线未就绪.*CORPORATE_ACTIONS_INCOMPLETE"):
-        run_backtest(bars(16), 100_000, config, prevalidated_quality=quality)
+    with pytest.raises(ValueError, match="formal=True 必须提供就绪报告、全部审计输入路径"):
+        run_backtest(bars(30), 100_000, config, formal=True)
 
 
-def test_baseline_diagnostics_function_has_its_own_disabled_gate(tmp_path):
+def test_unresolved_absorption_merger_blocks_return_when_old_security_remains_held():
     config = load_config()
-    with pytest.raises(ValueError, match="正式点时基线尚未启用"):
+    config["strategy"].update({"lookback_sessions": 2, "rebalance_sessions": 1, "max_positions": 1})
+    dates = pd.bdate_range("2025-07-28", "2025-08-14")
+    rows = []
+    for i, day in enumerate(dates):
+        for symbol in ("SH601989", "SH600000"):
+            if symbol == "SH601989" and day > pd.Timestamp("2025-08-12"):
+                continue
+            close = 8.0 + i * 0.05 if symbol == "SH601989" else 8.0
+            rows.append({
+                "trade_date": day.strftime("%Y-%m-%d"), "symbol": symbol,
+                "open": close, "high": close, "low": close, "close": close,
+                "adjusted_close": close, "volume_shares": 100000, "is_listed": True,
+                "is_suspended": False, "is_st": False, "data_source": "synthetic_merger_test",
+            })
+    with pytest.raises(ValueError, match="个人最终获配数与可估值权益未核实"):
+        run_backtest(pd.DataFrame(rows), 100_000, config)
+
+
+def test_baseline_diagnostics_function_requires_explicit_diagnostic_opt_in(tmp_path):
+    config = load_config()
+    with pytest.raises(ValueError, match="必须显式设置 diagnostic=True"):
         run_baseline_sensitivity(
             bars(16), pd.DataFrame(), bars(16), 100_000, config, tmp_path / "baseline",
         )

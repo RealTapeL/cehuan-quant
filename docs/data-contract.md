@@ -28,9 +28,9 @@ BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `
 
 `cehuan universe-snapshot --start ... --end ... --snapshot-id ...` 按交易日请求 `query_all_stock(day)`，每个日期的原始列表单独保存，支持 `--batch-size N` 与 `--resume`。最终 `securities_by_date.csv` 按日追加写出，避免将全历史成员记录长期保存在内存；同时保留日期列表成员、最新基础资料类型、挂牌区间核对、当日 `tradeStatus`、ST 状态来源以及候选资格状态。`reconciliation.csv` 列出基础资料挂牌区间认为在市、但日期列表未出现的证券；`daily_coverage.csv` 汇总证券类型、交易状态、ST 未知、行情覆盖和已退市样本覆盖。`universe-audit` 也按日期流式对齐行情和成员名单。可用 `--bars data/private/snapshots/.../bars.csv` 核对行情覆盖。股票池成员由日期列表确定，但类型来自单独查询的基础资料；基础资料类型缺失的证券保留为 `UNKNOWN_TYPE` 并排除，不会推断成股票。
 
-`universe-audit` 分别报告 `raw_bar_quality`（原始规范行情质量与来源 manifest 哈希）和 `universe_reconciliation_quality`（逐日成员覆盖、交易/停牌状态及 ST）。缺日线、状态冲突或关键状态未知时，对账健康状态为 false。只有 `configs/security_identity_events.csv` 登记且生效日旧/新代码成员与新代码有效行情均核验通过，旧代码缺行才可标为“已解释”；原始成员数和缺行情数保持不变。`docs/evidence/universe-outdate-boundary-audit.csv` 为 20 条 `outDate` 差异提供逐行独立证据，审计时按日期和代码精确匹配。
+`universe-audit` 分别报告 `raw_bar_quality`（原始规范行情质量与来源 manifest 哈希）和 `universe_reconciliation_quality`（逐日成员覆盖、交易/停牌状态及 ST）。缺日线、状态冲突或关键状态未知时，对账健康状态为 false。只有 `configs/security_identity_events.csv` 登记且生效日旧/新代码成员与新代码有效行情均核验通过，旧代码缺行才可标为“已解释”；原始成员数和缺行情数保持不变。`docs/evidence/universe-outdate-boundary-audit.csv` 为 20 条 `outDate` 差异提供逐行登记；当前 20 行都没有已归档原始公告 SHA-256，所以只是登记匹配，尚未达到证据复核完成。
 
-点时数据的正式基线还受 `research.formal_point_in_time_baseline_enabled` 门控，当前为 `false`。即使数据质量审计通过，在现金分红/送转/配股和退市持仓账务、有效日期市场规则、历史费用校准完成前，`backtest --universe`、`backtest --prevalidated-quality` 与 `baseline-diagnostics` 也会拒绝执行。身份事件只迁移持仓股数、成本基础及持有起始日；新代码信号不接续旧代码价格历史。详情见[证券身份事件与退市边界审计](security-identity.md)。逐条差异保留日期和代码，整体覆盖率不能替代核查。
+点时数据状态分层报告：`raw_bar_quality` 表示规范行情结构与来源哈希检查；`universe_reconciliation_quality` 表示已分类沪深 `type=1` 日成员与日线及状态的对账；`point_in_time_quality` 汇总前两项与身份事件解释，不证明未知类型或全市场历史完整；`baseline_ready` 由 `baseline-readiness` 审计生成，绑定评价窗口、输入 SHA-256、审计代码提交和工作区状态。编辑 TOML 或质量 JSON 不能替代该审计。当前回测引擎还没有实际消费审核过的有效日期交易规则、历史费率及完整公司行动账本，因此正式门控应保持 `NOT_READY`。`backtest` 点时输入必须明确使用 `--formal`（提供就绪报告）或 `--diagnostic`（研究诊断）；`baseline-diagnostics` 需显式 `--diagnostic`，其回退场景不属于正式基线。身份事件只处理 1:1 代码变更；新代码信号不接续旧代码价格历史。详情见[证券身份事件与公司行动边界](security-identity.md)。
 
 BaoStock 0.9.4 原始 `socketutil.send_msg` 在 `recv()` 返回空字节时不会退出，可能永久空转；适配器在单连接会话中安装 EOF 防护，并设置 20 秒 socket 超时。进程内线程锁和跨进程文件锁共同避免本机并发会话。默认请求最小间隔 1 秒；连接错误最多重试 1 次并指数退避，明确的 `10001001`“用户未登录”响应最多重新登录 1 次后重试原请求；其他 API/权限错误不自动重试。默认本地每日预算 49,000 次（包含分页请求），低于官方 50,000 次限制。断点逐日记录 CSV 哈希和行数；续跑先校验成员、日历、基础资料和追加请求日志。哈希不同或结构不符即停止，不覆盖原文件。原有无哈希断点首次续跑时仅在结构、代码唯一性检查通过后登记本地哈希，并标明迁移来源。具体限制与源码行为见[数据源审计](data-provider-audit.md)。
 
@@ -48,7 +48,7 @@ BaoStock 的 `volume` 映射为股、`amount` 映射为元；`tradestatus=0` 映
 
 `examples/trading_calendar_template.csv` 接受 `trade_date,is_open,previous_trade_date,source,retrieved_at_utc`，也识别 Tushare 风格的 `cal_date` 和 `pretrade_date` 列。`quality --calendar` 会检查每个行情日期是否为已知开市日；`plan --calendar` 会校验历史行情覆盖，并标注日历给出的下一个开市日期。请保留文件版本和来源，模板本身不包含真实交易日。
 
-BaoStock 日线可为取得的日期提供 ST/停牌状态，日期成员接口单独提供成员与 `tradeStatus`。2023–2025 点时股票池与行情快照已完成，但审计因一项证券代码迁移缺行和 20 条挂牌元数据差异未通过，不能作为正式基线输入；全历史股票池仍未完成。Tushare 文档列出上市/退市、交易日历、停复牌、涨跌停及历史 ST 接口，权限按端点分别控制；本机没有 Token，账户积分和实际覆盖未知。证券交易规则仍通过有效日期 CSV 输入，缺项保持未知。详见[数据源审计](data-provider-audit.md)与[三年数据审计](three-year-data-audit.md)。
+BaoStock 日线可为取得的日期提供 ST/停牌状态，日期成员接口单独提供成员与 `tradeStatus`。2023–2025 点时股票池与行情快照已完成，但已分类成员内部对账已通过，原始代码迁移缺行仍保留且另列解释；这不证明未分类记录和全市场历史成员完整。全历史股票池仍未完成。Tushare 文档列出上市/退市、交易日历、停复牌、涨跌停及历史 ST 接口，权限按端点分别控制；本机没有 Token，账户积分和实际覆盖未知。证券交易规则仍通过有效日期 CSV 输入，缺项保持未知。详见[数据源审计](data-provider-audit.md)与[三年数据审计](three-year-data-audit.md)。
 
 参考文档：[AKShare A 股历史行情与复权说明](https://akshare.akfamily.xyz/data/stock/stock.html)、[AKShare 数据风险提示](https://github.com/akfamily/akshare/blob/main/docs/data_tips.md)；[BaoStock API](https://www.baostock.com/api/)、[证券基本资料](https://www.baostock.com/mainContent?file=stockBasic.md)、[复权因子](https://www.baostock.com/mainContent?file=factorInfo.md)；[Tushare 股票基础信息](https://tushare.pro/document/1?doc_id=25)、[交易日历](https://tushare.pro/document/2?doc_id=26)、[每日停复牌](https://tushare.pro/document/2?doc_id=214)、[每日涨跌停价](https://tushare.pro/document/2?doc_id=183)、[历史 ST 名单](https://tushare.pro/document/2?doc_id=397)、[复权因子](https://tushare.pro/document/2?doc_id=28)。
 
@@ -63,3 +63,13 @@ BaoStock 日线可为取得的日期提供 ST/停牌状态，日期成员接口�
 ## 需要定期检查的质量项
 
 空字段、重复 (trade_date, symbol)、OHLC 不一致、非正价格、负成交量、代码映射、最后可用日和拉取时间。现有行情接口不支持完整的退市证券/历史股票池质量审计；这项不通过当前单股验证就被默认为已解决。
+
+
+## 正式基线就绪报告
+
+`cehuan baseline-readiness` 不执行回测，只检查点时质量报告、股票池快照、身份事件、公司行动覆盖、有效日期规则、费率、基准日历和配置，并将它们的 SHA-256 与评价窗口写入报告。正式运行还必须在相同输入下匹配此报告。现阶段回测器仍未将独立规则、费率和公司行动账本用于组合模拟，故程序会明确报告该阻断项，不能因 CSV 字段完整就放行。命令格式和空模板见[正式基线门控说明](baseline-readiness.md)。
+
+三年 2023–2025 快照不是 2026-10-29 的当日计划数据。生成近期计划前必须重新核验最近行情是否在收盘后可用，并使用对应交易日历、证券状态与交易规则。
+
+
+可以用 `cehuan universe-unknown-types --universe <snapshot-dir> --bars <bars.csv> --output <review.csv>` 按唯一代码汇总未知类型记录、出现窗口及对应行情行数。CSV 初始分类全为 `UNRESOLVED`；人工改为 `EXPLAINED_NON_STOCK` 或 `ADDED_AS_STOCK` 时必须提供 HTTPS 证据、归档文件 SHA-256、复核人和日期。代码前缀与是否有 OHLC 只作为观察字段，不用于推断类型。命令输出 CSV 与 `.summary.json`，并核对 `unknown_rows = explained_non_stock_rows + added_as_stock_rows + unresolved_rows`。本轮没有对 `data/private/` 运行该审计。

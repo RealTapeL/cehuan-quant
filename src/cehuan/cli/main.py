@@ -16,6 +16,7 @@ from cehuan.config import load_config
 from cehuan.data.akshare_adapter import make_akshare_provider
 from cehuan.data.baostock_adapter import BaoStockSession, create_baostock_snapshot
 from cehuan.data.canonical import read_bars, write_bars
+from cehuan.data.corporate_actions import DEFAULT_CORPORATE_ACTIONS, read_corporate_actions
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import read_security_identity_events, sha256_file
 from cehuan.data.pool import fetch_pool_daily
@@ -28,8 +29,10 @@ from cehuan.data.universe_snapshot import (
     record_baostock_universe_failure,
 )
 from cehuan.data.universe_import import import_historical_universe_csv
+from cehuan.data.unknown_types import audit_unknown_security_types
 from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loader_check
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
+from cehuan.research.baseline_readiness import build_baseline_readiness, readiness_input_hashes
 from cehuan.review.reconcile import (
     compare_plan_and_fills,
     compare_positions_to_plan,
@@ -164,6 +167,21 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--universe", help="可选的每日股票池 CSV 或股票池快照目录；提供后仅回测日期名单中 type=1 股票")
     backtest.add_argument("--prevalidated-quality", help="universe-audit 生成且与 --data 哈希匹配的 point_in_time_quality.json；用于大型 CSV")
     backtest.add_argument("--identity-events", help="证券身份变更事件 CSV；默认读取配置")
+    backtest.add_argument("--out-date-evidence", help="正式模式下绑定的逐条退市边界证据登记表")
+    backtest.add_argument("--unknown-type-review", help="正式模式下绑定的未知类型逐代码分类表")
+    backtest.add_argument("--unknown-type-summary", help="未知类型审计生成的 summary.json")
+    backtest.add_argument("--unknown-type-bars", help="未知类型行情覆盖检查所用的原始规范 bars.csv")
+    backtest.add_argument("--formal", action="store_true", help="正式历史基线；必须提供通过审计且与本次输入完全匹配的 readiness 报告")
+    backtest.add_argument("--diagnostic", action="store_true", help="显式运行非正式研究诊断，可使用配置回退规则")
+    backtest.add_argument("--readiness", help="由 baseline-readiness 生成的就绪报告")
+    backtest.add_argument("--readiness-universe", help="正式模式下绑定 readiness 的点时股票池快照目录")
+    backtest.add_argument("--readiness-quality", help="正式模式下绑定 readiness 的点时质量 JSON")
+    backtest.add_argument("--corporate-actions", help="正式模式下使用的公司行动表")
+    backtest.add_argument("--corporate-action-coverage", help="逐证券公司行动覆盖与来源复核表")
+    backtest.add_argument("--market-rules", help="有效日期交易规则 CSV")
+    backtest.add_argument("--fees", help="有效日期历史费率 CSV")
+    backtest.add_argument("--evaluation-start", help="正式模式评价区间开始日期 YYYY-MM-DD")
+    backtest.add_argument("--evaluation-end", help="正式模式评价区间结束日期 YYYY-MM-DD")
 
     universe_audit = subs.add_parser("universe-audit", help="核对每日股票池、行情覆盖、停牌状态差异和退市样本覆盖")
     universe_audit.add_argument("--universe", required=True, help="包含 manifest.json 与 securities_by_date.csv 的股票池快照目录")
@@ -172,6 +190,30 @@ def _parser() -> argparse.ArgumentParser:
     universe_audit.add_argument("--out-date-evidence", help="逐条退市边界独立证据 CSV；默认读取配置")
     universe_audit.add_argument("--output", default="outputs/universe-audit", help="私有审计结果目录")
 
+    unknown_types = subs.add_parser("universe-unknown-types", help="按证券代码汇总 UNKNOWN_TYPE 成员与行情窗口；不自动推断证券类型")
+    unknown_types.add_argument("--universe", required=True, help="股票池快照目录或 securities_by_date.csv")
+    unknown_types.add_argument("--bars", required=True, help="规范日线 CSV，仅用于报告行情行覆盖观察")
+    unknown_types.add_argument("--output", required=True, help="CSV 复核登记表；复跑会保留已有人工分类")
+
+    readiness = subs.add_parser("baseline-readiness", help="审计正式历史基线的输入完整性并生成散列绑定报告；不运行回测")
+    readiness.add_argument("--data", required=True, help="经过点时过滤的规范 bars.csv")
+    readiness.add_argument("--universe", required=True, help="包含 manifest.json 和 securities_by_date.csv 的快照目录")
+    readiness.add_argument("--point-in-time-quality", required=True)
+    readiness.add_argument("--identity-events", required=True)
+    readiness.add_argument("--out-date-evidence", required=True)
+    readiness.add_argument("--unknown-type-review", required=True)
+    readiness.add_argument("--unknown-type-summary", help="默认读取 --unknown-type-review.csv.summary.json")
+    readiness.add_argument("--unknown-type-bars", required=True)
+    readiness.add_argument("--corporate-actions", required=True)
+    readiness.add_argument("--corporate-action-coverage", required=True)
+    readiness.add_argument("--market-rules", required=True)
+    readiness.add_argument("--fees", required=True)
+    readiness.add_argument("--benchmark-data", required=True)
+    readiness.add_argument("--config")
+    readiness.add_argument("--start", required=True, help="评价窗口开始日期 YYYY-MM-DD")
+    readiness.add_argument("--end", required=True, help="评价窗口结束日期 YYYY-MM-DD")
+    readiness.add_argument("--output", required=True, help="私有 baseline_readiness.json 输出路径")
+
     diagnostics = subs.add_parser("baseline-diagnostics", help="按日期股票池运行冻结基线及单假设敏感性对照")
     diagnostics.add_argument("--data", required=True, help="规范 bars.csv")
     diagnostics.add_argument("--universe", required=True, help="股票池快照目录或 securities_by_date.csv")
@@ -179,6 +221,7 @@ def _parser() -> argparse.ArgumentParser:
     diagnostics.add_argument("--cash", type=float, required=True, help="研究演示资金，不是账户资金")
     diagnostics.add_argument("--config", help="策略配置；默认使用冻结的 configs/default.toml")
     diagnostics.add_argument("--output", help="私有结果目录；默认创建带时间戳的 outputs 子目录")
+    diagnostics.add_argument("--diagnostic", action="store_true", help="确认本命令只运行非正式敏感性诊断")
 
     plan = subs.add_parser("plan", help="生成独立的人工审核交易计划")
     plan.add_argument("--data", required=True)
@@ -426,6 +469,95 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["healthy"] else 2
 
+        if args.command == "universe-unknown-types":
+            universe_path = Path(args.universe).expanduser()
+            bars_path = Path(args.bars).expanduser()
+            output_path = Path(args.output).expanduser()
+            if not universe_path.is_absolute():
+                universe_path = REPO_ROOT / universe_path
+            if not bars_path.is_absolute():
+                bars_path = REPO_ROOT / bars_path
+            if not output_path.is_absolute():
+                output_path = REPO_ROOT / output_path
+            result = audit_unknown_security_types(universe_path, bars_path, output_path)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result["classification_partition_balances"] else 2
+
+        if args.command == "baseline-readiness":
+            def repo_path(value: str) -> Path:
+                path = Path(value).expanduser()
+                return path if path.is_absolute() else REPO_ROOT / path
+
+            data_path = repo_path(args.data)
+            universe_path = repo_path(args.universe)
+            quality_path = repo_path(args.point_in_time_quality)
+            identity_path = repo_path(args.identity_events)
+            out_date_path = repo_path(args.out_date_evidence)
+            unknown_review_path = repo_path(args.unknown_type_review)
+            unknown_summary_path = (
+                repo_path(args.unknown_type_summary)
+                if args.unknown_type_summary
+                else unknown_review_path.with_suffix(unknown_review_path.suffix + ".summary.json")
+            )
+            unknown_bars_path = repo_path(args.unknown_type_bars)
+            actions_path = repo_path(args.corporate_actions)
+            action_coverage_path = repo_path(args.corporate_action_coverage)
+            rules_path = repo_path(args.market_rules)
+            fees_path = repo_path(args.fees)
+            benchmark_path = repo_path(args.benchmark_data)
+            config_path = repo_path(args.config) if args.config else REPO_ROOT / "configs" / "default.toml"
+            output_path = repo_path(args.output)
+            paths = (
+                data_path, universe_path, quality_path, identity_path, out_date_path,
+                unknown_review_path, unknown_summary_path, unknown_bars_path, actions_path,
+                action_coverage_path, rules_path, fees_path, benchmark_path, config_path,
+            )
+            absent = [str(path) for path in paths if not path.exists()]
+            if absent:
+                raise FileNotFoundError("正式基线审计输入不存在：" + ", ".join(absent))
+            hashes = readiness_input_hashes(
+                data=data_path,
+                point_in_time_quality=quality_path,
+                universe=universe_path,
+                identity_events=identity_path,
+                out_date_evidence=out_date_path,
+                unknown_type_review=unknown_review_path,
+                unknown_type_summary=unknown_summary_path,
+                unknown_type_bars=unknown_bars_path,
+                corporate_actions=actions_path,
+                corporate_action_coverage=action_coverage_path,
+                market_rules=rules_path,
+                fees=fees_path,
+                benchmark=benchmark_path,
+                config=config_path,
+            )
+            report = build_baseline_readiness(
+                data=read_bars(data_path),
+                input_hashes=hashes,
+                universe=universe_path,
+                identity_events_path=identity_path,
+                out_date_evidence_path=out_date_path,
+                unknown_type_review_path=unknown_review_path,
+                unknown_type_summary_path=unknown_summary_path,
+                unknown_type_bars_path=unknown_bars_path,
+                point_in_time_quality_path=quality_path,
+                corporate_actions_path=actions_path,
+                corporate_action_coverage_path=action_coverage_path,
+                market_rules_path=rules_path,
+                fees_path=fees_path,
+                benchmark=read_bars(benchmark_path),
+                evaluation_start=args.start,
+                evaluation_end=args.end,
+            )
+            _write_json(report, output_path)
+            print(json.dumps({
+                "readiness_report": str(output_path),
+                "decision": report["decision"],
+                "blockers": report["blockers"],
+                "report_sha256": report["report_sha256"],
+            }, ensure_ascii=False, indent=2))
+            return 0 if report["ready"] else 2
+
         if args.command == "baseline-diagnostics":
             data_path = Path(args.data)
             universe_path = Path(args.universe)
@@ -444,10 +576,10 @@ def main(argv: list[str] | None = None) -> int:
             if not output.is_absolute():
                 output = REPO_ROOT / output
             config = load_config(args.config)
-            if not bool(config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)):
+            if not args.diagnostic:
                 raise ValueError(
-                    "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项；"
-                    "本阶段只完成身份事件与名单边界审计，不运行基线"
+                    "baseline-diagnostics 只运行含规则回退的研究敏感性场景；请显式附加 --diagnostic，"
+                    "不得将其结果称为正式基线"
                 )
             identity_path = _configured_path(config, "security_identity_events_file", None)
             identity_events = read_security_identity_events(identity_path) if identity_path else None
@@ -459,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
                 frozen_config=config,
                 output_dir=output,
                 security_identity_events=identity_events,
+                diagnostic=True,
             )
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             return 0
@@ -476,22 +609,113 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "backtest":
             config = load_config(args.config)
-            if (args.universe or args.prevalidated_quality) and not bool(
-                config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)
-            ):
-                raise ValueError(
-                    "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项；"
-                    "本阶段只完成身份事件与名单边界审计，不运行基线"
-                )
+            if args.formal and args.diagnostic:
+                raise ValueError("--formal 与 --diagnostic 不能同时使用")
+            if (args.universe or args.prevalidated_quality) and not (args.formal or args.diagnostic):
+                raise ValueError("点时股票池/预验证行情必须显式选择 --formal 或 --diagnostic")
+            if not args.formal and args.readiness:
+                raise ValueError("--readiness 只能与 --formal 一起使用")
             identity_path = _configured_path(config, "security_identity_events_file", args.identity_events)
             identity_events = read_security_identity_events(identity_path) if identity_path else None
+            corporate_actions_path = Path(args.corporate_actions).expanduser() if args.corporate_actions else DEFAULT_CORPORATE_ACTIONS
+            if not corporate_actions_path.is_absolute():
+                corporate_actions_path = REPO_ROOT / corporate_actions_path
+            corporate_actions = read_corporate_actions(corporate_actions_path)
+            readiness_report = None
+            expected_readiness_hashes = None
+            readiness_context = None
+            evaluation_start = args.evaluation_start
+            evaluation_end = args.evaluation_end
+            if args.formal:
+                required_formal = {
+                    "--readiness": args.readiness,
+                    "--readiness-universe": args.readiness_universe,
+                    "--out-date-evidence": args.out_date_evidence,
+                    "--unknown-type-review": args.unknown_type_review,
+                    "--unknown-type-bars": args.unknown_type_bars,
+                    "--corporate-actions": args.corporate_actions,
+                    "--corporate-action-coverage": args.corporate_action_coverage,
+                    "--market-rules": args.market_rules,
+                    "--fees": args.fees,
+                    "--benchmark-data": args.benchmark_data,
+                    "--evaluation-start": evaluation_start,
+                    "--evaluation-end": evaluation_end,
+                }
+                missing_formal = [name for name, value in required_formal.items() if not value]
+                if missing_formal:
+                    raise ValueError("正式基线缺少参数：" + ", ".join(missing_formal))
+                if not args.universe and not args.prevalidated_quality:
+                    raise ValueError("正式基线必须提供 --universe 或 --prevalidated-quality 证明点时数据")
+                quality_for_hash_value = args.prevalidated_quality or args.readiness_quality
+                if not quality_for_hash_value:
+                    raise ValueError("正式基线必须通过 --prevalidated-quality 或 --readiness-quality 绑定点时质量报告")
+                if args.prevalidated_quality and args.universe:
+                    raise ValueError("--prevalidated-quality 已表示行情经过股票池过滤，不能再与 --universe 并用")
+                if not identity_path:
+                    raise ValueError("正式基线必须提供证券身份事件表")
+                def formal_path(value: str) -> Path:
+                    path = Path(value).expanduser()
+                    return path if path.is_absolute() else REPO_ROOT / path
+                quality_for_hash = formal_path(quality_for_hash_value)
+                config_for_hash = formal_path(args.config) if args.config else REPO_ROOT / "configs" / "default.toml"
+                data_for_hash = formal_path(args.data)
+                readiness_universe = formal_path(args.readiness_universe)
+                readiness_path = formal_path(args.readiness)
+                actions_for_hash = formal_path(args.corporate_actions)
+                action_coverage_for_hash = formal_path(args.corporate_action_coverage)
+                rules_for_hash = formal_path(args.market_rules)
+                fees_for_hash = formal_path(args.fees)
+                benchmark_for_hash = formal_path(args.benchmark_data)
+                unknown_review_for_hash = formal_path(args.unknown_type_review)
+                unknown_summary_for_hash = (
+                    formal_path(args.unknown_type_summary)
+                    if args.unknown_type_summary
+                    else unknown_review_for_hash.with_suffix(unknown_review_for_hash.suffix + ".summary.json")
+                )
+                unknown_bars_for_hash = formal_path(args.unknown_type_bars)
+                if not readiness_universe.is_dir():
+                    raise ValueError("--readiness-universe 必须是完整股票池快照目录")
+                expected_readiness_hashes = readiness_input_hashes(
+                    data=data_for_hash,
+                    point_in_time_quality=quality_for_hash,
+                    universe=readiness_universe,
+                    identity_events=identity_path,
+                    out_date_evidence=formal_path(args.out_date_evidence),
+                    unknown_type_review=unknown_review_for_hash,
+                    unknown_type_summary=unknown_summary_for_hash,
+                    unknown_type_bars=unknown_bars_for_hash,
+                    corporate_actions=actions_for_hash,
+                    corporate_action_coverage=action_coverage_for_hash,
+                    market_rules=rules_for_hash,
+                    fees=fees_for_hash,
+                    benchmark=benchmark_for_hash,
+                    config=config_for_hash,
+                )
+                readiness_context = {
+                    "data": data_for_hash,
+                    "point_in_time_quality": quality_for_hash,
+                    "universe": readiness_universe,
+                    "identity_events": identity_path,
+                    "out_date_evidence": formal_path(args.out_date_evidence),
+                    "unknown_type_review": unknown_review_for_hash,
+                    "unknown_type_summary": unknown_summary_for_hash,
+                    "unknown_type_bars": unknown_bars_for_hash,
+                    "corporate_actions": actions_for_hash,
+                    "corporate_action_coverage": action_coverage_for_hash,
+                    "market_rules": rules_for_hash,
+                    "fees": fees_for_hash,
+                    "benchmark": benchmark_for_hash,
+                    "config": config_for_hash,
+                }
+                readiness_report = json.loads(readiness_path.read_text(encoding="utf-8"))
             prevalidated_quality = None
             source_data_sha256 = None
             mutate_input = False
-            if args.prevalidated_quality:
-                if args.universe or args.security_master:
+            quality_argument = args.prevalidated_quality or (args.readiness_quality if args.formal else None)
+            if quality_argument:
+                if args.prevalidated_quality and (args.universe or args.security_master):
                     raise ValueError("--prevalidated-quality 仅用于已完成点时股票池过滤与证券主数据校验的规范 CSV")
-                quality_path = Path(args.prevalidated_quality)
+                quality_path = Path(quality_argument)
                 if not quality_path.is_absolute():
                     quality_path = REPO_ROOT / quality_path
                 prevalidated_quality = json.loads(quality_path.read_text(encoding="utf-8"))
@@ -543,7 +767,14 @@ def main(argv: list[str] | None = None) -> int:
                 prevalidated_quality=prevalidated_quality,
                 source_data_sha256=source_data_sha256,
                 security_identity_events=identity_events,
+                corporate_actions=corporate_actions,
                 mutate_input=mutate_input,
+                formal=args.formal,
+                readiness_report=readiness_report,
+                readiness_input_hashes=expected_readiness_hashes,
+                evaluation_start=evaluation_start,
+                evaluation_end=evaluation_end,
+                readiness_context=readiness_context,
             )
             if universe_summary is not None:
                 result["metrics"]["point_in_time_universe_audit"] = universe_summary

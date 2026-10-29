@@ -1390,6 +1390,7 @@ def audit_baostock_universe_prices(
     if missing_total:
         prevalidated_warnings.append(f"点时股票池有 {missing_total} 个股票日缺少日线")
     prevalidated_quality = {
+        "schema_version": 1,
         "healthy": bool(raw_bar_quality["healthy"] and universe_reconciliation_quality["healthy"]),
         "baseline_ready": False,
         "baseline_blockers": [

@@ -21,12 +21,12 @@ def run_baseline_sensitivity(
     frozen_config: dict[str, Any],
     output_dir: str | Path,
     security_identity_events: pd.DataFrame | None = None,
+    *,
+    diagnostic: bool = False,
 ) -> dict[str, Any]:
     """Run the frozen baseline and transparent one-assumption-at-a-time checks."""
-    if not bool(frozen_config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)):
-        raise ValueError(
-            "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项"
-        )
+    if not diagnostic:
+        raise ValueError("敏感性场景含回退假设；必须显式设置 diagnostic=True，不能作为正式基线")
     point_in_time_bars, universe_coverage, discrepancies = filter_bars_to_point_in_time_universe(
         bars, membership, security_identity_events=security_identity_events,
     )

@@ -15,9 +15,17 @@ import numpy as np
 import pandas as pd
 
 from cehuan import __version__
-from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame
+from cehuan.config import load_config
+from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
+from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import normalize_security_identity_events
+from cehuan.research.baseline_readiness import (
+    build_baseline_readiness,
+    readiness_input_hashes as compute_readiness_input_hashes,
+    require_baseline_ready,
+    require_report_matches_recomputed,
+)
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
@@ -220,7 +228,14 @@ def run_backtest(
     prevalidated_quality: dict[str, Any] | None = None,
     source_data_sha256: str | None = None,
     security_identity_events: pd.DataFrame | None = None,
+    corporate_actions: pd.DataFrame | None = None,
     mutate_input: bool = False,
+    formal: bool = False,
+    readiness_report: dict[str, Any] | None = None,
+    readiness_input_hashes: dict[str, str] | None = None,
+    evaluation_start: str | None = None,
+    evaluation_end: str | None = None,
+    readiness_context: dict[str, str | Path] | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -237,20 +252,80 @@ def run_backtest(
         compact=mutate_input,
         assume_sorted=mutate_input,
     )
+    if formal:
+        if (
+            readiness_report is None or readiness_input_hashes is None or not evaluation_start
+            or not evaluation_end or readiness_context is None
+        ):
+            raise ValueError("formal=True 必须提供就绪报告、全部审计输入路径、当前输入散列和评价窗口")
+        context_keys = {
+            "data", "point_in_time_quality", "universe", "identity_events", "out_date_evidence",
+            "unknown_type_review", "unknown_type_summary", "unknown_type_bars", "corporate_actions",
+            "corporate_action_coverage", "market_rules", "fees", "benchmark", "config",
+        }
+        missing_context = context_keys.difference(readiness_context)
+        if missing_context:
+            raise ValueError("正式基线缺少 readiness 输入路径：" + ", ".join(sorted(missing_context)))
+        current_hashes = compute_readiness_input_hashes(**{
+            key: readiness_context[key]
+            for key in context_keys
+        })
+        if current_hashes != readiness_input_hashes:
+            raise ValueError("正式基线输入文件哈希已变化，请先重新运行 baseline-readiness")
+        file_data = normalize_bar_frame(read_bars(readiness_context["data"]))
+        supplied_frame_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+        ).hexdigest()
+        file_frame_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(file_data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+        ).hexdigest()
+        if supplied_frame_digest != file_frame_digest:
+            raise ValueError("正式基线内存行情与散列绑定的 --data 文件内容不同")
+        configured_values = load_config(readiness_context["config"])
+        if configured_values != config:
+            raise ValueError("正式基线运行配置与 readiness 审计所绑定的配置文件不同")
+        if benchmark_frame is None:
+            raise ValueError("正式基线必须加载 readiness 绑定的独立基准数据")
+        file_benchmark = normalize_bar_frame(read_bars(readiness_context["benchmark"]))
+        supplied_benchmark = normalize_bar_frame(benchmark_frame)
+        supplied_benchmark_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(supplied_benchmark[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+        ).hexdigest()
+        file_benchmark_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(file_benchmark[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+        ).hexdigest()
+        if supplied_benchmark_digest != file_benchmark_digest:
+            raise ValueError("正式基线内存基准与 readiness 绑定的基准文件内容不同")
+        recomputed_report = build_baseline_readiness(
+            data=file_data,
+            input_hashes=current_hashes,
+            universe=readiness_context["universe"],
+            identity_events_path=readiness_context["identity_events"],
+            out_date_evidence_path=readiness_context["out_date_evidence"],
+            point_in_time_quality_path=readiness_context["point_in_time_quality"],
+            corporate_actions_path=readiness_context["corporate_actions"],
+            corporate_action_coverage_path=readiness_context["corporate_action_coverage"],
+            market_rules_path=readiness_context["market_rules"],
+            fees_path=readiness_context["fees"],
+            benchmark=file_benchmark,
+            evaluation_start=evaluation_start,
+            evaluation_end=evaluation_end,
+        )
+        require_report_matches_recomputed(readiness_report, recomputed_report)
+        current_commit = _git_metadata().get("git_commit")
+        require_baseline_ready(
+            readiness_report,
+            readiness_input_hashes,
+            evaluation_start,
+            evaluation_end,
+            current_git_commit=current_commit,
+        )
     quality = prevalidated_quality or check_data_quality(
         data,
         large_change_warning=float(config.get("data", {}).get("large_daily_price_change_warning", 0.50)),
     )
     if not quality.get("healthy", False):
         raise ValueError("数据质量检查未通过：" + "; ".join(quality.get("errors", [])))
-    if (
-        quality.get("result_type") == "prevalidated_source_snapshot_after_streaming_point_in_time_audit"
-        and not quality.get("baseline_ready", False)
-    ):
-        raise ValueError(
-            "点时数据质量审计通过，但正式基线未就绪："
-            + "; ".join(quality.get("baseline_blockers", []))
-        )
     strategy = config["strategy"]
     market = config["market"]
     costs = config["costs"]
@@ -260,6 +335,9 @@ def run_backtest(
         raise ValueError("rebalance_sessions 必须大于 0")
 
     identity_events = normalize_security_identity_events(security_identity_events)
+    action_events = normalize_corporate_actions(
+        read_corporate_actions() if corporate_actions is None else corporate_actions
+    )
     symbols_in_data = set(data["symbol"].astype(str).unique())
     if not identity_events.empty:
         identity_events = identity_events.loc[
@@ -297,6 +375,15 @@ def run_backtest(
     for index, (date, start, end) in enumerate(zip(dates, day_starts, day_ends)):
         day = data.iloc[start:end].set_index("symbol", drop=False)
         day_date = pd.Timestamp(date).strftime("%Y-%m-%d")
+
+        for action in action_events.to_dict(orient="records"):
+            old_symbol = str(action["old_symbol"])
+            if day_date > str(action["old_last_trade_date"]) and holdings.get(old_symbol, 0) > 0:
+                raise ValueError(
+                    f"正式/研究净值中止：{old_symbol} 在 {day_date} 仍有 {holdings[old_symbol]} 股，"
+                    f"涉及未完成公司行动 {action['event_id']}；个人最终获配数与可估值权益未核实，"
+                    "不得沿用旧股收盘价或按现金补尾继续计算"
+                )
 
         # A confirmed code replacement transfers the position as a ledger event.
         # It is deliberately excluded from `trades`: no cash, fee, or realized P&L.
@@ -557,6 +644,14 @@ def run_backtest(
         data_digest = hashlib.sha256(
             f"{data_digest}:{identity_event_data_sha256}".encode("utf-8")
         ).hexdigest()
+    corporate_action_data_sha256 = None
+    if not action_events.empty:
+        corporate_action_data_sha256 = hashlib.sha256(
+            action_events.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        ).hexdigest()
+        data_digest = hashlib.sha256(
+            f"{data_digest}:{corporate_action_data_sha256}".encode("utf-8")
+        ).hexdigest()
     benchmark_data_digest = None
     if benchmark_data is not None:
         benchmark_data_digest = hashlib.sha256(
@@ -615,6 +710,8 @@ def run_backtest(
         "data_version_sha256": data_digest,
         "security_identity_events_sha256": identity_event_data_sha256,
         "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
+        "corporate_actions_sha256": corporate_action_data_sha256,
+        "corporate_action_event_ids": action_events["event_id"].astype(str).tolist() if not action_events.empty else [],
         "benchmark_data_version_sha256": benchmark_data_digest,
         "code_version": __version__,
         **_git_metadata(),
@@ -647,7 +744,10 @@ def run_backtest(
             "sell_min_and_step_shares": market.get("sell_lot_shares"),
         },
         "benchmark_method": benchmark_method,
-        "result_type": "research_backtest_not_simulated_or_real_account",
+        "result_type": (
+            "formal_historical_baseline_research_not_simulated_or_real_account"
+            if formal else "research_backtest_not_simulated_or_real_account"
+        ),
         "quality_warnings": quality["warnings"],
         "limitations": limitations,
     })

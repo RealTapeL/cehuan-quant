@@ -52,8 +52,3 @@ cash_note = "Set this to the cash amount you choose before generating a personal
 method = "equal_weight_eligible_universe"
 symbol = "SH000300"
 note = "The initial backtest uses the configured eligible universe as a transparent peer benchmark when index data is absent."
-
-[research]
-# Kept false until historical corporate actions, effective-dated market rules,
-# and historical broker fee assumptions pass their own validation.
-formal_point_in_time_baseline_enabled = false

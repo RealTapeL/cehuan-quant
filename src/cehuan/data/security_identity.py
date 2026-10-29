@@ -16,6 +16,7 @@ DEFAULT_SECURITY_IDENTITY_EVENTS = (
 
 IDENTITY_EVENT_COLUMNS = [
     "event_id",
+    "event_type",
     "old_symbol",
     "new_symbol",
     "effective_date",
@@ -36,8 +37,13 @@ OUT_DATE_EVIDENCE_COLUMNS = [
     "evidence_type",
     "evidence_url",
     "evidence_summary",
+    "announcement_title",
+    "page_reference",
+    "source_sha256",
     "additional_action_required",
     "review_status",
+    "reviewed_by",
+    "reviewed_at",
 ]
 
 
@@ -61,12 +67,16 @@ def normalize_security_identity_events(frame: pd.DataFrame | None) -> pd.DataFra
     if ratios.isna().any() or (~ratios.map(math.isfinite)).any() or (ratios <= 0).any():
         raise ValueError("证券身份事件表 share_ratio 必须为有限正数")
     events["share_ratio"] = ratios.astype(float)
+    if not events["share_ratio"].eq(1.0).all():
+        raise ValueError("CODE_CHANGE_1_TO_1 的 share_ratio 必须严格为 1.0")
     if events["event_id"].eq("").any() or events["security_identity"].eq("").any():
         raise ValueError("证券身份事件表 event_id 与 security_identity 不能为空")
     if events["old_symbol"].eq(events["new_symbol"]).any():
         raise ValueError("证券身份事件的旧代码和新代码不能相同")
+    if not events["event_type"].eq("CODE_CHANGE_1_TO_1").all():
+        raise ValueError("证券身份事件表只接受 CODE_CHANGE_1_TO_1；并购换股必须登记为公司行动")
     if not events["event_status"].eq("CONFIRMED").all():
-        raise ValueError("只有 event_status=CONFIRMED 的事件可以进入回测")
+        raise ValueError("只有 event_status=CONFIRMED 的 1:1 代码变更可以进入回测")
     if not events["ratio_basis"].eq("old_shares_to_new_shares").all():
         raise ValueError("证券身份事件 share_ratio 必须按旧股数到新股数解释")
     if not events["evidence_url"].str.startswith("https://").all():
@@ -115,8 +125,11 @@ def audit_out_date_boundary_evidence(
             "healthy": False,
             "errors": ["点时股票池快照缺少 reconciliation.csv"],
             "source_rows": 0,
+            "register_matched_rows": 0,
             "resolved_rows": 0,
             "unresolved_rows": 0,
+            "source_hash_present_rows": 0,
+            "source_hash_missing_rows": 0,
             "evidence_file": None,
             "evidence_sha256": None,
         }, empty)
@@ -129,8 +142,11 @@ def audit_out_date_boundary_evidence(
             "healthy": True,
             "errors": [],
             "source_rows": 0,
+            "register_matched_rows": 0,
             "resolved_rows": 0,
             "unresolved_rows": 0,
+            "source_hash_present_rows": 0,
+            "source_hash_missing_rows": 0,
             "evidence_file": str(evidence_file) if evidence_file else None,
             "evidence_sha256": digest,
         }, empty)
@@ -146,8 +162,11 @@ def audit_out_date_boundary_evidence(
             "healthy": True,
             "errors": [],
             "source_rows": 0,
+            "register_matched_rows": 0,
             "resolved_rows": 0,
             "unresolved_rows": 0,
+            "source_hash_present_rows": 0,
+            "source_hash_missing_rows": 0,
             "evidence_file": str(Path(evidence_path).expanduser().resolve()) if evidence_path else None,
             "evidence_sha256": sha256_file(evidence_path) if evidence_path and Path(evidence_path).is_file() else None,
         }, empty)
@@ -172,6 +191,8 @@ def audit_out_date_boundary_evidence(
     reviewed_rows: list[dict[str, str]] = []
     errors: list[str] = []
     resolved = 0
+    register_matched = 0
+    source_hash_present = 0
     for row in expected.to_dict(orient="records"):
         key = (str(row["trade_date"]), str(row["symbol"]))
         evidence_row = evidence_index.loc[key] if evidence_index is not None and key in evidence_index.index else None
@@ -188,18 +209,52 @@ def audit_out_date_boundary_evidence(
             and record["evidence_url"].startswith("https://")
             and record["evidence_summary"]
         )
+        if valid:
+            register_matched += 1
+        source_hash_valid = bool(
+            len(record["source_sha256"]) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in record["source_sha256"])
+        )
+        review_complete = bool(
+            valid
+            and source_hash_valid
+            and record["announcement_title"]
+            and record["page_reference"]
+            and record["reviewed_by"]
+            and record["reviewed_at"]
+        )
+        if source_hash_valid:
+            source_hash_present += 1
         record.update({
             "trade_date": key[0],
             "symbol": key[1],
             "source_basic_out_date": str(row["outDate"]),
             "source_discrepancy": str(row["discrepancy"]),
-            "resolution_status": "EXPLAINED_OUT_DATE_BOUNDARY" if valid else "UNRESOLVED_OUT_DATE_BOUNDARY",
+            "register_match_status": "MATCHED" if valid else "UNRESOLVED",
+            "source_review_status": "REVIEW_METADATA_COMPLETE" if review_complete else "REVIEW_METADATA_INCOMPLETE",
+            "source_hash_valid": "true" if source_hash_valid else "false",
+            "resolution_status": (
+                "EXPLAINED_OUT_DATE_BOUNDARY" if review_complete
+                else "EVIDENCE_REGISTER_MATCHED_NEEDS_REVIEW" if valid
+                else "UNRESOLVED_OUT_DATE_BOUNDARY"
+            ),
         })
         reviewed_rows.append(record)
-        if valid:
+        if review_complete:
             resolved += 1
         else:
-            errors.append(f"{key[0]} {key[1]} 的 outDate/日期名单差异缺少匹配的独立公告证据")
+            missing_review = []
+            if not valid:
+                missing_review.append("登记与快照精确匹配")
+            if not source_hash_valid:
+                missing_review.append("原始公告文件 SHA-256")
+            if not record["announcement_title"] or not record["page_reference"]:
+                missing_review.append("公告标题/页码段落引用")
+            if not record["reviewed_by"] or not record["reviewed_at"]:
+                missing_review.append("人工复核人/时间")
+            errors.append(
+                f"{key[0]} {key[1]} 的 outDate 证据未完成复核：" + "、".join(missing_review)
+            )
 
     expected_keys = set(zip(expected["trade_date"].astype(str), expected["symbol"].astype(str)))
     if not evidence.empty:
@@ -211,8 +266,11 @@ def audit_out_date_boundary_evidence(
         "healthy": not errors and resolved == len(expected),
         "errors": errors,
         "source_rows": int(len(expected)),
+        "register_matched_rows": int(register_matched),
         "resolved_rows": int(resolved),
         "unresolved_rows": int(len(expected) - resolved),
+        "source_hash_present_rows": int(source_hash_present),
+        "source_hash_missing_rows": int(len(expected) - source_hash_present),
         "evidence_file": str(evidence_file) if evidence_file else None,
         "evidence_sha256": evidence_hash,
     }, result_frame)

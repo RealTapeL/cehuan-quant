@@ -227,14 +227,21 @@ def test_out_date_evidence_audit_requires_exact_row_and_date_match(tmp_path):
         "trade_date": "2025-05-22", "symbol": "SZ300630", "basic_out_date": "2025-05-22",
         "confirmed_delisting_date": "2025-05-22", "evidence_type": "issuer_notice",
         "evidence_url": "https://example.invalid/notice.pdf", "evidence_summary": "Notice confirms delisting date.",
+        "announcement_title": "Issuer delisting notice (descriptive title)",
+        "page_reference": "Body, delisting date paragraph", "source_sha256": "",
         "additional_action_required": "delisting settlement not modeled",
-        "review_status": "PRIMARY_NOTICE_CONFIRMED",
+        "review_status": "PRIMARY_NOTICE_CONFIRMED", "reviewed_by": "test reviewer",
+        "reviewed_at": "2025-05-23",
     }]).to_csv(evidence, index=False)
 
     quality, reviewed = audit_out_date_boundary_evidence(reconciliation, evidence)
-    assert quality["healthy"] is True
-    assert quality["source_rows"] == quality["resolved_rows"] == 1
-    assert reviewed.iloc[0]["resolution_status"] == "EXPLAINED_OUT_DATE_BOUNDARY"
+    assert quality["healthy"] is False
+    assert quality["source_rows"] == 1
+    assert quality["resolved_rows"] == 0
+    assert quality["register_matched_rows"] == 1
+    assert quality["source_hash_missing_rows"] == 1
+    assert reviewed.iloc[0]["resolution_status"] == "EVIDENCE_REGISTER_MATCHED_NEEDS_REVIEW"
+    assert "SHA-256" in quality["errors"][0]
 
     bad = pd.read_csv(evidence, dtype=str)
     bad.loc[0, "confirmed_delisting_date"] = "2025-05-21"
@@ -360,7 +367,7 @@ def test_official_backtest_command_rejects_universe_reconciliation_failure(tmp_p
 
     exit_code = main([
         "backtest", "--data", str(bars_path), "--universe", str(membership_path),
-        "--cash", "100000", "--config", str(config_path),
+        "--cash", "100000", "--config", str(config_path), "--diagnostic",
     ])
 
     captured = capsys.readouterr()
@@ -369,14 +376,32 @@ def test_official_backtest_command_rejects_universe_reconciliation_failure(tmp_p
     assert "不能把该结果作为正式基线" in captured.err
 
 
-def test_formal_point_in_time_baseline_is_disabled_until_accounting_gates_pass(tmp_path, capsys):
+def test_point_in_time_backtest_requires_explicit_mode_and_config_toggle_cannot_enable_formal(tmp_path, capsys):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[research]\nformal_point_in_time_baseline_enabled = true\n", encoding="utf-8")
     exit_code = main([
         "backtest", "--data", str(tmp_path / "not-read.csv"), "--cash", "100000",
-        "--universe", str(tmp_path / "not-read-universe"),
+        "--universe", str(tmp_path / "not-read-universe"), "--config", str(config_path),
     ])
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "公司行动记账、有效日期交易规则及历史费用校准" in captured.err
+    assert "必须显式选择 --formal 或 --diagnostic" in captured.err
+
+    exit_code = main([
+        "backtest", "--data", str(tmp_path / "not-read.csv"), "--cash", "100000",
+        "--universe", str(tmp_path / "not-read-universe"), "--config", str(config_path), "--formal",
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "正式基线缺少参数" in captured.err
+
+    exit_code = main([
+        "backtest", "--data", str(tmp_path / "not-read.csv"), "--cash", "100000",
+        "--prevalidated-quality", str(tmp_path / "forged-quality.json"), "--config", str(config_path),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "必须显式选择 --formal 或 --diagnostic" in captured.err
 
     exit_code = main([
         "baseline-diagnostics", "--data", str(tmp_path / "not-read.csv"),
@@ -385,4 +410,4 @@ def test_formal_point_in_time_baseline_is_disabled_until_accounting_gates_pass(t
     ])
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "正式点时基线尚未启用" in captured.err
+    assert "请显式附加 --diagnostic" in captured.err
