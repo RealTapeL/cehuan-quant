@@ -19,7 +19,10 @@ from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
 from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
 from cehuan.data.quality import check_data_quality
-from cehuan.data.security_identity import normalize_security_identity_events
+from cehuan.data.security_identity import (
+    normalize_security_identity_events,
+    read_security_identity_events,
+)
 from cehuan.research.baseline_readiness import (
     READINESS_CONTEXT_KEYS,
     build_baseline_readiness,
@@ -56,6 +59,15 @@ def _git_metadata() -> dict[str, Any]:
     except (OSError, subprocess.CalledProcessError):
         pass
     return {"git_commit": commit, "git_dirty": dirty}
+
+
+def _normalized_event_table_digest(frame: pd.DataFrame) -> str:
+    """Hash a normalized event table independent of CSV formatting and dtypes."""
+    canonical = frame.copy()
+    for column in canonical.columns:
+        canonical[column] = canonical[column].astype("string").fillna("")
+    payload = canonical.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _fees(notional: float, side: str, costs: dict[str, Any]) -> float:
@@ -268,6 +280,24 @@ def run_backtest(
         })
         if current_hashes != readiness_input_hashes:
             raise ValueError("正式基线输入文件哈希已变化，请先重新运行 baseline-readiness")
+        bound_identity_events = read_security_identity_events(readiness_context["identity_events"])
+        if security_identity_events is not None:
+            supplied_identity_events = normalize_security_identity_events(security_identity_events)
+            if _normalized_event_table_digest(supplied_identity_events) != _normalized_event_table_digest(
+                bound_identity_events
+            ):
+                raise ValueError("正式基线内存证券身份事件与 readiness 绑定文件内容不一致")
+        security_identity_events = bound_identity_events
+
+        bound_corporate_actions = read_corporate_actions(readiness_context["corporate_actions"])
+        if corporate_actions is not None:
+            supplied_corporate_actions = normalize_corporate_actions(corporate_actions)
+            if _normalized_event_table_digest(supplied_corporate_actions) != _normalized_event_table_digest(
+                bound_corporate_actions
+            ):
+                raise ValueError("正式基线内存公司行动与 readiness 绑定文件内容不一致")
+        corporate_actions = bound_corporate_actions
+
         file_data = normalize_bar_frame(read_bars(readiness_context["data"]))
         supplied_frame_digest = hashlib.sha256(
             pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()

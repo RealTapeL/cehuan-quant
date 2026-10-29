@@ -4,7 +4,7 @@
 
 当前已输出固定规则基线按时间顺序划分的开发/验证/测试指标，以及可配置长度和步长的连续滚动窗口表现诊断。后者观察组合在多个时间段的稳定性，并计入窗口期间回测组合的交易和费用；它不重新训练模型、不重置组合，也不属于滚动样本外验证。规则基线没有拟合模型；测试段只有在策略规则和参数事先冻结时才可作为有效留出结果。
 
-对按日期重建的股票池，使用 `cehuan backtest --universe data/private/universes/<snapshot-id>`。命令只保留相同交易日 `pool_status=STOCK_MEMBER` 的行情，再执行同一基线；未知类型成员会留在审计表中但不进入回测。运行 `cehuan universe-audit --universe <snapshot-dir> --bars <bars.csv>` 可查看逐日行情覆盖、停牌字段差异、未知 ST 和未来退市样本覆盖。缺失行情不会被补价格。
+对按日期重建的股票池，研究诊断使用 `cehuan backtest --diagnostic --universe data/private/universes/<snapshot-id>`。命令只保留相同交易日 `pool_status=STOCK_MEMBER` 的行情；未知类型成员会留在审计表中但不进入诊断回测。正式模式不接受 `--universe`，必须使用同一次 `universe-audit` 生成的过滤行情和预验证质量报告。运行 `cehuan universe-audit --universe <snapshot-dir> --bars <bars.csv>` 可查看逐日行情覆盖、停牌字段差异、未知 ST 和未来退市样本覆盖。缺失行情不会被补价格。
 
 2023–2025 点时快照的身份事件与退市边界复核见[证券身份事件审计](security-identity.md)和[三年数据审计报告](three-year-data-audit.md)。`SZ300114 → SZ302132` 的持仓迁移是单独账簿事件；信号历史不跨代码拼接。20 条 `outDate` 差异逐条保留证据登记，但原始公告 SHA-256 尚未归档，`SH601989` 的 1:0.1339 吸收合并仍需公司行动账务。正式点时基线改由 `baseline-readiness` 生成的散列绑定报告控制；TOML 开关或 `healthy=true` 不能放行。当前模拟器尚未消费审核过的公司行动账本、有效日期交易规则和历史费率，因此仍会阻断正式基线。研究敏感性场景须显式加 `--diagnostic`。此次只修复代码与文档，不重跑基线。此前 68 日固定动量结果仅作为开发诊断，不能称为独立留出或策略绩效结论。
 

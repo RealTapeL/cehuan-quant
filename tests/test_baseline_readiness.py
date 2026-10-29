@@ -11,7 +11,12 @@ import pytest
 from cehuan.backtest.engine import run_backtest
 from cehuan.config import load_config
 from cehuan.data.canonical import read_bars
-from cehuan.data.security_identity import IDENTITY_EVENT_COLUMNS, sha256_file
+from cehuan.data.corporate_actions import read_corporate_actions
+from cehuan.data.security_identity import (
+    IDENTITY_EVENT_COLUMNS,
+    read_security_identity_events,
+    sha256_file,
+)
 from cehuan.data.unknown_types import audit_unknown_security_types
 from cehuan.cli.main import main
 from cehuan.research.baseline_readiness import (
@@ -225,6 +230,64 @@ def test_formal_backtest_recomputes_complete_readiness_and_reports_blockers(tmp_
         )
 
 
+def test_formal_backtest_accepts_event_frames_matching_bound_files(tmp_path):
+    paths = _write_inputs(tmp_path / "formal-matching-events")
+    context, hashes, report = _formal_inputs(paths)
+
+    with pytest.raises(ValueError, match="正式基线未就绪"):
+        run_backtest(
+            read_bars(paths["data"]), 100_000, load_config(paths["config"]),
+            benchmark_frame=read_bars(paths["benchmark"]),
+            security_identity_events=read_security_identity_events(paths["identity"]),
+            corporate_actions=read_corporate_actions(paths["actions"]),
+            formal=True, readiness_report=report, readiness_input_hashes=hashes,
+            evaluation_start="2025-01-02", evaluation_end="2025-01-03",
+            readiness_context=context,
+        )
+
+
+def test_formal_backtest_rejects_identity_events_different_from_bound_file(tmp_path):
+    paths = _write_inputs(tmp_path / "formal-mismatched-identity")
+    context, hashes, report = _formal_inputs(paths)
+
+    with pytest.raises(ValueError, match="内存证券身份事件与 readiness 绑定文件内容不一致"):
+        run_backtest(
+            read_bars(paths["data"]), 100_000, load_config(paths["config"]),
+            security_identity_events=read_security_identity_events(),
+            formal=True, readiness_report=report, readiness_input_hashes=hashes,
+            evaluation_start="2025-01-02", evaluation_end="2025-01-03",
+            readiness_context=context,
+        )
+
+
+def test_formal_backtest_rejects_corporate_actions_different_from_bound_file(tmp_path):
+    paths = _write_inputs(tmp_path / "formal-mismatched-actions")
+    context, hashes, report = _formal_inputs(paths)
+
+    with pytest.raises(ValueError, match="内存公司行动与 readiness 绑定文件内容不一致"):
+        run_backtest(
+            read_bars(paths["data"]), 100_000, load_config(paths["config"]),
+            corporate_actions=read_corporate_actions(),
+            formal=True, readiness_report=report, readiness_input_hashes=hashes,
+            evaluation_start="2025-01-02", evaluation_end="2025-01-03",
+            readiness_context=context,
+        )
+
+
+def test_formal_backtest_rejects_changed_readiness_input_hash(tmp_path):
+    paths = _write_inputs(tmp_path / "formal-stale-hash")
+    context, hashes, report = _formal_inputs(paths)
+    paths["identity"].write_text(paths["identity"].read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="正式基线输入文件哈希已变化"):
+        run_backtest(
+            read_bars(paths["data"]), 100_000, load_config(paths["config"]),
+            formal=True, readiness_report=report, readiness_input_hashes=hashes,
+            evaluation_start="2025-01-02", evaluation_end="2025-01-03",
+            readiness_context=context,
+        )
+
+
 def test_formal_backtest_rejects_incomplete_readiness_context_before_reaudit(tmp_path):
     paths = _write_inputs(tmp_path / "formal-missing-context")
     context, hashes, report = _formal_inputs(paths)
@@ -317,3 +380,31 @@ def test_baseline_readiness_cli_writes_a_blocked_report_without_running_backtest
     assert '"decision": "NOT_READY"' in captured.out
     assert report["ready"] is False
     assert "EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER" in report["blockers"]
+
+
+def test_formal_cli_requires_prevalidated_filtered_bars_and_rejects_universe(tmp_path, capsys):
+    paths = _write_inputs(tmp_path / "formal-cli-contract")
+    common = [
+        "--data", str(paths["data"]), "--cash", "100000",
+        "--readiness", str(tmp_path / "readiness.json"),
+        "--readiness-universe", str(paths["universe"]),
+        "--out-date-evidence", str(paths["evidence"]),
+        "--unknown-type-review", str(paths["unknown_review"]),
+        "--unknown-type-bars", str(paths["data"]),
+        "--identity-events", str(paths["identity"]),
+        "--corporate-actions", str(paths["actions"]),
+        "--corporate-action-coverage", str(paths["action_coverage"]),
+        "--market-rules", str(paths["rules"]), "--fees", str(paths["fees"]),
+        "--benchmark-data", str(paths["benchmark"]),
+        "--evaluation-start", "2025-01-02", "--evaluation-end", "2025-01-03",
+        "--config", str(paths["config"]),
+    ]
+    exit_code = main(["backtest", *common, "--formal", "--universe", str(paths["universe"])])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "正式模式不接受 --universe" in captured.err
+
+    exit_code = main(["backtest", *common, "--formal"])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "正式基线必须提供 --prevalidated-quality" in captured.err

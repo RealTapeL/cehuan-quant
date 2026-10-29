@@ -56,6 +56,8 @@ uv run cehuan backtest \
 
 当前回测引擎尚未把经审计的有效日期规则、历史费率及完整公司行动账本用于逐日组合模拟。因此 readiness 报告会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。不得手工删除阻断项。
 
-`backtest --universe` 或 `--prevalidated-quality` 若用于探索，必须明确 `--diagnostic`；没有该标记不能把结果误称正式基线。`baseline-diagnostics` 产生规则回退和假设敏感性场景，必须显式传 `--diagnostic`。研究诊断结果仍不是模拟账户或华泰真实账户结果。
+正式回测唯一支持的行情输入是同一次 `universe-audit` 生成的 `--data <point_in_time_bars.csv>` 与 `--prevalidated-quality <point_in_time_quality.json>`。`--formal --universe` 会被拒绝，避免把原始快照与过滤后内存数据混用。`--readiness-universe` 仍指向原始股票池快照目录，用于重新核验成员、manifest 和证据；它不是行情过滤参数。若同时提供 `--readiness-quality`，其文件内容必须与 `--prevalidated-quality` 相同。
+
+探索回测可使用 `--diagnostic --universe`，也可使用 `--diagnostic --prevalidated-quality`；没有显式诊断标记不能把结果称为正式基线。`baseline-diagnostics` 产生规则回退和假设敏感性场景，也必须显式传 `--diagnostic`。研究诊断结果仍不是模拟账户或华泰真实账户结果。
 
 三年快照汇总中的内部覆盖率只对已分类沪深 `type=1` 股票日成立；未知类型记录不在分母内，北交所未覆盖。该数据集不支持 2026-10-29 当日计划。正式策略评价前还需在持有私有数据的机器上重新核验快照、完成未知类型审计并归档公告原件。

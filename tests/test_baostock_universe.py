@@ -393,7 +393,7 @@ def test_point_in_time_backtest_requires_explicit_mode_and_config_toggle_cannot_
     ])
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "正式基线缺少参数" in captured.err
+    assert "正式模式不接受 --universe" in captured.err
 
     exit_code = main([
         "backtest", "--data", str(tmp_path / "not-read.csv"), "--cash", "100000",

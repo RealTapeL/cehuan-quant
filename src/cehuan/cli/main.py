@@ -164,8 +164,8 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--config")
     backtest.add_argument("--security-master")
     backtest.add_argument("--benchmark-data", help="可选独立基准规范日线 CSV")
-    backtest.add_argument("--universe", help="可选的每日股票池 CSV 或股票池快照目录；提供后仅回测日期名单中 type=1 股票")
-    backtest.add_argument("--prevalidated-quality", help="universe-audit 生成且与 --data 哈希匹配的 point_in_time_quality.json；用于大型 CSV")
+    backtest.add_argument("--universe", help="仅供 --diagnostic 使用的每日股票池 CSV 或快照目录")
+    backtest.add_argument("--prevalidated-quality", help="universe-audit 生成且与已过滤 --data 哈希匹配的 point_in_time_quality.json")
     backtest.add_argument("--identity-events", help="证券身份变更事件 CSV；默认读取配置")
     backtest.add_argument("--out-date-evidence", help="正式模式下绑定的逐条退市边界证据登记表")
     backtest.add_argument("--unknown-type-review", help="正式模式下绑定的未知类型逐代码分类表")
@@ -611,6 +611,11 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config(args.config)
             if args.formal and args.diagnostic:
                 raise ValueError("--formal 与 --diagnostic 不能同时使用")
+            if args.formal and args.universe:
+                raise ValueError(
+                    "正式模式不接受 --universe；请先运行 universe-audit，并将其过滤后的 point_in_time_bars.csv "
+                    "与对应 --prevalidated-quality 一起传入"
+                )
             if (args.universe or args.prevalidated_quality) and not (args.formal or args.diagnostic):
                 raise ValueError("点时股票池/预验证行情必须显式选择 --formal 或 --diagnostic")
             if not args.formal and args.readiness:
@@ -644,19 +649,21 @@ def main(argv: list[str] | None = None) -> int:
                 missing_formal = [name for name, value in required_formal.items() if not value]
                 if missing_formal:
                     raise ValueError("正式基线缺少参数：" + ", ".join(missing_formal))
-                if not args.universe and not args.prevalidated_quality:
-                    raise ValueError("正式基线必须提供 --universe 或 --prevalidated-quality 证明点时数据")
-                quality_for_hash_value = args.prevalidated_quality or args.readiness_quality
-                if not quality_for_hash_value:
-                    raise ValueError("正式基线必须通过 --prevalidated-quality 或 --readiness-quality 绑定点时质量报告")
-                if args.prevalidated_quality and args.universe:
-                    raise ValueError("--prevalidated-quality 已表示行情经过股票池过滤，不能再与 --universe 并用")
+                if not args.prevalidated_quality:
+                    raise ValueError(
+                        "正式基线必须提供 --prevalidated-quality，且 --data 必须是同次 universe-audit 生成的过滤行情"
+                    )
+                quality_for_hash_value = args.prevalidated_quality
                 if not identity_path:
                     raise ValueError("正式基线必须提供证券身份事件表")
                 def formal_path(value: str) -> Path:
                     path = Path(value).expanduser()
                     return path if path.is_absolute() else REPO_ROOT / path
                 quality_for_hash = formal_path(quality_for_hash_value)
+                if args.readiness_quality:
+                    readiness_quality_path = formal_path(args.readiness_quality)
+                    if sha256_file(quality_for_hash) != sha256_file(readiness_quality_path):
+                        raise ValueError("--readiness-quality 必须与 --prevalidated-quality 指向内容相同的点时质量报告")
                 config_for_hash = formal_path(args.config) if args.config else REPO_ROOT / "configs" / "default.toml"
                 data_for_hash = formal_path(args.data)
                 readiness_universe = formal_path(args.readiness_universe)
