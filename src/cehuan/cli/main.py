@@ -17,6 +17,7 @@ from cehuan.data.akshare_adapter import make_akshare_provider
 from cehuan.data.baostock_adapter import BaoStockSession, create_baostock_snapshot
 from cehuan.data.canonical import read_bars, write_bars
 from cehuan.data.quality import check_data_quality
+from cehuan.data.security_identity import read_security_identity_events, sha256_file
 from cehuan.data.pool import fetch_pool_daily
 from cehuan.data.security_master import apply_security_master
 from cehuan.data.universe_snapshot import (
@@ -66,6 +67,14 @@ def _console_metrics_summary(metrics: dict[str, object]) -> dict[str, object]:
 def _provider_for(config: dict[str, object], source: str | None):
     configured = str(config.get("data", {}).get("provider", "eastmoney"))
     return make_akshare_provider(source or configured)
+
+
+def _configured_path(config: dict[str, object], key: str, argument: str | None) -> Path | None:
+    value = argument or config.get("data", {}).get(key)
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -154,10 +163,13 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--benchmark-data", help="可选独立基准规范日线 CSV")
     backtest.add_argument("--universe", help="可选的每日股票池 CSV 或股票池快照目录；提供后仅回测日期名单中 type=1 股票")
     backtest.add_argument("--prevalidated-quality", help="universe-audit 生成且与 --data 哈希匹配的 point_in_time_quality.json；用于大型 CSV")
+    backtest.add_argument("--identity-events", help="证券身份变更事件 CSV；默认读取配置")
 
     universe_audit = subs.add_parser("universe-audit", help="核对每日股票池、行情覆盖、停牌状态差异和退市样本覆盖")
     universe_audit.add_argument("--universe", required=True, help="包含 manifest.json 与 securities_by_date.csv 的股票池快照目录")
     universe_audit.add_argument("--bars", required=True, help="规范 bars.csv")
+    universe_audit.add_argument("--identity-events", help="证券身份变更事件 CSV；默认读取配置")
+    universe_audit.add_argument("--out-date-evidence", help="逐条退市边界独立证据 CSV；默认读取配置")
     universe_audit.add_argument("--output", default="outputs/universe-audit", help="私有审计结果目录")
 
     diagnostics = subs.add_parser("baseline-diagnostics", help="按日期股票池运行冻结基线及单假设敏感性对照")
@@ -390,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "universe-audit":
+            config = load_config()
             universe = Path(args.universe)
             bars = Path(args.bars)
             output = Path(args.output)
@@ -399,7 +412,17 @@ def main(argv: list[str] | None = None) -> int:
                 bars = REPO_ROOT / bars
             if not output.is_absolute():
                 output = REPO_ROOT / output
-            result = audit_baostock_universe_prices(universe, bars, output)
+            identity_path = _configured_path(config, "security_identity_events_file", args.identity_events)
+            out_date_path = _configured_path(config, "out_date_evidence_file", args.out_date_evidence)
+            identity_events = read_security_identity_events(identity_path) if identity_path else None
+            result = audit_baostock_universe_prices(
+                universe,
+                bars,
+                output,
+                security_identity_events=identity_events,
+                security_identity_events_sha256=sha256_file(identity_path) if identity_path else None,
+                out_date_evidence_path=out_date_path,
+            )
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["healthy"] else 2
 
@@ -421,6 +444,13 @@ def main(argv: list[str] | None = None) -> int:
             if not output.is_absolute():
                 output = REPO_ROOT / output
             config = load_config(args.config)
+            if not bool(config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)):
+                raise ValueError(
+                    "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项；"
+                    "本阶段只完成身份事件与名单边界审计，不运行基线"
+                )
+            identity_path = _configured_path(config, "security_identity_events_file", None)
+            identity_events = read_security_identity_events(identity_path) if identity_path else None
             result = run_baseline_sensitivity(
                 bars=read_bars(data_path),
                 membership=pd.read_csv(universe_path, dtype=str, keep_default_na=False),
@@ -428,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_cash_cny=args.cash,
                 frozen_config=config,
                 output_dir=output,
+                security_identity_events=identity_events,
             )
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             return 0
@@ -445,6 +476,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "backtest":
             config = load_config(args.config)
+            if (args.universe or args.prevalidated_quality) and not bool(
+                config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)
+            ):
+                raise ValueError(
+                    "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项；"
+                    "本阶段只完成身份事件与名单边界审计，不运行基线"
+                )
+            identity_path = _configured_path(config, "security_identity_events_file", args.identity_events)
+            identity_events = read_security_identity_events(identity_path) if identity_path else None
             prevalidated_quality = None
             source_data_sha256 = None
             mutate_input = False
@@ -480,7 +520,9 @@ def main(argv: list[str] | None = None) -> int:
                 if universe_path.is_dir():
                     universe_path = universe_path / "securities_by_date.csv"
                 membership = pd.read_csv(universe_path, dtype=str, keep_default_na=False)
-                bars, universe_summary, universe_discrepancies = filter_bars_to_point_in_time_universe(bars, membership)
+                bars, universe_summary, universe_discrepancies = filter_bars_to_point_in_time_universe(
+                    bars, membership, security_identity_events=identity_events,
+                )
                 reconciliation = universe_summary["reconciliation_quality"]
                 if not reconciliation["healthy"]:
                     raise ValueError(
@@ -500,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 benchmark_frame=benchmark,
                 prevalidated_quality=prevalidated_quality,
                 source_data_sha256=source_data_sha256,
+                security_identity_events=identity_events,
                 mutate_input=mutate_input,
             )
             if universe_summary is not None:
@@ -511,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
             result["equity_curve"].to_csv(folder / "equity_curve.csv", index=False)
             result["trades"].to_csv(folder / "trades.csv", index=False)
             result["blocked_orders"].to_csv(folder / "blocked_orders.csv", index=False)
+            result["security_events"].to_csv(folder / "security_events.csv", index=False)
+            result["open_positions"].to_csv(folder / "open_positions.csv", index=False)
             if universe_summary is not None:
                 _write_json(universe_summary, folder / "point_in_time_universe_audit.json")
                 universe_discrepancies.to_csv(folder / "point_in_time_universe_discrepancies.csv", index=False)

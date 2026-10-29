@@ -1,0 +1,2 @@
+event_id,old_symbol,new_symbol,effective_date,share_ratio,ratio_basis,security_identity,event_status,evidence_type,evidence_url,evidence_summary
+SZ300114-to-SZ302132-2025-02-17,SZ300114,SZ302132,2025-02-17,1.0,old_shares_to_new_shares,中航成飞股份有限公司,CONFIRMED,issuer_implementation_notice,https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF,公告确认同一上市主体于2025-02-17开市起启用新代码；登记在册旧代码股份转为新代码且持股数量不变；简称与代码变化不表示信号价格序列已连续。

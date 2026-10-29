@@ -28,7 +28,9 @@ BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `
 
 `cehuan universe-snapshot --start ... --end ... --snapshot-id ...` 按交易日请求 `query_all_stock(day)`，每个日期的原始列表单独保存，支持 `--batch-size N` 与 `--resume`。最终 `securities_by_date.csv` 按日追加写出，避免将全历史成员记录长期保存在内存；同时保留日期列表成员、最新基础资料类型、挂牌区间核对、当日 `tradeStatus`、ST 状态来源以及候选资格状态。`reconciliation.csv` 列出基础资料挂牌区间认为在市、但日期列表未出现的证券；`daily_coverage.csv` 汇总证券类型、交易状态、ST 未知、行情覆盖和已退市样本覆盖。`universe-audit` 也按日期流式对齐行情和成员名单。可用 `--bars data/private/snapshots/.../bars.csv` 核对行情覆盖。股票池成员由日期列表确定，但类型来自单独查询的基础资料；基础资料类型缺失的证券保留为 `UNKNOWN_TYPE` 并排除，不会推断成股票。
 
-`universe-audit` 分别报告 `raw_bar_quality`（原始规范行情质量与来源 manifest 哈希）和 `universe_reconciliation_quality`（逐日成员覆盖、交易/停牌状态及 ST）。缺日线、状态冲突或关键状态未知时，对账健康状态为 false；`backtest --universe`、`baseline-diagnostics` 和紧凑数据预验证均拒绝把未通过的结果列作正式基线。逐条差异保留日期和代码，整体覆盖率不能替代核查。
+`universe-audit` 分别报告 `raw_bar_quality`（原始规范行情质量与来源 manifest 哈希）和 `universe_reconciliation_quality`（逐日成员覆盖、交易/停牌状态及 ST）。缺日线、状态冲突或关键状态未知时，对账健康状态为 false。只有 `configs/security_identity_events.csv` 登记且生效日旧/新代码成员与新代码有效行情均核验通过，旧代码缺行才可标为“已解释”；原始成员数和缺行情数保持不变。`docs/evidence/universe-outdate-boundary-audit.csv` 为 20 条 `outDate` 差异提供逐行独立证据，审计时按日期和代码精确匹配。
+
+点时数据的正式基线还受 `research.formal_point_in_time_baseline_enabled` 门控，当前为 `false`。即使数据质量审计通过，在现金分红/送转/配股和退市持仓账务、有效日期市场规则、历史费用校准完成前，`backtest --universe`、`backtest --prevalidated-quality` 与 `baseline-diagnostics` 也会拒绝执行。身份事件只迁移持仓股数、成本基础及持有起始日；新代码信号不接续旧代码价格历史。详情见[证券身份事件与退市边界审计](security-identity.md)。逐条差异保留日期和代码，整体覆盖率不能替代核查。
 
 BaoStock 0.9.4 原始 `socketutil.send_msg` 在 `recv()` 返回空字节时不会退出，可能永久空转；适配器在单连接会话中安装 EOF 防护，并设置 20 秒 socket 超时。进程内线程锁和跨进程文件锁共同避免本机并发会话。默认请求最小间隔 1 秒；连接错误最多重试 1 次并指数退避，明确的 `10001001`“用户未登录”响应最多重新登录 1 次后重试原请求；其他 API/权限错误不自动重试。默认本地每日预算 49,000 次（包含分页请求），低于官方 50,000 次限制。断点逐日记录 CSV 哈希和行数；续跑先校验成员、日历、基础资料和追加请求日志。哈希不同或结构不符即停止，不覆盖原文件。原有无哈希断点首次续跑时仅在结构、代码唯一性检查通过后登记本地哈希，并标明迁移来源。具体限制与源码行为见[数据源审计](data-provider-audit.md)。
 

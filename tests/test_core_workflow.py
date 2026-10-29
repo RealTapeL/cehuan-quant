@@ -14,12 +14,14 @@ from cehuan.data.calendar import next_open_session, validate_bars_against_calend
 from cehuan.data.canonical import canonical_symbol, read_bars
 from cehuan.data.pool import fetch_pool_daily
 from cehuan.data.quality import check_data_quality
+from cehuan.data.security_identity import read_security_identity_events
 from cehuan.review.reconcile import (
     compare_plan_and_fills,
     compare_positions_to_plan,
     read_fills,
     read_positions,
 )
+from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.qlib_bridge import calculate_qlib_momentum
 from cehuan.signals.plan import generate_plan
 from cehuan.signals.strategy import add_momentum
@@ -176,6 +178,88 @@ def test_backtest_sells_existing_holding_after_it_becomes_st():
     assert "BUY" in sim001_trades["side"].tolist()
     assert "SELL" in sim001_trades["side"].tolist()
     assert sim001_trades.loc[sim001_trades["side"] == "SELL", "trade_date"].min() > st_start_date
+
+
+def _code_change_bars(days: int = 20, event_index: int = 6) -> pd.DataFrame:
+    data = bars(days)
+    rows = data.loc[data["symbol"] == "SIM001"].copy().sort_values("trade_date")
+    dates = rows["trade_date"].tolist()
+    rows.loc[rows.index[:event_index], "symbol"] = "SZ300114"
+    rows.loc[rows.index[event_index:], "symbol"] = "SZ302132"
+    # The successor starts with its own price history and turns down, so the
+    # first fresh signal can later request an exit without splicing old prices.
+    successor_indices = rows.index[event_index:]
+    start_price = float(rows.loc[successor_indices[0], "close"])
+    for offset, row_index in enumerate(successor_indices):
+        close = round(start_price - 0.25 * offset, 2)
+        open_price = close if offset == 0 else round(start_price - 0.25 * (offset - 1), 2)
+        rows.loc[row_index, ["open", "high", "low", "close", "adjusted_close"]] = [
+            open_price, max(open_price, close) + 0.05, min(open_price, close) - 0.05, close, close,
+        ]
+    data = data.loc[data["symbol"] != "SIM001"].copy()
+    return pd.concat([data, rows], ignore_index=True).sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+
+
+def test_backtest_migrates_holding_without_trade_or_fee_and_sells_successor_after_fresh_signal():
+    config = load_config()
+    config["strategy"].update({
+        "lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1,
+        "max_position_weight": 0.8, "max_total_exposure": 0.8,
+    })
+    data = _code_change_bars()
+    signalled = add_momentum(data, 3)
+    successor_signal = signalled.loc[signalled["symbol"] == "SZ302132", "momentum"]
+    assert successor_signal.iloc[:3].isna().all()
+    assert pd.notna(successor_signal.iloc[3])
+    events = read_security_identity_events()
+    events["effective_date"] = "2025-01-07"
+    result = run_backtest(data, 100_000, config, security_identity_events=events)
+
+    migration = result["security_events"].loc[
+        result["security_events"]["event_type"] == "MIGRATE_POSITION"
+    ].iloc[0]
+    event_day = migration["trade_date"]
+    assert migration["old_symbol"] == "SZ300114"
+    assert migration["new_symbol"] == "SZ302132"
+    assert migration["old_shares"] == migration["new_shares"]
+    assert migration["cost_basis_before_cny"] == migration["cost_basis_after_cny"]
+    assert migration["cash_before_cny"] == migration["cash_after_cny"]
+    assert migration["trade_count_before"] == migration["trade_count_after"]
+    assert not result["trades"].loc[result["trades"]["trade_date"] == event_day, "symbol"].eq("SZ302132").any()
+    assert not (
+        result["trades"]["symbol"].eq("SZ300114")
+        & result["trades"]["trade_date"].ge(event_day)
+    ).any()
+
+    successor_trades = result["trades"].loc[result["trades"]["symbol"] == "SZ302132"]
+    assert successor_trades["side"].tolist() == ["SELL"]
+    assert successor_trades.iloc[0]["quantity"] == migration["new_shares"]
+    assert successor_trades.iloc[0]["allocated_cost_basis_cny"] == migration["cost_basis_after_cny"]
+    dates = sorted(data["trade_date"].unique().tolist())
+    assert dates.index(successor_trades.iloc[0]["trade_date"]) > dates.index(event_day) + config["strategy"]["lookback_sessions"]
+    assert successor_trades.iloc[0]["holding_since"] < event_day
+    assert pd.notna(successor_trades.iloc[0]["realized_pnl_cny"])
+
+
+def test_backtest_records_no_position_for_registered_event_without_fake_order():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 20, "max_positions": 1})
+    events = pd.DataFrame([{
+        "event_id": "TEST-1", "old_symbol": "SZ300114", "new_symbol": "SZ302132",
+        "effective_date": "2025-01-07", "share_ratio": "1.0",
+        "ratio_basis": "old_shares_to_new_shares", "security_identity": "test issuer",
+        "event_status": "CONFIRMED", "evidence_type": "test_fixture",
+        "evidence_url": "https://example.invalid/test", "evidence_summary": "test event",
+    }])
+    data = _code_change_bars()
+    # Start the backtest after the old-code history so there is no old holding.
+    data = data.loc[data["trade_date"] >= "2025-01-07"].copy()
+    data.loc[data["symbol"] == "SZ300114", "symbol"] = "SZ302132"
+    result = run_backtest(data, 100_000, config, security_identity_events=events)
+    event = result["security_events"].iloc[0]
+    assert event["event_type"] == "NO_POSITION"
+    assert event["old_shares"] == event["new_shares"] == 0
+    assert not ((result["trades"]["trade_date"] == "2025-01-07") & result["trades"]["symbol"].isin(["SZ300114", "SZ302132"])).any()
 
 
 def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
@@ -492,3 +576,23 @@ def test_compact_prevalidated_backtest_matches_standard_run(tmp_path) -> None:
     assert compact_result["metrics"]["total_return"] == standard["metrics"]["total_return"]
     assert compact_result["metrics"]["max_drawdown"] == standard["metrics"]["max_drawdown"]
     pd.testing.assert_frame_equal(compact_result["trades"], standard["trades"])
+
+
+def test_prevalidated_point_in_time_data_cannot_run_backtest_before_baseline_gates():
+    config = load_config()
+    quality = {
+        "healthy": True,
+        "result_type": "prevalidated_source_snapshot_after_streaming_point_in_time_audit",
+        "baseline_ready": False,
+        "baseline_blockers": ["CORPORATE_ACTIONS_INCOMPLETE"],
+    }
+    with pytest.raises(ValueError, match="正式基线未就绪.*CORPORATE_ACTIONS_INCOMPLETE"):
+        run_backtest(bars(16), 100_000, config, prevalidated_quality=quality)
+
+
+def test_baseline_diagnostics_function_has_its_own_disabled_gate(tmp_path):
+    config = load_config()
+    with pytest.raises(ValueError, match="正式点时基线尚未启用"):
+        run_baseline_sensitivity(
+            bars(16), pd.DataFrame(), bars(16), 100_000, config, tmp_path / "baseline",
+        )

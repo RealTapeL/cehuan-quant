@@ -8,6 +8,8 @@ source_note = "AKShare / Eastmoney daily history; close data is expected after 1
 max_symbols_per_fetch = 50
 request_delay_seconds = 0.25
 large_daily_price_change_warning = 0.50
+security_identity_events_file = "configs/security_identity_events.csv"
+out_date_evidence_file = "docs/evidence/universe-outdate-boundary-audit.csv"
 
 [strategy]
 name = "momentum_rank_technical_baseline"
@@ -50,3 +52,8 @@ cash_note = "Set this to the cash amount you choose before generating a personal
 method = "equal_weight_eligible_universe"
 symbol = "SH000300"
 note = "The initial backtest uses the configured eligible universe as a transparent peer benchmark when index data is absent."
+
+[research]
+# Kept false until historical corporate actions, effective-dated market rules,
+# and historical broker fee assumptions pass their own validation.
+formal_point_in_time_baseline_enabled = false

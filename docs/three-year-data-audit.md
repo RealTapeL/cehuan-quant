@@ -6,22 +6,24 @@
 
 - 点时名单快照：`bs-universe-20230101-20251231-v1`，2023-01-01 至 2025-12-31 的 727 个开市日。BaoStock `query_all_stock(day)` 原始名单共 4,811,380 行；与采集时的 `query_stock_basic type=1` 交集得到 3,700,244 个沪深股票日、5,309 只证券并集。另有 1,097,939 行已知非股票和 13,197 行基础类型未知；未知类型没有推断为股票。股票并集文件 SHA-256：`9b71bc21037cb0db886e0609e8d709729c32c7034f7fe96a21c63e9c7c659490`。
 - 行情快照：`bs-bars-universe-20221201-20251231-v1`，2022-12-01 至 2025-12-31，额外包含评价窗口前 22 个开市日作预热。共 177 批、5,309 只代码、3,807,838 行规范日线，覆盖 749 个开市日。最后一批 29 只；无未封存临时批次。
-- 行情总文件 SHA-256：`0912a3025c5445341a5a32a955453ea2009f8a46a3feea5ad1790195aa88cd00`。总质量报告为 `healthy=true`，必需字段缺失 0、重复行 0、交易日历差异 0；这只表示规范行情结构检查通过，不代表点时股票池和交易规则已通过。
+- 行情总文件 SHA-256：`0912a3025c5445341a5a32a95584bc18d271a7bd67b5a6d2046e3115cd3bab75`。它与来源 manifest 一致。总质量报告为 `healthy=true`，必需字段缺失 0、重复行 0、交易日历差异 0；这只表示规范行情结构检查通过，不代表交易规则已通过。
 - 离线重新计算了行情 manifest 所列 16,999 个文件和股票池 manifest 所列 734 个文件的 SHA-256，共校验 4,274,194,602 字节，文件清单和散列均一致。批次内还逐一核对 177 份 manifest、5,309 只证券的批次顺序、质量报告和各批文件散列。
 - 行情请求汇总从已校验的批次日志重建：15,956 次 API 调用、15,952 条尝试记录；11 次传输失败（3 次 `10002007`、7 次超时、1 次连接重置）都在同批、同端点随后重试成功；失败批次 0。最早曾有一次旧 SDK 的第 86 批未提交尝试，部分文件已隔离归档且不属于快照；该次请求数无法恢复。
 - BaoStock 0.9.4 按单连接、串行、每次请求间隔 0.5 秒和 20 秒 socket 超时采集，本地每日请求停止阈值为 49,000。官方访问规则列明每日请求量与并发访问限制：[BaoStock 访问限制](https://www.baostock.com/blacklist)。本次取得的 `stock_basic type=1` 没有北交所代码，因此这不是完整 A 股市场数据集。
 
-原始响应、全量 manifest 和散列清单都留在 Git 忽略的 `data/private/`；本报告只发布脱敏汇总。复核输出位于本机 `data/private/audits/universe-audit-2023-2025-v1/`。
+原始响应、全量 manifest 和散列清单都留在 Git 忽略的 `data/private/`；本报告只发布脱敏汇总。当前复核输出位于本机 `data/private/audits/universe-audit-2023-2025-v2/`；v1 历史审计目录未覆盖。
 
 ## 点时股票池与行情对账
 
-`universe-audit` 逐日对齐 3,700,244 个 `type=1` 股票日成员与行情：3,700,243 行有规范日线，1 行缺少；总体覆盖率 99.999973%，每日覆盖率最低 99.980514%。有匹配日线的日期名单与 K 线停牌状态不一致数为 0；股票池外行情为 0；股票池窗口之外的预热行情为 107,595 行。后来退市证券成员共 58,264 行，58,263 行有日线，差异仍是同一条缺失成员。
+`universe-audit` 逐日对齐 3,700,244 个 `type=1` 股票日成员与行情：3,700,243 行有规范日线，1 行缺少；原始覆盖仍是 99.999973%，每日覆盖率最低 99.980514%。审计不会因身份映射而重写这个计数。旧代码缺行情另外标为“已解释的身份变更”1 行、未解释缺口 0 行；有行情的成员停牌状态不一致 0 行，股票池外行情 0 行，股票池窗口之外的预热行情 107,595 行。后来退市证券成员共 58,264 行，58,263 行有日线。
 
-唯一的行情对账差异是 `SZ300114`，日期 2025-02-17。BaoStock 当日名单将旧代码标为停牌，旧代码 K 线 OHLC 为空；同日名单将 `SZ302132`（中航成飞）标为交易，后者有有效日线。采集时的旧代码基础资料 `outDate` 也为 2025-02-17。深交所披露的实施公告确认该日证券代码从 300114 变更为 302132，并说明登记在册持股数量不变；AKShare 1.19.3 腾讯未复权行情对 302132 当日 OHLC 与 BaoStock 完全一致。[深交所披露的实施公告](https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF)
+唯一的原始行情对账差异仍是 `SZ300114`，日期 2025-02-17：该旧代码在当日名单中，但没有有效 OHLC；同日名单将 `SZ302132` 标为交易，新代码有有效、非停牌行情。深交所实施公告确认同一上市主体从该日开市起变更代码，原持股按 1:1 转为新代码。[深交所披露的实施公告](https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF)。审计将这一条差异标为 `EXPLAINED_SECURITY_CODE_TRANSITION`，但保留旧代码原始缺行情事实和原始覆盖率；没有创建旧代码行情行。组合回测现在把现有持仓、成本基础和持有起始日迁到新代码，不生成交易、费用、现金变化或已实现盈亏。新代码动量独立从生效日起累计观察期，信号不会跨代码拼接。
 
-因此，这不是发现一笔错价，而是一个有公告支持的证券身份转换；但项目尚未实现跨代码持仓迁移和公司行动账务。严格的 `universe_reconciliation_quality` 与 `point_in_time_quality` 仍保持 `healthy=false`，不能把旧代码和新代码静默合并后将数据标为基线就绪。逐项证据在本机 `security-code-transition-300114-302132.json`。
+`reconciliation.csv` 中的 20 条基础资料/日期名单差异都与采集时的 `outDate` 同日。它们已逐条与摘牌公告或交易所通告核对，并按 `(日期, 代码)` 精确匹配；20/20 行标记为 `EXPLAINED_OUT_DATE_BOUNDARY`。原始基础资料字段及日期名单内容均未修改。逐条来源、摘牌日期和未实现的退市后处理见[独立证据登记表](evidence/universe-outdate-boundary-audit.csv)。其中 `SH601989` 是吸收合并，公告比例为每股换 0.1339 股 `SH600150`；其换股和零股现金处理不属于本次 1:1 代码迁移实现，仍未记账。
 
-另外，`reconciliation.csv` 有 20 行：按快照时的 `ipoDate/outDate` 推算为在市，但当日 `query_all_stock(day)` 没有返回该代码；20 行都与该代码记录的 `outDate` 同日。它们保留为“未解释的基础资料/日期名单差异”，没有被补进股票池。该基础资料是采集时取得的元数据，不是逐日挂牌事实；目前也没有独立来源完成 20 行逐一核实。
+v2 审计中 `raw_bar_quality.healthy=true`、`universe_reconciliation_quality.healthy=true`、`point_in_time_quality.healthy=true`，但 `baseline_ready=false`。正式基线仍受公司行动记账、有效日期市场规则和历史费用校准三项阻断；这不是允许立即评价策略绩效的信号。完整实现边界见[证券身份事件与退市边界审计](security-identity.md)。
+
+v2 复核散列：证券身份事件表 `e082347c74578a23d358a94839d423ec6450d95a92e2a994b293652e3d16db11`；20 条独立退市证据表 `1f8c59aa97afbe1c8b5b9a1baeaa43316c7c223bb46870bf69b997911ee992db`；点时过滤行情输出 `d9cf4505a4b1565edda2b5dbf0e40841fad2fac900e4bb623e0f7685e5a8a393`。本机完整审计 JSON 和逐日 CSV 在 `data/private/audits/universe-audit-2023-2025-v2/`，未提交到 Git。
 
 ## 指定案例与独立行情抽查
 
@@ -36,14 +38,14 @@ AKShare 的 299 个事件原始响应和散列保存在本机 `data/private/audi
 
 ## 当前可用性与后续门槛
 
-目前还不能用这份数据生成正式多年基线：点时质量报告因 2025-02-17 的代码迁移缺行而拒绝；20 条基础资料/日期名单差异仍待核；历史涨跌停价格、板块规则有效期、交易单位、现金分红/送转/配股、退市持仓结算和历史费用仍不完整。对正式回测的拒绝已实测：
+目前还不能用这份数据生成正式多年基线：身份迁移和 20 条 `outDate` 差异已有独立证据并通过对账，但历史涨跌停价格、板块规则有效期、交易单位、现金分红/送转/配股、退市持仓结算和历史费用仍不完整。质量报告明确写出 `baseline_ready=false` 和三项阻断；配置门控也会在正式回测和基线诊断入口拒绝执行。此次没有重跑多年基线。
 
 ```text
-uv run cehuan backtest --data data/private/audits/universe-audit-2023-2025-v1/point_in_time_bars.csv --cash 100000 --prevalidated-quality data/private/audits/universe-audit-2023-2025-v1/point_in_time_quality.json
-错误：提供的预验证质量报告未通过
+uv run cehuan backtest --data data/private/audits/universe-audit-2023-2025-v2/point_in_time_bars.csv --cash 100000 --prevalidated-quality data/private/audits/universe-audit-2023-2025-v2/point_in_time_quality.json
+错误：正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项
 ```
 
-因此没有基于此快照重跑或宣称新的策略绩效；已查看的 68 日结果仍是开发诊断，20 日动量参数未调整。下一步应先确定证券代码变更时持仓/收益的记账规则，并逐条核对 20 项基础资料差异；补齐有效日期交易规则与公司行动后，再决定是否可生成可比较的冻结基线。原始数据仍只保留在本机。
+因此没有基于此快照重跑或宣称新的策略绩效；已查看的 68 日结果仍是开发诊断，20 日动量参数未调整。下一步应补分红送转/配股与退市结算记账，再补有效日期市场规则和历史费用校准；各项案例核验后，才重新评估冻结基线是否可比较。原始数据仍只保留在本机。
 
 可在本机重跑纯离线对账：
 
@@ -51,5 +53,7 @@ uv run cehuan backtest --data data/private/audits/universe-audit-2023-2025-v1/po
 uv run cehuan universe-audit \
   --universe data/private/universes/bs-universe-20230101-20251231-v1 \
   --bars data/private/snapshots/bs-bars-universe-20221201-20251231-v1/bars.csv \
-  --output data/private/audits/universe-audit-2023-2025-v1-rerun
+  --identity-events configs/security_identity_events.csv \
+  --out-date-evidence docs/evidence/universe-outdate-boundary-audit.csv \
+  --output data/private/audits/universe-audit-2023-2025-v2-rerun
 ```

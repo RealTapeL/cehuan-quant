@@ -20,10 +20,15 @@ def run_baseline_sensitivity(
     initial_cash_cny: float,
     frozen_config: dict[str, Any],
     output_dir: str | Path,
+    security_identity_events: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Run the frozen baseline and transparent one-assumption-at-a-time checks."""
+    if not bool(frozen_config.get("research", {}).get("formal_point_in_time_baseline_enabled", False)):
+        raise ValueError(
+            "正式点时基线尚未启用：公司行动记账、有效日期交易规则及历史费用校准仍有阻断项"
+        )
     point_in_time_bars, universe_coverage, discrepancies = filter_bars_to_point_in_time_universe(
-        bars, membership,
+        bars, membership, security_identity_events=security_identity_events,
     )
     reconciliation = universe_coverage["reconciliation_quality"]
     if not reconciliation["healthy"]:
@@ -85,6 +90,7 @@ def run_baseline_sensitivity(
             initial_cash_cny,
             scenario_config,
             benchmark_frame=benchmark,
+            security_identity_events=security_identity_events,
         )
         metrics = result["metrics"]
         trades = result["trades"]
@@ -100,6 +106,8 @@ def run_baseline_sensitivity(
         result["equity_curve"].to_csv(folder / "equity_curve.csv", index=False)
         trades.to_csv(folder / "trades.csv", index=False)
         result["blocked_orders"].to_csv(folder / "blocked_orders.csv", index=False)
+        result["security_events"].to_csv(folder / "security_events.csv", index=False)
+        result["open_positions"].to_csv(folder / "open_positions.csv", index=False)
         fee_total = float(trades["fees_cny"].sum()) if not trades.empty else 0.0
         result_rows.append({
             "scenario": name,

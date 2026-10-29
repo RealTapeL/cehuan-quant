@@ -17,6 +17,7 @@ import pandas as pd
 from cehuan import __version__
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame
 from cehuan.data.quality import check_data_quality
+from cehuan.data.security_identity import normalize_security_identity_events
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
@@ -218,6 +219,7 @@ def run_backtest(
     *,
     prevalidated_quality: dict[str, Any] | None = None,
     source_data_sha256: str | None = None,
+    security_identity_events: pd.DataFrame | None = None,
     mutate_input: bool = False,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
@@ -241,6 +243,14 @@ def run_backtest(
     )
     if not quality.get("healthy", False):
         raise ValueError("数据质量检查未通过：" + "; ".join(quality.get("errors", [])))
+    if (
+        quality.get("result_type") == "prevalidated_source_snapshot_after_streaming_point_in_time_audit"
+        and not quality.get("baseline_ready", False)
+    ):
+        raise ValueError(
+            "点时数据质量审计通过，但正式基线未就绪："
+            + "; ".join(quality.get("baseline_blockers", []))
+        )
     strategy = config["strategy"]
     market = config["market"]
     costs = config["costs"]
@@ -249,6 +259,13 @@ def run_backtest(
     if rebalance_sessions < 1:
         raise ValueError("rebalance_sessions 必须大于 0")
 
+    identity_events = normalize_security_identity_events(security_identity_events)
+    symbols_in_data = set(data["symbol"].astype(str).unique())
+    if not identity_events.empty:
+        identity_events = identity_events.loc[
+            identity_events["old_symbol"].isin(symbols_in_data)
+            | identity_events["new_symbol"].isin(symbols_in_data)
+        ].reset_index(drop=True)
     data = add_momentum(data, lookback, normalized=True)
     data["previous_close"] = data.groupby("symbol", sort=False, observed=True)["close"].shift(1)
     trade_dates = data["trade_date"].to_numpy()
@@ -261,17 +278,88 @@ def run_backtest(
 
     cash = float(initial_cash_cny)
     holdings: dict[str, int] = {}
+    cost_basis_cny: dict[str, float] = {}
+    holding_since: dict[str, str] = {}
     last_prices: dict[str, float] = {}
     pending_targets: dict[str, float] | None = None
+    transition_signal_ready_index: dict[str, int] = {}
     equity_rows: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
+    security_events: list[dict[str, Any]] = []
     blocked_orders: list[dict[str, Any]] = []
     total_turnover = 0.0
     slippage = float(costs.get("slippage_bps", 0.0)) / 10000.0
+    identity_events_by_date = {
+        str(day): group.to_dict(orient="records")
+        for day, group in identity_events.groupby("effective_date", sort=False)
+    } if not identity_events.empty else {}
 
     for index, (date, start, end) in enumerate(zip(dates, day_starts, day_ends)):
         day = data.iloc[start:end].set_index("symbol", drop=False)
         day_date = pd.Timestamp(date).strftime("%Y-%m-%d")
+
+        # A confirmed code replacement transfers the position as a ledger event.
+        # It is deliberately excluded from `trades`: no cash, fee, or realized P&L.
+        for event in identity_events_by_date.get(day_date, []):
+            old_symbol = str(event["old_symbol"])
+            new_symbol = str(event["new_symbol"])
+            cash_before = cash
+            trade_count_before = len(trades)
+            new_row = day.loc[new_symbol] if new_symbol in day.index else None
+            if isinstance(new_row, pd.DataFrame):
+                raise ValueError(f"{day_date} {new_symbol} 的日线不唯一，不能执行身份迁移")
+            if new_row is None:
+                raise ValueError(f"{day_date} {new_symbol} 缺少代码变更生效日行情，不能验证身份迁移")
+            if any(
+                pd.isna(new_row.get(column))
+                or not math.isfinite(float(new_row[column]))
+                or float(new_row[column]) <= 0
+                for column in ("open", "high", "low", "close")
+            ):
+                raise ValueError(f"{day_date} {new_symbol} 生效日 OHLC 无效，不能迁移持仓")
+            if pd.isna(new_row.get("is_suspended")) or bool(new_row["is_suspended"]):
+                raise ValueError(f"{day_date} {new_symbol} 生效日停牌状态未知或为停牌，不能迁移持仓")
+            if pd.isna(new_row.get("is_listed")) or not bool(new_row["is_listed"]):
+                raise ValueError(f"{day_date} {new_symbol} 生效日上市状态未知或未上市，不能迁移持仓")
+            if old_symbol in day.index:
+                raise ValueError(f"{day_date} 旧代码 {old_symbol} 与新代码行情同时存在，身份事件需人工核验")
+
+            old_shares = int(holdings.pop(old_symbol, 0))
+            old_basis = float(cost_basis_cny.pop(old_symbol, 0.0))
+            old_holding_since = holding_since.pop(old_symbol, "")
+            ratio = float(event["share_ratio"])
+            raw_new_shares = old_shares * ratio
+            new_shares = int(round(raw_new_shares))
+            if not math.isclose(raw_new_shares, new_shares, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError(
+                    f"{day_date} {old_symbol}->{new_symbol} 转换后产生非整数股；需先实现公司行动尾差记账"
+                )
+            if new_shares:
+                holdings[new_symbol] = holdings.get(new_symbol, 0) + new_shares
+                cost_basis_cny[new_symbol] = cost_basis_cny.get(new_symbol, 0.0) + old_basis
+                existing_since = holding_since.get(new_symbol, "")
+                candidates = [value for value in (existing_since, old_holding_since) if value]
+                holding_since[new_symbol] = min(candidates) if candidates else day_date
+                transition_signal_ready_index[new_symbol] = index + lookback
+            last_prices.pop(old_symbol, None)
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": str(event["event_id"]),
+                "event_type": "MIGRATE_POSITION" if old_shares else "NO_POSITION",
+                "old_symbol": old_symbol,
+                "new_symbol": new_symbol,
+                "share_ratio": ratio,
+                "old_shares": old_shares,
+                "new_shares": new_shares,
+                "cost_basis_before_cny": old_basis,
+                "cost_basis_after_cny": cost_basis_cny.get(new_symbol, 0.0) if new_shares else 0.0,
+                "holding_since": holding_since.get(new_symbol, "") if new_shares else "",
+                "cash_before_cny": cash_before,
+                "cash_after_cny": cash,
+                "trade_count_before": trade_count_before,
+                "trade_count_after": len(trades),
+                "signal_policy": f"new code starts a fresh {lookback}-session momentum window",
+            })
 
         if pending_targets is not None:
             estimate_equity = cash
@@ -288,6 +376,15 @@ def run_backtest(
                 minimum, step = order_constraints(row, "BUY", market, allow_fallback=True)
                 raw_target = int(target_amount / float(row["open"]))
                 target_shares[symbol] = round_order_quantity(raw_target, minimum, step)
+
+            # Keep migrated shares unchanged while the successor builds its own
+            # lookback. A signal from the previous code is never carried over.
+            protected_symbols = {
+                symbol for symbol, ready_index in transition_signal_ready_index.items()
+                if symbol in holdings and index <= ready_index
+            }
+            for symbol in protected_symbols:
+                target_shares[symbol] = holdings[symbol]
 
             # Sells first, so their proceeds can fund the target buys.
             for symbol in list(holdings):
@@ -318,12 +415,18 @@ def run_backtest(
                 fill_price = reference * (1.0 - slippage)
                 notional = quantity * fill_price
                 fees = _fees(notional, "SELL", costs)
+                allocated_basis = cost_basis_cny.get(symbol, 0.0) * quantity / current if current else 0.0
+                realized_pnl = notional - fees - allocated_basis
+                acquisition_date = holding_since.get(symbol, "")
                 cash += notional - fees
                 holdings[symbol] = current - quantity
+                cost_basis_cny[symbol] = max(0.0, cost_basis_cny.get(symbol, 0.0) - allocated_basis)
                 total_turnover += notional
-                trades.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "目標排名/權重調整；次交易日開盤模擬"})
+                trades.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": allocated_basis, "realized_pnl_cny": realized_pnl, "holding_since": acquisition_date, "reason": "目標排名/權重調整；次交易日開盤模擬"})
                 if holdings[symbol] <= 0:
                     holdings.pop(symbol, None)
+                    cost_basis_cny.pop(symbol, None)
+                    holding_since.pop(symbol, None)
 
             for symbol, desired in target_shares.items():
                 current = holdings.get(symbol, 0)
@@ -360,8 +463,10 @@ def run_backtest(
                 fees = _fees(notional, "BUY", costs)
                 cash -= notional + fees
                 holdings[symbol] = current + quantity
+                cost_basis_cny[symbol] = cost_basis_cny.get(symbol, 0.0) + notional + fees
+                holding_since.setdefault(symbol, day_date)
                 total_turnover += notional
-                trades.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "reason": "收盤排名入選；次交易日開盤模擬"})
+                trades.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": 0.0, "realized_pnl_cny": pd.NA, "holding_since": holding_since[symbol], "reason": "收盤排名入選；次交易日開盤模擬"})
             pending_targets = None
 
         for symbol in holdings:
@@ -444,6 +549,14 @@ def run_backtest(
     data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
     ).hexdigest()
+    identity_event_data_sha256 = None
+    if not identity_events.empty:
+        identity_event_data_sha256 = hashlib.sha256(
+            identity_events.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        ).hexdigest()
+        data_digest = hashlib.sha256(
+            f"{data_digest}:{identity_event_data_sha256}".encode("utf-8")
+        ).hexdigest()
     benchmark_data_digest = None
     if benchmark_data is not None:
         benchmark_data_digest = hashlib.sha256(
@@ -500,6 +613,8 @@ def run_backtest(
         "strategy_id": str(strategy["name"]),
         "config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
         "data_version_sha256": data_digest,
+        "security_identity_events_sha256": identity_event_data_sha256,
+        "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
         "benchmark_data_version_sha256": benchmark_data_digest,
         "code_version": __version__,
         **_git_metadata(),
@@ -508,6 +623,8 @@ def run_backtest(
         "universe_symbols": sorted(str(value) for value in data["symbol"].unique()),
         "universe_filter": "status-known, listed and not suspended; ST excluded when configured; momentum threshold from config",
         "features": [f"{lookback}-session adjusted-close momentum"],
+        "security_identity_events": int(len(identity_events)),
+        "security_identity_signal_policy": "security-code changes never splice momentum history; successor begins a fresh configured lookback",
         "label": "none; rule-based baseline",
         "model": "none; rank-based technical baseline",
         "training_interval": "not applicable",
@@ -537,6 +654,17 @@ def run_backtest(
     return {
         "metrics": metrics,
         "equity_curve": curve,
-        "trades": pd.DataFrame(trades, columns=["trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price", "notional_cny", "fees_cny", "reason"]),
+        "trades": pd.DataFrame(trades, columns=["trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price", "notional_cny", "fees_cny", "allocated_cost_basis_cny", "realized_pnl_cny", "holding_since", "reason"]),
         "blocked_orders": pd.DataFrame(blocked_orders, columns=["trade_date", "symbol", "side", "quantity", "reason"]),
+        "security_events": pd.DataFrame(security_events),
+        "open_positions": pd.DataFrame([
+            {
+                "symbol": symbol,
+                "shares": shares,
+                "cost_basis_cny": cost_basis_cny.get(symbol, 0.0),
+                "average_cost_cny": cost_basis_cny.get(symbol, 0.0) / shares if shares else 0.0,
+                "holding_since": holding_since.get(symbol, ""),
+            }
+            for symbol, shares in sorted(holdings.items())
+        ], columns=["symbol", "shares", "cost_basis_cny", "average_cost_cny", "holding_since"]),
     }

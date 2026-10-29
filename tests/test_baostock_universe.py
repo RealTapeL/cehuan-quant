@@ -11,6 +11,7 @@ from cehuan.data.universe_snapshot import (
     filter_bars_to_point_in_time_universe,
     _verify_request_log,
 )
+from cehuan.data.security_identity import audit_out_date_boundary_evidence, read_security_identity_events
 from cehuan.cli.main import main
 
 
@@ -170,6 +171,80 @@ def test_point_in_time_filter_reports_missing_quotes_and_daily_status_mismatch()
     assert discrepancies.iloc[0]["discrepancy"] == "DAILY_STOCK_MEMBER_WITHOUT_CANONICAL_BAR"
 
 
+def test_point_in_time_filter_explains_only_a_confirmed_successor_bar_without_rewriting_raw_gap():
+    membership = pd.DataFrame([
+        {"trade_date": "2025-02-17", "symbol": "SZ300114", "pool_status": "STOCK_MEMBER", "daily_trade_status": "0"},
+        {"trade_date": "2025-02-17", "symbol": "SZ302132", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
+    ])
+    bars = pd.DataFrame([{
+        "trade_date": "2025-02-17", "symbol": "SZ302132", "open": 73.98,
+        "high": 73.98, "low": 65.01, "close": 68.01, "adjusted_close": 68.01,
+        "volume_shares": 100000, "is_listed": True, "is_suspended": False,
+        "is_st": False,
+    }])
+
+    filtered, summary, discrepancies = filter_bars_to_point_in_time_universe(
+        bars, membership, security_identity_events=read_security_identity_events(),
+    )
+
+    assert summary["members_without_bars"] == 1
+    assert summary["explained_security_identity_transition_rows"] == 1
+    assert summary["unresolved_missing_bar_rows"] == 0
+    assert summary["reconciliation_quality"]["healthy"] is True
+    assert set(filtered["symbol"]) == {"SZ302132"}
+    assert discrepancies.iloc[0]["symbol"] == "SZ300114"
+    assert discrepancies.iloc[0]["resolution_status"] == "EXPLAINED_SECURITY_CODE_TRANSITION"
+    assert discrepancies.iloc[0]["successor_symbol"] == "SZ302132"
+
+
+def test_unregistered_identity_change_remains_an_unresolved_missing_bar():
+    membership = pd.DataFrame([
+        {"trade_date": "2025-02-17", "symbol": "SZ300114", "pool_status": "STOCK_MEMBER", "daily_trade_status": "0"},
+        {"trade_date": "2025-02-17", "symbol": "SZ302132", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
+    ])
+    bars = pd.DataFrame([{
+        "trade_date": "2025-02-17", "symbol": "SZ302132", "open": 73.98,
+        "high": 73.98, "low": 65.01, "close": 68.01, "adjusted_close": 68.01,
+        "volume_shares": 100000, "is_listed": True, "is_suspended": False,
+        "is_st": False,
+    }])
+    _, summary, discrepancies = filter_bars_to_point_in_time_universe(bars, membership)
+    assert summary["members_without_bars"] == 1
+    assert summary["explained_security_identity_transition_rows"] == 0
+    assert summary["unresolved_missing_bar_rows"] == 1
+    assert summary["reconciliation_quality"]["healthy"] is False
+    assert discrepancies.iloc[0]["resolution_status"] == "UNRESOLVED"
+
+
+def test_out_date_evidence_audit_requires_exact_row_and_date_match(tmp_path):
+    reconciliation = tmp_path / "reconciliation.csv"
+    pd.DataFrame([{
+        "trade_date": "2025-05-22", "symbol": "SZ300630", "outDate": "2025-05-22",
+        "discrepancy": "BASIC_INTERVAL_SAYS_LISTED_BUT_NOT_IN_DATE_LIST",
+    }]).to_csv(reconciliation, index=False)
+    evidence = tmp_path / "evidence.csv"
+    pd.DataFrame([{
+        "trade_date": "2025-05-22", "symbol": "SZ300630", "basic_out_date": "2025-05-22",
+        "confirmed_delisting_date": "2025-05-22", "evidence_type": "issuer_notice",
+        "evidence_url": "https://example.invalid/notice.pdf", "evidence_summary": "Notice confirms delisting date.",
+        "additional_action_required": "delisting settlement not modeled",
+        "review_status": "PRIMARY_NOTICE_CONFIRMED",
+    }]).to_csv(evidence, index=False)
+
+    quality, reviewed = audit_out_date_boundary_evidence(reconciliation, evidence)
+    assert quality["healthy"] is True
+    assert quality["source_rows"] == quality["resolved_rows"] == 1
+    assert reviewed.iloc[0]["resolution_status"] == "EXPLAINED_OUT_DATE_BOUNDARY"
+
+    bad = pd.read_csv(evidence, dtype=str)
+    bad.loc[0, "confirmed_delisting_date"] = "2025-05-21"
+    bad.to_csv(evidence, index=False)
+    quality, reviewed = audit_out_date_boundary_evidence(reconciliation, evidence)
+    assert quality["healthy"] is False
+    assert quality["unresolved_rows"] == 1
+    assert reviewed.iloc[0]["resolution_status"] == "UNRESOLVED_OUT_DATE_BOUNDARY"
+
+
 def test_streaming_universe_audit_keeps_delisted_sample_and_checks_status(tmp_path):
     universe = tmp_path / "universe"
     universe.mkdir()
@@ -280,13 +355,34 @@ def test_official_backtest_command_rejects_universe_reconciliation_failure(tmp_p
         {"trade_date": "2025-01-02", "symbol": "SH600000", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
         {"trade_date": "2025-01-02", "symbol": "SH600001", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
     ]).to_csv(membership_path, index=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[research]\nformal_point_in_time_baseline_enabled = true\n", encoding="utf-8")
 
     exit_code = main([
         "backtest", "--data", str(bars_path), "--universe", str(membership_path),
-        "--cash", "100000",
+        "--cash", "100000", "--config", str(config_path),
     ])
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "点时股票池对账未通过" in captured.err
     assert "不能把该结果作为正式基线" in captured.err
+
+
+def test_formal_point_in_time_baseline_is_disabled_until_accounting_gates_pass(tmp_path, capsys):
+    exit_code = main([
+        "backtest", "--data", str(tmp_path / "not-read.csv"), "--cash", "100000",
+        "--universe", str(tmp_path / "not-read-universe"),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "公司行动记账、有效日期交易规则及历史费用校准" in captured.err
+
+    exit_code = main([
+        "baseline-diagnostics", "--data", str(tmp_path / "not-read.csv"),
+        "--universe", str(tmp_path / "not-read-universe"),
+        "--benchmark-data", str(tmp_path / "not-read-benchmark.csv"), "--cash", "100000",
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "正式点时基线尚未启用" in captured.err

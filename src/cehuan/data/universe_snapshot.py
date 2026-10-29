@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -17,6 +18,10 @@ from cehuan.data.baostock_adapter import (
     normalize_baostock_calendar,
 )
 from cehuan.data.canonical import BAR_COLUMNS, canonical_symbol, normalize_bar_frame, parse_optional_bool
+from cehuan.data.security_identity import (
+    audit_out_date_boundary_evidence,
+    normalize_security_identity_events,
+)
 
 
 def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -810,6 +815,7 @@ def export_baostock_universe_symbol_union(
 def filter_bars_to_point_in_time_universe(
     bars: pd.DataFrame,
     membership: pd.DataFrame,
+    security_identity_events: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
     """Keep only daily bars whose code is a confirmed type-1 daily-list member."""
     required = {"trade_date", "symbol", "pool_status", "daily_trade_status"}
@@ -848,6 +854,51 @@ def filter_bars_to_point_in_time_universe(
     no_bar = joined.loc[~joined["has_bar"], no_bar_columns].copy()
     if not no_bar.empty:
         no_bar["discrepancy"] = "DAILY_STOCK_MEMBER_WITHOUT_CANONICAL_BAR"
+        no_bar["resolution_status"] = "UNRESOLVED"
+        no_bar["successor_symbol"] = ""
+        no_bar["identity_event_id"] = ""
+        no_bar["share_ratio"] = pd.NA
+        events = normalize_security_identity_events(security_identity_events)
+        event_index = events.set_index(["effective_date", "old_symbol"], drop=False) if not events.empty else None
+        pool_index = pool.set_index(["trade_date_key", "symbol_key"], drop=False)
+        quote_index = quotes.set_index(["trade_date_key", "symbol_key"], drop=False)
+        for idx, missing_row in no_bar.iterrows():
+            day_key = str(missing_row["trade_date_key"])
+            old_symbol = str(missing_row["symbol_key"])
+            key = (day_key, old_symbol)
+            if event_index is None or key not in event_index.index:
+                continue
+            event = event_index.loc[key]
+            if isinstance(event, pd.DataFrame):
+                raise ValueError(f"{day_key} {old_symbol} 的证券身份事件不唯一")
+            new_symbol = str(event["new_symbol"])
+            new_key = (day_key, new_symbol)
+            if new_key not in pool_index.index or new_key not in quote_index.index:
+                continue
+            old_member = pool_index.loc[key]
+            new_member = pool_index.loc[new_key]
+            new_quote = quote_index.loc[new_key]
+            prices_valid = all(
+                pd.notna(new_quote.get(column))
+                and math.isfinite(float(new_quote[column]))
+                and float(new_quote[column]) > 0
+                for column in ("open", "high", "low", "close")
+            )
+            suspended = parse_optional_bool(pd.Series([new_quote.get("is_suspended", pd.NA)])).iloc[0]
+            listed = parse_optional_bool(pd.Series([new_quote.get("is_listed", pd.NA)])).iloc[0]
+            if (
+                str(old_member.get("pool_status", "")) == "STOCK_MEMBER"
+                and str(new_member.get("daily_trade_status", "")) == "1"
+                and prices_valid
+                and pd.notna(suspended)
+                and not bool(suspended)
+                and pd.notna(listed)
+                and bool(listed)
+            ):
+                no_bar.loc[idx, "resolution_status"] = "EXPLAINED_SECURITY_CODE_TRANSITION"
+                no_bar.loc[idx, "successor_symbol"] = new_symbol
+                no_bar.loc[idx, "identity_event_id"] = str(event["event_id"])
+                no_bar.loc[idx, "share_ratio"] = float(event["share_ratio"])
     daily_status = joined["daily_trade_status"].astype("string")
     bar_suspended = joined.get("is_suspended")
     known_status = joined["has_bar"] & daily_status.isin(["0", "1"])
@@ -886,7 +937,7 @@ def filter_bars_to_point_in_time_universe(
         [no_bar, status_discrepancies, unknown_trade_status, unknown_suspension, unknown_st],
         ignore_index=True,
         sort=False,
-    )
+    ).rename(columns={"trade_date_key": "trade_date", "symbol_key": "symbol"})
     filtered = joined.loc[joined["has_bar"], list(bar_columns_after_merge.values())].rename(
         columns={value: key for key, value in bar_columns_after_merge.items()}
     ).copy()
@@ -900,8 +951,12 @@ def filter_bars_to_point_in_time_universe(
     unknown_trade_status_rows = int((~daily_status.isin(["0", "1"])).sum())
     unknown_suspension_rows = int((known_status & ~known_bar_suspension).sum())
     reconciliation_errors = []
+    explained_identity_rows = int(
+        no_bar.get("resolution_status", pd.Series(dtype=str)).eq("EXPLAINED_SECURITY_CODE_TRANSITION").sum()
+    )
+    unresolved_missing_rows = int((~joined["has_bar"]).sum()) - explained_identity_rows
     for count, message in (
-        (int((~joined["has_bar"]).sum()), "点时股票池成员缺少规范日线"),
+        (unresolved_missing_rows, "点时股票池成员缺少规范日线且没有通过的证券身份变更证据"),
         (int(mismatch.sum()), "每日证券名单与日线停牌状态不一致"),
         (unknown_trade_status_rows, "每日证券名单的交易状态未知"),
         (unknown_suspension_rows, "日线停牌状态未知"),
@@ -914,6 +969,8 @@ def filter_bars_to_point_in_time_universe(
         "errors": reconciliation_errors,
         "daily_stock_member_rows": int(len(pool)),
         "missing_bar_rows": int((~joined["has_bar"]).sum()),
+        "explained_security_identity_transition_rows": explained_identity_rows,
+        "unresolved_missing_bar_rows": unresolved_missing_rows,
         "suspension_status_mismatch_rows": int(mismatch.sum()),
         "unknown_daily_trade_status_rows": unknown_trade_status_rows,
         "unknown_suspension_status_rows": unknown_suspension_rows,
@@ -923,6 +980,8 @@ def filter_bars_to_point_in_time_universe(
         "daily_stock_member_rows": int(len(pool)),
         "members_with_bars": int(joined["has_bar"].sum()),
         "members_without_bars": int((~joined["has_bar"]).sum()),
+        "explained_security_identity_transition_rows": explained_identity_rows,
+        "unresolved_missing_bar_rows": unresolved_missing_rows,
         "price_coverage_fraction": float(joined["has_bar"].mean()) if len(joined) else None,
         "st_known_member_rows": int(joined.loc[joined["has_bar"], bar_columns_after_merge["is_st"]].notna().sum()),
         "st_unknown_member_rows": int((~joined["has_bar"] | joined[bar_columns_after_merge["is_st"]].isna()).sum()),
@@ -985,6 +1044,9 @@ def audit_baostock_universe_prices(
     universe_dir: str | Path,
     bars_path: str | Path,
     output_dir: str | Path,
+    security_identity_events: pd.DataFrame | None = None,
+    security_identity_events_sha256: str | None = None,
+    out_date_evidence_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compare a date-specific universe to bars using bounded-memory CSV groups."""
     universe_root = Path(universe_dir).expanduser().resolve()
@@ -993,6 +1055,15 @@ def audit_baostock_universe_prices(
     if not membership_path.exists() or not manifest_path.exists():
         raise FileNotFoundError("--universe 需要指向包含 manifest.json 和 securities_by_date.csv 的快照目录")
     universe_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    identity_events = normalize_security_identity_events(security_identity_events)
+    if security_identity_events_sha256 is None and not identity_events.empty:
+        security_identity_events_sha256 = hashlib.sha256(
+            identity_events.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        ).hexdigest()
+    identity_event_index = (
+        identity_events.set_index(["effective_date", "old_symbol"], drop=False)
+        if not identity_events.empty else None
+    )
     membership_sha256 = _sha256(membership_path)
     expected_membership_sha256 = universe_manifest.get("files_sha256", {}).get("securities_by_date.csv")
     universe_source_errors = []
@@ -1021,7 +1092,7 @@ def audit_baostock_universe_prices(
     current_quotes = next(quote_groups, None)
     first_member_date = current_members[0] if current_members is not None else None
     coverage_rows: list[dict[str, Any]] = []
-    member_total = bar_total = missing_total = 0
+    member_total = bar_total = missing_total = explained_identity_transition_total = 0
     pre_universe_warmup_bar_rows = 0
     bars_on_missing_universe_date = 0
     bars_after_universe_window = 0
@@ -1077,12 +1148,54 @@ def audit_baostock_universe_prices(
                         "discrepancy": "TRADING_DAY_MISSING_FROM_POINT_IN_TIME_UNIVERSE",
                     })
         for symbol in missing_symbols:
-            discrepancies.append({
+            discrepancy = {
                 "trade_date": day,
                 "symbol": symbol,
                 "daily_trade_status": members_by_symbol.loc[symbol, "daily_trade_status"],
                 "discrepancy": "DAILY_STOCK_MEMBER_WITHOUT_CANONICAL_BAR",
-            })
+                "resolution_status": "UNRESOLVED",
+                "successor_symbol": "",
+                "identity_event_id": "",
+                "share_ratio": "",
+            }
+            event_key = (day, symbol)
+            if identity_event_index is not None and event_key in identity_event_index.index:
+                event = identity_event_index.loc[event_key]
+                if isinstance(event, pd.DataFrame):
+                    raise ValueError(f"{day} {symbol} 的证券身份事件不唯一")
+                successor = str(event["new_symbol"])
+                if successor in members_by_symbol.index and successor in quotes_by_symbol.index:
+                    successor_member = members_by_symbol.loc[successor]
+                    successor_quote = quotes_by_symbol.loc[successor]
+                    successor_prices_valid = all(
+                        pd.notna(successor_quote.get(column))
+                        and math.isfinite(float(successor_quote[column]))
+                        and float(successor_quote[column]) > 0
+                        for column in ("open", "high", "low", "close")
+                    )
+                    successor_suspended = parse_optional_bool(
+                        pd.Series([successor_quote.get("is_suspended", pd.NA)])
+                    ).iloc[0]
+                    successor_listed = parse_optional_bool(
+                        pd.Series([successor_quote.get("is_listed", pd.NA)])
+                    ).iloc[0]
+                    if (
+                        str(members_by_symbol.loc[symbol, "pool_status"]) == "STOCK_MEMBER"
+                        and str(successor_member.get("daily_trade_status", "")) == "1"
+                        and successor_prices_valid
+                        and pd.notna(successor_suspended)
+                        and not bool(successor_suspended)
+                        and pd.notna(successor_listed)
+                        and bool(successor_listed)
+                    ):
+                        discrepancy.update({
+                            "resolution_status": "EXPLAINED_SECURITY_CODE_TRANSITION",
+                            "successor_symbol": successor,
+                            "identity_event_id": str(event["event_id"]),
+                            "share_ratio": float(event["share_ratio"]),
+                        })
+                        explained_identity_transition_total += 1
+            discrepancies.append(discrepancy)
         daily_status_unknown = ~stock_members["daily_trade_status"].astype(str).isin(["0", "1"])
         for symbol in stock_members.loc[daily_status_unknown, "symbol_key"].astype(str):
             discrepancies.append({
@@ -1192,13 +1305,21 @@ def audit_baostock_universe_prices(
     if not filtered_temp.exists():
         pd.DataFrame(columns=BAR_COLUMNS).to_csv(filtered_temp, index=False, encoding="utf-8")
     if not discrepancy_temp.exists():
-        pd.DataFrame(columns=["trade_date", "symbol", "daily_trade_status", "is_suspended", "is_st", "discrepancy"]).to_csv(
+        pd.DataFrame(columns=[
+            "trade_date", "symbol", "daily_trade_status", "is_suspended", "is_st", "discrepancy",
+            "resolution_status", "successor_symbol", "identity_event_id", "share_ratio",
+        ]).to_csv(
             discrepancy_temp, index=False, encoding="utf-8",
         )
     os.replace(filtered_temp, output / "point_in_time_bars.csv")
     os.replace(discrepancy_temp, output / "universe_price_discrepancies.csv")
     coverage = pd.DataFrame(coverage_rows)
     _atomic_csv(coverage, output / "daily_price_coverage.csv")
+    out_date_boundary_quality, out_date_boundary_rows = audit_out_date_boundary_evidence(
+        universe_root / "reconciliation.csv",
+        out_date_evidence_path,
+    )
+    _atomic_csv(out_date_boundary_rows, output / "out_date_boundary_audit.csv")
     source_quality_path = bars_path.parent / "quality.json"
     source_quality = json.loads(source_quality_path.read_text(encoding="utf-8")) if source_quality_path.exists() else None
     source_manifest_path = bars_path.parent / "manifest.json"
@@ -1228,8 +1349,9 @@ def audit_baostock_universe_prices(
         "source_bars_sha256": source_bars_hash,
     }
     reconciliation_errors = list(universe_source_errors)
+    unresolved_missing_total = missing_total - explained_identity_transition_total
     for count, message in (
-        (missing_total, "点时股票池成员缺少规范日线"),
+        (unresolved_missing_total, "点时股票池成员缺少规范日线且没有通过的证券身份变更证据"),
         (bars_on_missing_universe_date, "行情交易日缺少对应的点时股票池名单"),
         (status_mismatch_total, "每日证券名单与日线停牌状态不一致"),
         (daily_status_unknown_total, "每日证券名单的交易状态未知"),
@@ -1238,11 +1360,14 @@ def audit_baostock_universe_prices(
     ):
         if count:
             reconciliation_errors.append(f"{message}：{count} 行；详见 universe_price_discrepancies.csv")
+    reconciliation_errors.extend(out_date_boundary_quality["errors"])
     universe_reconciliation_quality = {
         "healthy": not reconciliation_errors,
         "errors": reconciliation_errors,
         "daily_stock_member_rows": member_total,
         "members_without_bars": missing_total,
+        "explained_security_identity_transition_rows": explained_identity_transition_total,
+        "unresolved_missing_bar_rows": unresolved_missing_total,
         "bars_on_missing_universe_date": bars_on_missing_universe_date,
         "pre_universe_warmup_bar_rows": pre_universe_warmup_bar_rows,
         "bars_after_universe_window": bars_after_universe_window,
@@ -1255,6 +1380,10 @@ def audit_baostock_universe_prices(
         "source_artifact_sha256": membership_sha256,
         "expected_source_artifact_sha256": expected_membership_sha256,
         "source_artifact_errors": universe_source_errors,
+        "out_date_boundary_quality": out_date_boundary_quality,
+        "out_date_boundary_audit_file": str(output / "out_date_boundary_audit.csv"),
+        "security_identity_event_count": int(len(identity_events)),
+        "security_identity_events_sha256": security_identity_events_sha256,
     }
     overall_errors = raw_errors + reconciliation_errors
     prevalidated_warnings = list(source_quality.get("warnings", [])) if source_quality else []
@@ -1262,6 +1391,12 @@ def audit_baostock_universe_prices(
         prevalidated_warnings.append(f"点时股票池有 {missing_total} 个股票日缺少日线")
     prevalidated_quality = {
         "healthy": bool(raw_bar_quality["healthy"] and universe_reconciliation_quality["healthy"]),
+        "baseline_ready": False,
+        "baseline_blockers": [
+            "HISTORICAL_CORPORATE_ACTION_ACCOUNTING_INCOMPLETE",
+            "EFFECTIVE_DATED_MARKET_RULES_INCOMPLETE",
+            "HISTORICAL_FEES_NOT_CALIBRATED_TO_BROKER",
+        ],
         "errors": overall_errors,
         "warnings": prevalidated_warnings,
         "raw_bar_quality": raw_bar_quality,
@@ -1271,6 +1406,9 @@ def audit_baostock_universe_prices(
         "data_sha256": filtered_hash,
         "result_type": "prevalidated_source_snapshot_after_streaming_point_in_time_audit",
         "universe_snapshot_id": universe_manifest.get("snapshot_id"),
+        "security_identity_event_count": int(len(identity_events)),
+        "security_identity_events_sha256": security_identity_events_sha256,
+        "out_date_evidence_sha256": out_date_boundary_quality.get("evidence_sha256"),
         "point_in_time_rows": bar_total,
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -1286,6 +1424,11 @@ def audit_baostock_universe_prices(
         "daily_stock_member_rows": member_total,
         "members_with_bars": bar_total,
         "members_without_bars": missing_total,
+        "explained_security_identity_transition_rows": explained_identity_transition_total,
+        "unresolved_missing_bar_rows": unresolved_missing_total,
+        "out_date_boundary_rows": out_date_boundary_quality["source_rows"],
+        "out_date_boundary_rows_resolved": out_date_boundary_quality["resolved_rows"],
+        "out_date_boundary_rows_unresolved": out_date_boundary_quality["unresolved_rows"],
         "bars_on_missing_universe_date": bars_on_missing_universe_date,
         "pre_universe_warmup_bar_rows": pre_universe_warmup_bar_rows,
         "bars_after_universe_window": bars_after_universe_window,
@@ -1304,6 +1447,8 @@ def audit_baostock_universe_prices(
         "daily_coverage_file": str(output / "daily_price_coverage.csv"),
         "discrepancy_file": str(output / "universe_price_discrepancies.csv"),
         "prevalidated_quality_file": str(output / "point_in_time_quality.json"),
+        "out_date_boundary_audit_file": str(output / "out_date_boundary_audit.csv"),
+        "security_identity_events_sha256": security_identity_events_sha256,
         "raw_bar_quality": raw_bar_quality,
         "universe_reconciliation_quality": universe_reconciliation_quality,
         "healthy": bool(raw_bar_quality["healthy"] and universe_reconciliation_quality["healthy"]),
