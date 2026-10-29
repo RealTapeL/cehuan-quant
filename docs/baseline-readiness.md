@@ -54,7 +54,7 @@ uv run cehuan backtest \
 
 ## 目前为什么仍会阻断
 
-当前回测引擎尚未把经审计的有效日期规则、历史费率及完整公司行动账本用于逐日组合模拟。因此 readiness 报告会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。不得手工删除阻断项。
+当前回测引擎尚未把经审计的有效日期规则、历史费率及完整公司行动账本用于逐日组合模拟。因此 readiness 报告会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。不得手工删除阻断项。公司行动的目标账本与合成样例先记录在[账务契约设计稿](corporate-action-accounting-contract.md)，该文档本身不代表执行层已实现。
 
 正式回测唯一支持的行情输入是同一次 `universe-audit` 生成的 `--data <point_in_time_bars.csv>` 与 `--prevalidated-quality <point_in_time_quality.json>`。`--formal --universe` 会被拒绝，避免把原始快照与过滤后内存数据混用。`--readiness-universe` 仍指向原始股票池快照目录，用于重新核验成员、manifest 和证据；它不是行情过滤参数。若同时提供 `--readiness-quality`，其文件内容必须与 `--prevalidated-quality` 相同。
 
