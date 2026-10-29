@@ -412,7 +412,7 @@ def main() -> int:
             "baseline_ready": quality.get("baseline_ready"),
             "blockers": quality.get("baseline_blockers", []),
             "classified_stock_member_days": quality.get("universe_reconciliation_quality", {}).get("daily_stock_member_rows"),
-            "normalized_bar_rows": quality.get("raw_bar_quality", {}).get("row_count"),
+            "normalized_bar_rows": quality.get("point_in_time_rows"),
             "unexplained_missing_bar_rows": quality.get("universe_reconciliation_quality", {}).get("unresolved_missing_bar_rows"),
         },
         "research_design": {
