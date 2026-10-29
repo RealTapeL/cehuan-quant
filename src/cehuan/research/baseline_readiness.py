@@ -23,6 +23,24 @@ from cehuan.data.universe_snapshot import filter_bars_to_point_in_time_universe
 
 
 READINESS_SCHEMA = "cehuan.baseline_readiness.v1"
+# These file-context keys also name the keyword arguments accepted by
+# readiness_input_hashes; keep the formal caller's required set centralized.
+READINESS_CONTEXT_KEYS = (
+    "data",
+    "point_in_time_quality",
+    "universe",
+    "identity_events",
+    "out_date_evidence",
+    "unknown_type_review",
+    "unknown_type_summary",
+    "unknown_type_bars",
+    "corporate_actions",
+    "corporate_action_coverage",
+    "market_rules",
+    "fees",
+    "benchmark",
+    "config",
+)
 ACTION_COVERAGE_COLUMNS = [
     "symbol", "valid_from", "valid_to", "source", "source_sha256",
     "review_status", "reviewed_by", "reviewed_at",

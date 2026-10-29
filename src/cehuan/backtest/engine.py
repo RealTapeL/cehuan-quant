@@ -21,6 +21,7 @@ from cehuan.data.corporate_actions import normalize_corporate_actions, read_corp
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import normalize_security_identity_events
 from cehuan.research.baseline_readiness import (
+    READINESS_CONTEXT_KEYS,
     build_baseline_readiness,
     readiness_input_hashes as compute_readiness_input_hashes,
     require_baseline_ready,
@@ -258,17 +259,12 @@ def run_backtest(
             or not evaluation_end or readiness_context is None
         ):
             raise ValueError("formal=True 必须提供就绪报告、全部审计输入路径、当前输入散列和评价窗口")
-        context_keys = {
-            "data", "point_in_time_quality", "universe", "identity_events", "out_date_evidence",
-            "unknown_type_review", "unknown_type_summary", "unknown_type_bars", "corporate_actions",
-            "corporate_action_coverage", "market_rules", "fees", "benchmark", "config",
-        }
-        missing_context = context_keys.difference(readiness_context)
+        missing_context = set(READINESS_CONTEXT_KEYS).difference(readiness_context)
         if missing_context:
             raise ValueError("正式基线缺少 readiness 输入路径：" + ", ".join(sorted(missing_context)))
         current_hashes = compute_readiness_input_hashes(**{
             key: readiness_context[key]
-            for key in context_keys
+            for key in READINESS_CONTEXT_KEYS
         })
         if current_hashes != readiness_input_hashes:
             raise ValueError("正式基线输入文件哈希已变化，请先重新运行 baseline-readiness")
@@ -302,6 +298,9 @@ def run_backtest(
             universe=readiness_context["universe"],
             identity_events_path=readiness_context["identity_events"],
             out_date_evidence_path=readiness_context["out_date_evidence"],
+            unknown_type_review_path=readiness_context["unknown_type_review"],
+            unknown_type_summary_path=readiness_context["unknown_type_summary"],
+            unknown_type_bars_path=readiness_context["unknown_type_bars"],
             point_in_time_quality_path=readiness_context["point_in_time_quality"],
             corporate_actions_path=readiness_context["corporate_actions"],
             corporate_action_coverage_path=readiness_context["corporate_action_coverage"],
