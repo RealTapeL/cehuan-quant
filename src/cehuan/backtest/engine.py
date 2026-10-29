@@ -22,7 +22,8 @@ from cehuan.signals.strategy import (
     order_constraints,
     rank_precomputed_day,
     round_order_quantity,
-    status_is_eligible,
+    status_is_buy_eligible,
+    status_is_sell_eligible,
 )
 
 
@@ -305,7 +306,7 @@ def run_backtest(
                 )
                 if quantity <= 0:
                     continue
-                eligible, reason = status_is_eligible(row, market, require_order_rules=False)
+                eligible, reason = status_is_sell_eligible(row, market, require_order_rules=False)
                 if not eligible:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": reason})
                     continue
@@ -336,7 +337,7 @@ def run_backtest(
                 quantity = round_order_quantity(quantity, minimum, step)
                 if quantity < minimum:
                     continue
-                eligible, reason = status_is_eligible(row, market, require_order_rules=False)
+                eligible, reason = status_is_buy_eligible(row, market, require_order_rules=False)
                 if not eligible:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": reason})
                     continue
@@ -399,26 +400,42 @@ def run_backtest(
         benchmark_rows = benchmark_data.loc[benchmark_data["symbol"] == benchmark_symbol]
         if benchmark_rows.empty:
             raise ValueError(f"独立基准数据不包含配置标的 {benchmark_symbol}")
-        benchmark_rows = benchmark_rows.sort_values("trade_date")
-        benchmark_values = benchmark_rows.set_index(benchmark_rows["trade_date"].astype(str))["close"].pct_change()
+        benchmark_rows = benchmark_rows.sort_values("trade_date").copy()
         benchmark_method = f"configured_index_close_return:{benchmark_symbol}"
     else:
         benchmark_rows = data.loc[data["symbol"] == benchmark_symbol] if benchmark_symbol else pd.DataFrame()
     if benchmark_frame is None and not benchmark_rows.empty:
-        benchmark_values = benchmark_rows.set_index(benchmark_rows["trade_date"].astype(str))["raw_close_return"]
+        benchmark_rows = benchmark_rows.sort_values("trade_date").copy()
         benchmark_method = f"configured_index_close_return:{benchmark_symbol}"
     elif benchmark_frame is None:
-        allowed = data.apply(lambda row: status_is_eligible(row, market, require_order_rules=False)[0], axis=1)
+        allowed = data.apply(lambda row: status_is_buy_eligible(row, market, require_order_rules=False)[0], axis=1)
         data["peer_return_eligible"] = allowed & data["raw_close_return"].notna()
-        benchmark_values = data.loc[data["peer_return_eligible"]].assign(
-            trade_date_key=lambda table: table["trade_date"].astype(str)
+        peer_returns = data.loc[data["peer_return_eligible"]].assign(
+            trade_date_key=lambda table: pd.to_datetime(table["trade_date"]).dt.strftime("%Y-%m-%d")
         ).groupby("trade_date_key")["raw_close_return"].mean()
         benchmark_method = "equal-weight daily returns of status-known eligible input symbols; not an index benchmark"
-    peer_curve = pd.Series(
-        [float(benchmark_values.get(day, 0.0)) for day in curve["trade_date"]],
-        index=curve.index,
-        dtype=float,
-    )
+    if benchmark_method.startswith("configured_index_close_return:"):
+        benchmark_rows["trade_date_key"] = pd.to_datetime(benchmark_rows["trade_date"]).dt.strftime("%Y-%m-%d")
+        benchmark_close = benchmark_rows.set_index("trade_date_key")["close"]
+        evaluation_dates = curve["trade_date"].astype(str).tolist()
+        missing_benchmark_dates = sorted(set(evaluation_dates) - set(benchmark_close.index.astype(str)))
+        if missing_benchmark_dates:
+            raise ValueError(
+                "基准数据缺少评价区间交易日：" + ", ".join(missing_benchmark_dates)
+            )
+        aligned_close = benchmark_close.reindex(evaluation_dates)
+        invalid_closes = aligned_close.isna() | ~np.isfinite(aligned_close.astype(float)) | aligned_close.astype(float).le(0)
+        if invalid_closes.any():
+            invalid_dates = curve.loc[invalid_closes.to_numpy(), "trade_date"].astype(str).tolist()
+            raise ValueError("基准数据评价区间收盘价无效：" + ", ".join(invalid_dates))
+        peer_curve = aligned_close.astype(float).pct_change(fill_method=None).fillna(0.0).reset_index(drop=True)
+    else:
+        benchmark_values = peer_returns
+        peer_curve = pd.Series(
+            [float(benchmark_values.get(day, 0.0)) for day in curve["trade_date"]],
+            index=curve.index,
+            dtype=float,
+        )
     benchmark = pd.Series(initial_cash_cny * (1.0 + peer_curve.fillna(0.0)).cumprod().to_numpy())
     equity_series = curve["equity_cny"]
 

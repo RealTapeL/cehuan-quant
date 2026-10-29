@@ -22,8 +22,11 @@ from cehuan.data.security_master import apply_security_master
 from cehuan.data.universe_snapshot import (
     audit_baostock_universe_prices,
     create_baostock_universe_snapshot,
+    export_baostock_universe_symbol_union,
     filter_bars_to_point_in_time_universe,
+    record_baostock_universe_failure,
 )
+from cehuan.data.universe_import import import_historical_universe_csv
 from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loader_check
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.review.reconcile import (
@@ -102,6 +105,11 @@ def _parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--max-batches", type=int, help="本次最多执行的批次数，便于分段下载")
     snapshot.add_argument("--resume", action="store_true", help="续跑同一 snapshot-id 的未完成批次")
     snapshot.add_argument("--output", default="data/private/snapshots", help="私有快照根目录")
+    snapshot.add_argument("--socket-timeout-seconds", type=float, default=20.0)
+    snapshot.add_argument("--request-interval-seconds", type=float, default=1.0, help="BaoStock 单连接最小请求间隔")
+    snapshot.add_argument("--max-retries", type=int, default=1, help="仅对连接错误执行的有限重试次数")
+    snapshot.add_argument("--retry-base-seconds", type=float, default=2.0, help="指数退避初始等待秒数")
+    snapshot.add_argument("--daily-request-budget", type=int, default=49000, help="低于 BaoStock 官方 50,000 次日限额的本地停止阈值")
 
     universe_snapshot = subs.add_parser(
         "universe-snapshot", help="按历史交易日抓取 BaoStock 证券列表，保存股票池、排除项和差异；可分批续跑",
@@ -111,8 +119,27 @@ def _parser() -> argparse.ArgumentParser:
     universe_snapshot.add_argument("--snapshot-id", required=True, help="用于续跑的固定任务名")
     universe_snapshot.add_argument("--batch-size", type=int, help="本次最多抓取的交易日数量；省略时完成全部剩余日期")
     universe_snapshot.add_argument("--resume", action="store_true", help="从 data/private 中的 partial 任务续跑")
+    universe_snapshot.add_argument("--defer-finalize", action="store_true", help="完成逐日列表后仍保留 partial，等待附加行情进行 ST/覆盖核对")
     universe_snapshot.add_argument("--bars", help="可选的规范 bars.csv，用于核对行情覆盖与退市样本覆盖")
     universe_snapshot.add_argument("--output", default="data/private/universes", help="私有股票池快照根目录")
+    universe_snapshot.add_argument("--socket-timeout-seconds", type=float, default=20.0)
+    universe_snapshot.add_argument("--request-interval-seconds", type=float, default=1.0, help="BaoStock 单连接最小请求间隔")
+    universe_snapshot.add_argument("--max-retries", type=int, default=1, help="仅对连接错误执行的有限重试次数")
+    universe_snapshot.add_argument("--retry-base-seconds", type=float, default=2.0, help="指数退避初始等待秒数")
+    universe_snapshot.add_argument("--daily-request-budget", type=int, default=49000, help="低于 BaoStock 官方 50,000 次日限额的本地停止阈值")
+
+    universe_import = subs.add_parser(
+        "universe-import", help="导入带逐日来源日期的外部历史股票池 CSV，不使用当前名单回填历史",
+    )
+    universe_import.add_argument("--input", required=True, help="历史成员 CSV；字段见 docs/data-contract.md")
+    universe_import.add_argument("--snapshot-id", required=True)
+    universe_import.add_argument("--output", default="data/private/universes")
+
+    universe_symbols = subs.add_parser(
+        "universe-symbols", help="从完成验证的历史股票池导出实际出现过的 type=1 证券并集",
+    )
+    universe_symbols.add_argument("--universe", required=True, help="已封存快照或全部日期均已验证的 partial 路径")
+    universe_symbols.add_argument("--output", required=True, help="输出包含 symbol 列的私有 CSV")
 
     quality = subs.add_parser("quality", help="检查规范化日线 CSV")
     quality.add_argument("--data", required=True)
@@ -227,7 +254,14 @@ def main(argv: list[str] | None = None) -> int:
             output = Path(args.output)
             if not output.is_absolute():
                 output = REPO_ROOT / output
-            with BaoStockSession() as session:
+            with BaoStockSession(
+                socket_timeout_seconds=args.socket_timeout_seconds,
+                minimum_interval_seconds=args.request_interval_seconds,
+                max_retries=args.max_retries,
+                retry_base_seconds=args.retry_base_seconds,
+                daily_request_budget=args.daily_request_budget,
+                lock_path=REPO_ROOT / "data" / "private" / ".baostock-session.lock",
+            ) as session:
                 result = create_baostock_snapshot(
                     session,
                     symbols=symbols,
@@ -274,26 +308,84 @@ def main(argv: list[str] | None = None) -> int:
             bars = Path(args.bars) if args.bars else None
             if bars is not None and not bars.is_absolute():
                 bars = REPO_ROOT / bars
-            with BaoStockSession() as session:
-                result = create_baostock_universe_snapshot(
-                    session,
-                    start_date=args.start,
-                    end_date=args.end,
-                    root=output,
-                    snapshot_id=args.snapshot_id,
-                    batch_size=args.batch_size,
-                    resume=args.resume,
-                    bars_path=bars,
+            session = BaoStockSession(
+                socket_timeout_seconds=args.socket_timeout_seconds,
+                minimum_interval_seconds=args.request_interval_seconds,
+                max_retries=args.max_retries,
+                retry_base_seconds=args.retry_base_seconds,
+                daily_request_budget=args.daily_request_budget,
+                lock_path=REPO_ROOT / "data" / "private" / ".baostock-session.lock",
+            )
+
+            def report_universe_progress(item: dict[str, object]) -> None:
+                completed_dates = int(item["completed_dates"])
+                total_dates = int(item["total_dates"])
+                if completed_dates == 1 or completed_dates % 25 == 0 or completed_dates == total_dates:
+                    print(json.dumps({"event": "universe_checkpoint", **item}, ensure_ascii=False), flush=True)
+
+            try:
+                with session:
+                    result = create_baostock_universe_snapshot(
+                        session,
+                        start_date=args.start,
+                        end_date=args.end,
+                        root=output,
+                        snapshot_id=args.snapshot_id,
+                        batch_size=args.batch_size,
+                        resume=args.resume,
+                        bars_path=bars,
+                        defer_finalize=args.defer_finalize,
+                        progress_callback=report_universe_progress,
+                    )
+            except KeyboardInterrupt:
+                interrupted = RuntimeError("BaoStock 采集被操作员中断；最近已验证日期和请求日志已保留")
+                interrupted.category = "operator_interrupted"
+                record_baostock_universe_failure(
+                    output, args.snapshot_id, args.start, args.end, session, interrupted,
                 )
+                print(str(interrupted), file=sys.stderr)
+                return 130
+            except Exception as exc:
+                if getattr(exc, "category", None) != "local_concurrency_stop":
+                    record_baostock_universe_failure(
+                        output, args.snapshot_id, args.start, args.end, session, exc,
+                    )
+                raise
             if result.get("state") == "partial":
                 resume_command = (
                     "uv run --extra baostock cehuan universe-snapshot "
                     f"--start {shlex.quote(args.start)} --end {shlex.quote(args.end)} "
-                    f"--snapshot-id {shlex.quote(args.snapshot_id)} --resume --output {shlex.quote(args.output)}"
+                    f"--snapshot-id {shlex.quote(args.snapshot_id)} --resume --output {shlex.quote(args.output)} "
+                    f"--socket-timeout-seconds {args.socket_timeout_seconds} "
+                    f"--request-interval-seconds {args.request_interval_seconds} "
+                    f"--max-retries {args.max_retries} --retry-base-seconds {args.retry_base_seconds} "
+                    f"--daily-request-budget {args.daily_request_budget}"
                 )
                 if args.bars:
                     resume_command += f" --bars {shlex.quote(args.bars)}"
                 result["resume_command"] = resume_command
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.command == "universe-import":
+            source = Path(args.input)
+            output = Path(args.output)
+            if not source.is_absolute():
+                source = REPO_ROOT / source
+            if not output.is_absolute():
+                output = REPO_ROOT / output
+            result = import_historical_universe_csv(source, output, args.snapshot_id)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.command == "universe-symbols":
+            universe = Path(args.universe)
+            output = Path(args.output)
+            if not universe.is_absolute():
+                universe = REPO_ROOT / universe
+            if not output.is_absolute():
+                output = REPO_ROOT / output
+            result = export_baostock_universe_symbol_union(universe, output)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
 
@@ -309,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
                 output = REPO_ROOT / output
             result = audit_baostock_universe_prices(universe, bars, output)
             print(json.dumps(result, ensure_ascii=False, indent=2))
-            return 0
+            return 0 if result["healthy"] else 2
 
         if args.command == "baseline-diagnostics":
             data_path = Path(args.data)
@@ -389,6 +481,13 @@ def main(argv: list[str] | None = None) -> int:
                     universe_path = universe_path / "securities_by_date.csv"
                 membership = pd.read_csv(universe_path, dtype=str, keep_default_na=False)
                 bars, universe_summary, universe_discrepancies = filter_bars_to_point_in_time_universe(bars, membership)
+                reconciliation = universe_summary["reconciliation_quality"]
+                if not reconciliation["healthy"]:
+                    raise ValueError(
+                        "点时股票池对账未通过，不能把该结果作为正式基线："
+                        + "; ".join(reconciliation["errors"])
+                        + "；请先运行 universe-audit 并核对逐条差异"
+                    )
                 if bars.empty:
                     raise ValueError("每日股票池与行情没有交集，无法回测")
             if args.security_master:

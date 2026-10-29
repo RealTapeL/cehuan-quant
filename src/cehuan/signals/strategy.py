@@ -75,12 +75,14 @@ def add_momentum(
     return data
 
 
-def status_is_eligible(
+def _status_is_tradeable(
     row: pd.Series,
     market: dict[str, object],
     require_order_rules: bool = True,
+    *,
+    side: str,
 ) -> tuple[bool, str | None]:
-    """Unknown status is never treated as eligible for a trade."""
+    """Check common point-in-time status and side-specific trade rules."""
     listed = row.get("is_listed", pd.NA)
     suspended = row.get("is_suspended", pd.NA)
     st_flag = row.get("is_st", pd.NA)
@@ -93,7 +95,7 @@ def status_is_eligible(
         return False, "停牌状态未知"
     if not pd.isna(suspended) and bool(suspended):
         return False, "停牌"
-    if bool(market.get("exclude_st", True)):
+    if side == "BUY" and bool(market.get("exclude_st", True)):
         if pd.isna(st_flag) and strict:
             return False, "ST 状态未知"
         if not pd.isna(st_flag) and bool(st_flag):
@@ -119,16 +121,51 @@ def status_is_eligible(
             return False, "当日是否适用涨跌幅限制未知"
         if bool(has_limit) and pd.isna(row.get("price_limit_pct", pd.NA)):
             return False, "当日涨跌幅阈值未知"
-        for column, label in (
-            ("buy_min_shares", "买入最小数量未知"),
-            ("buy_step_shares", "买入数量增量未知"),
-            ("sell_min_shares", "卖出最小数量未知"),
-            ("sell_step_shares", "卖出数量增量未知"),
-        ):
+        order_columns = (
+            (("buy_min_shares", "买入最小数量未知"), ("buy_step_shares", "买入数量增量未知"))
+            if side == "BUY"
+            else (("sell_min_shares", "卖出最小数量未知"), ("sell_step_shares", "卖出数量增量未知"))
+        )
+        for column, label in order_columns:
             value = row.get(column, pd.NA)
             if pd.isna(value) or float(value) < 1 or float(value) % 1 != 0:
                 return False, label
     return True, None
+
+
+def status_is_buy_eligible(
+    row: pd.Series,
+    market: dict[str, object],
+    require_order_rules: bool = True,
+) -> tuple[bool, str | None]:
+    """Whether a security may enter the new-buy candidate pool."""
+    return _status_is_tradeable(
+        row, market, require_order_rules, side="BUY",
+    )
+
+
+def status_is_sell_eligible(
+    row: pd.Series,
+    market: dict[str, object],
+    require_order_rules: bool = True,
+) -> tuple[bool, str | None]:
+    """Whether an existing position may be sold under known constraints.
+
+    The strategy's ST exclusion is an entry filter. It must not prevent exits;
+    suspension, listing status, and order rules are still checked separately.
+    """
+    return _status_is_tradeable(
+        row, market, require_order_rules, side="SELL",
+    )
+
+
+def status_is_eligible(
+    row: pd.Series,
+    market: dict[str, object],
+    require_order_rules: bool = True,
+) -> tuple[bool, str | None]:
+    """Backward-compatible alias for buy-candidate eligibility."""
+    return status_is_buy_eligible(row, market, require_order_rules)
 
 
 def rank_at_close(
@@ -155,7 +192,7 @@ def rank_precomputed_day(
     if "momentum" not in day:
         raise ValueError("rank_precomputed_day 需要预先计算的 momentum 列")
     day = day.reset_index(drop=True)
-    eligibility = day.apply(lambda row: status_is_eligible(row, market, require_order_rules)[0], axis=1)
+    eligibility = day.apply(lambda row: status_is_buy_eligible(row, market, require_order_rules)[0], axis=1)
     day = day.loc[eligibility & day["momentum"].notna()]
     day = day.loc[day["momentum"] >= float(strategy.get("min_momentum", 0.0))]
     day = day.sort_values(["momentum", "symbol"], ascending=[False, True]).reset_index(drop=True)

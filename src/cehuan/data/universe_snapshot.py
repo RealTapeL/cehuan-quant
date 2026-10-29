@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -49,22 +49,82 @@ def _flush_baostock_requests(
 ) -> None:
     if not session.request_log:
         return
+    records = list(session.request_log)
     with request_log_path.open("a", encoding="utf-8") as handle:
-        for request in session.request_log:
+        for request in records:
             handle.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
-    checkpoint["request_count"] = int(checkpoint.get("request_count", 0)) + len(session.request_log)
+    checkpoint["request_count"] = int(checkpoint.get("request_count", 0)) + sum(
+        int(request.get("request_count", 1)) for request in records
+    )
+    checkpoint["attempt_count"] = int(checkpoint.get("attempt_count", 0)) + len(records)
+    checkpoint["request_log_bytes"] = request_log_path.stat().st_size
+    checkpoint["request_log_sha256"] = _sha256(request_log_path)
     checkpoint["provider_package_version"] = session.package_version
     checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     session.request_log.clear()
     _atomic_json(checkpoint, checkpoint_path)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _verify_request_log(path: Path, checkpoint: dict[str, Any], checkpoint_path: Path) -> None:
+    if not path.exists():
+        if int(checkpoint.get("request_log_bytes", 0)):
+            raise ValueError("断点记录了请求日志，但 JSONL 文件不存在")
+        if int(checkpoint.get("request_count", 0)) or int(checkpoint.get("attempt_count", 0)):
+            raise ValueError("断点包含请求计数，但 JSONL 文件不存在")
+        return
+    content = path.read_bytes()
+    committed_bytes = checkpoint.get("request_log_bytes")
+    committed_hash = checkpoint.get("request_log_sha256")
+    tail_records: list[dict[str, Any]] = []
+    if committed_bytes is not None:
+        committed_bytes = int(committed_bytes)
+        if len(content) < committed_bytes or hashlib.sha256(content[:committed_bytes]).hexdigest() != committed_hash:
+            raise ValueError("请求日志已提交部分的字节数或哈希不匹配；停止续跑并保留现场")
+        tail = content[committed_bytes:]
+        if tail:
+            if not tail.endswith(b"\n"):
+                raise ValueError("请求日志有未完成的尾行；停止续跑并保留现场")
+            tail_records = [json.loads(line) for line in tail.decode("utf-8").splitlines() if line]
+    records = [json.loads(line) for line in content.decode("utf-8").splitlines() if line]
+    committed_records = records[:-len(tail_records)] if tail_records else records
+    checkpoint["request_log_bytes"] = len(content)
+    checkpoint["request_log_sha256"] = hashlib.sha256(content).hexdigest()
+    checkpoint["attempt_count"] = len(records)
+    if "request_count" not in checkpoint:
+        checkpoint["request_count"] = sum(int(record.get("request_count", 1)) for record in committed_records)
+    if tail_records:
+        checkpoint["request_count"] = int(checkpoint.get("request_count", 0)) + sum(
+            int(record.get("request_count", 1)) for record in tail_records
+        )
+    _atomic_json(checkpoint, checkpoint_path)
+
+
+def _pin_checkpoint_artifact(
+    path: Path,
+    checkpoint: dict[str, Any],
+    checkpoint_path: Path,
+    *,
+    key: str,
+    required_columns: set[str],
+    unique_column: str,
+) -> None:
+    if not path.is_file():
+        raise ValueError(f"断点元数据文件不存在：{path}")
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    missing = required_columns.difference(frame.columns)
+    if missing:
+        raise ValueError(f"断点元数据文件字段不完整 {path.name}：{', '.join(sorted(missing))}")
+    if frame.empty or frame[unique_column].astype(str).str.strip().eq("").any() or frame[unique_column].duplicated().any():
+        raise ValueError(f"断点元数据文件为空或 {unique_column} 重复/为空：{path}")
+    artifact = {"sha256": _sha256(path), "bytes": path.stat().st_size, "row_count": int(len(frame))}
+    verified_artifacts = checkpoint.setdefault("verified_artifacts", {})
+    previous = verified_artifacts.get(key)
+    if previous is not None and previous.get("sha256") != artifact["sha256"]:
+        raise ValueError(f"断点元数据文件哈希发生变化：{path}；停止续跑且不会覆盖")
+    if previous is None:
+        artifact["verification_origin"] = "legacy_file_revalidated_locally"
+    verified_artifacts[key] = artifact
+    _atomic_json(checkpoint, checkpoint_path)
 
 
 def _as_text(value: object) -> str | None:
@@ -72,6 +132,83 @@ def _as_text(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _validate_daily_list_file(path: Path, day: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError(f"已标记完成的日期缺少原始文件：{path}")
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    required = {"code", "tradeStatus", "code_name"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"日期 {day} 的原始证券列表字段不完整：{', '.join(sorted(missing))}")
+    if frame.empty:
+        raise ValueError(f"日期 {day} 的原始证券列表为空，不能标记为已验证")
+    symbols = frame["code"].map(_canonical_vendor_symbol)
+    if symbols.astype(str).str.strip().eq("").any():
+        raise ValueError(f"日期 {day} 的原始证券列表含空代码")
+    duplicate_symbols = symbols[symbols.duplicated(keep=False)].unique().tolist()
+    if duplicate_symbols:
+        raise ValueError(f"日期 {day} 的原始证券列表有重复代码：{duplicate_symbols[:10]}")
+    return {
+        "sha256": _sha256(path),
+        "bytes": path.stat().st_size,
+        "row_count": int(len(frame)),
+        "unique_symbol_count": int(symbols.nunique()),
+        "columns": list(frame.columns),
+        "schema_validated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def record_baostock_universe_failure(
+    root: str | Path,
+    snapshot_id: str,
+    start_date: str,
+    end_date: str,
+    session: BaoStockSession,
+    error: BaseException,
+) -> Path | None:
+    """Persist session-level failures, including failures during login before a snapshot starts."""
+    parent = Path(root).expanduser().resolve()
+    work = parent / f".{snapshot_id}.partial"
+    destination = parent / snapshot_id
+    if destination.exists():
+        return None
+    work.mkdir(parents=True, exist_ok=True)
+    raw_dir = work / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = work / "checkpoint.json"
+    request_log_path = raw_dir / "request_log.jsonl"
+    request = {"start_date": _parse_date(start_date), "end_date": _parse_date(end_date), "snapshot_id": snapshot_id}
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.exists() else {
+        "request": request,
+        "completed_dates": [],
+        "requests": [],
+    }
+    if checkpoint.get("request") != request:
+        raise ValueError("失败诊断任务参数与已有断点不一致")
+    if session.request_log:
+        with request_log_path.open("a", encoding="utf-8") as handle:
+            for record in session.request_log:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        checkpoint["request_count"] = int(checkpoint.get("request_count", 0)) + sum(
+            int(record.get("request_count", 1)) for record in session.request_log
+        )
+        checkpoint["attempt_count"] = int(checkpoint.get("attempt_count", 0)) + len(session.request_log)
+        checkpoint["request_log_bytes"] = request_log_path.stat().st_size
+        checkpoint["request_log_sha256"] = _sha256(request_log_path)
+        session.request_log.clear()
+    checkpoint["last_failure"] = {
+        "category": getattr(error, "category", "client_or_validation"),
+        "endpoint": getattr(error, "endpoint", None),
+        "error_code": getattr(error, "error_code", None),
+        "message": str(error),
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    checkpoint["provider_package_version"] = session.package_version
+    checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _atomic_json(checkpoint, checkpoint_path)
+    return work
 
 
 def _date_is_in_basic_interval(day: str, basic: pd.Series) -> bool | None:
@@ -107,6 +244,8 @@ def create_baostock_universe_snapshot(
     batch_size: int | None = None,
     resume: bool = False,
     bars_path: str | Path | None = None,
+    defer_finalize: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Build a daily securities-list snapshot, keeping every date request resumable."""
     start, end = _parse_date(start_date), _parse_date(end_date)
@@ -142,6 +281,19 @@ def create_baostock_universe_snapshot(
             raise ValueError("续跑参数与原任务不一致")
     else:
         checkpoint = {"request": request_spec, "completed_dates": [], "requests": []}
+    capture_policy = {
+        "socket_timeout_seconds": float(getattr(session, "socket_timeout_seconds", 20.0)),
+        "minimum_interval_seconds": float(getattr(session, "minimum_interval_seconds", 1.0)),
+        "max_retries": int(getattr(session, "max_retries", 0)),
+        "retry_base_seconds": float(getattr(session, "retry_base_seconds", 0.0)),
+        "daily_request_budget": int(getattr(session, "daily_request_budget", 49_000)),
+    }
+    previous_capture_policy = checkpoint.get("capture_policy")
+    if previous_capture_policy is not None and "daily_request_budget" not in previous_capture_policy:
+        previous_capture_policy["daily_request_budget"] = 49_000
+    if previous_capture_policy is not None and previous_capture_policy != capture_policy:
+        raise ValueError("续跑的 BaoStock 超时、限速或退避参数与断点不一致")
+    checkpoint["capture_policy"] = capture_policy
     legacy_requests = checkpoint.pop("requests", [])
     if legacy_requests and not request_log_path.exists():
         with request_log_path.open("w", encoding="utf-8") as handle:
@@ -149,20 +301,70 @@ def create_baostock_universe_snapshot(
                 handle.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
         checkpoint["request_count"] = len(legacy_requests)
         _atomic_json(checkpoint, checkpoint_path)
+    _verify_request_log(request_log_path, checkpoint, checkpoint_path)
 
     calendar_path = work / "trading_calendar.csv"
+    raw_calendar_path = raw_dir / "trade_calendar.csv"
     basics_path = raw_dir / "stock_basic_all_types.csv"
+
+    def run_query(endpoint: str, function: Any) -> pd.DataFrame:
+        try:
+            return function()
+        except (Exception, KeyboardInterrupt) as exc:
+            _flush_baostock_requests(session, request_log_path, checkpoint, checkpoint_path)
+            checkpoint["last_failure"] = {
+                "category": getattr(exc, "category", "client_or_validation"),
+                "endpoint": getattr(exc, "endpoint", endpoint),
+                "error_code": getattr(exc, "error_code", None),
+                "message": str(exc),
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            checkpoint["provider_package_version"] = session.package_version
+            _atomic_json(checkpoint, checkpoint_path)
+            raise
+
+    if calendar_path.exists() and not raw_calendar_path.exists():
+        raise ValueError("规范交易日历存在但原始交易日历缺失；停止续跑且不会重新覆盖元数据")
     if not calendar_path.exists():
-        raw_calendar = session.trade_calendar(start, end)
+        if raw_calendar_path.exists():
+            raw_calendar = pd.read_csv(raw_calendar_path, dtype=str, keep_default_na=False)
+            _pin_checkpoint_artifact(
+                raw_calendar_path, checkpoint, checkpoint_path,
+                key="raw/trade_calendar.csv", required_columns={"calendar_date", "is_trading_day"}, unique_column="calendar_date",
+            )
+            request_history = [
+                json.loads(line) for line in request_log_path.read_text(encoding="utf-8").splitlines() if line
+            ] if request_log_path.exists() else []
+            retrieved = next((entry["completed_at_utc"] for entry in reversed(request_history)
+                              if entry.get("endpoint") == "query_trade_dates" and entry.get("completed_at_utc")),
+                             "unknown_recovered_from_raw_file")
+        else:
+            raw_calendar = run_query("query_trade_dates", lambda: session.trade_calendar(start, end))
+            if raw_calendar.empty:
+                raise RuntimeError("BaoStock 未返回请求区间的交易日历")
+            retrieved = session.request_log[-1]["completed_at_utc"]
+            _atomic_csv(raw_calendar, raw_calendar_path)
         if raw_calendar.empty:
-            raise RuntimeError("BaoStock 未返回请求区间的交易日历")
-        retrieved = session.request_log[-1]["completed_at_utc"]
-        _atomic_csv(raw_calendar, raw_dir / "trade_calendar.csv")
+            raise RuntimeError("BaoStock 缓存的原始交易日历为空")
         _atomic_csv(normalize_baostock_calendar(raw_calendar, retrieved), calendar_path)
     if not basics_path.exists():
-        _atomic_csv(session.stock_basic(), basics_path)
+        _atomic_csv(run_query("query_stock_basic", session.stock_basic), basics_path)
 
     _flush_baostock_requests(session, request_log_path, checkpoint, checkpoint_path)
+    _pin_checkpoint_artifact(
+        raw_dir / "trade_calendar.csv", checkpoint, checkpoint_path,
+        key="raw/trade_calendar.csv", required_columns={"calendar_date", "is_trading_day"}, unique_column="calendar_date",
+    )
+    _pin_checkpoint_artifact(
+        calendar_path, checkpoint, checkpoint_path,
+        key="trading_calendar.csv", required_columns={"trade_date", "is_open"}, unique_column="trade_date",
+    )
+    _pin_checkpoint_artifact(
+        basics_path, checkpoint, checkpoint_path,
+        key="raw/stock_basic_all_types.csv",
+        required_columns={"code", "code_name", "ipoDate", "outDate", "type", "status"},
+        unique_column="code",
+    )
 
     calendar = pd.read_csv(calendar_path, dtype=str)
     if "is_open" not in calendar or "trade_date" not in calendar:
@@ -183,17 +385,73 @@ def create_baostock_universe_snapshot(
     }
 
     completed = set(checkpoint.get("completed_dates", []))
+    verified_dates: dict[str, dict[str, Any]] = dict(checkpoint.get("verified_dates", {}))
+    existing_dates = {
+        path.stem for path in daily_dir.glob("*.csv")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.stem)
+    }
+    # Revalidate every prior raw member file before a resume. Legacy checkpoints
+    # did not contain hashes, so the first resumed run pins validated local files.
+    for day in sorted(completed | existing_dates):
+        path = daily_dir / f"{day}.csv"
+        if day not in open_dates:
+            raise ValueError(f"断点中存在请求区间外日期：{day}")
+        artifact = _validate_daily_list_file(path, day)
+        previous = verified_dates.get(day)
+        if previous is not None and previous.get("sha256") != artifact["sha256"]:
+            raise ValueError(f"日期 {day} 的已验证原始快照哈希发生变化；已停止且不会覆盖该文件")
+        if previous is None:
+            artifact["verification_origin"] = "legacy_checkpoint_revalidated_locally"
+        elif day not in completed:
+            artifact["verification_origin"] = "recovered_atomic_file_before_checkpoint_commit"
+        else:
+            artifact["verification_origin"] = previous.get("verification_origin", "checkpoint_hash_verified")
+        verified_dates[day] = artifact
+        completed.add(day)
+    checkpoint["verified_dates"] = verified_dates
+    checkpoint["completed_dates"] = sorted(completed)
+    _atomic_json(checkpoint, checkpoint_path)
     pending = [day for day in open_dates if day not in completed]
     selected_dates = pending if batch_size is None else pending[:batch_size]
     for day in selected_dates:
-        raw = session.all_stocks(day)
-        required_day = {"code", "tradeStatus", "code_name"}
-        if not required_day.issubset(raw.columns):
-            raise RuntimeError(f"BaoStock query_all_stock({day}) 返回字段变化：{list(raw.columns)}")
-        _atomic_csv(raw, daily_dir / f"{day}.csv")
+        daily_path = daily_dir / f"{day}.csv"
+        try:
+            if daily_path.exists():
+                raise FileExistsError(f"待采集日期已有原始文件，拒绝联网重取或覆盖：{daily_path}")
+            raw = session.all_stocks(day)
+            required_day = {"code", "tradeStatus", "code_name"}
+            if not required_day.issubset(raw.columns):
+                raise RuntimeError(f"BaoStock query_all_stock({day}) 返回字段变化：{list(raw.columns)}")
+            _atomic_csv(raw, daily_path)
+            artifact = _validate_daily_list_file(daily_path, day)
+        except (Exception, KeyboardInterrupt) as exc:
+            _flush_baostock_requests(session, request_log_path, checkpoint, checkpoint_path)
+            checkpoint["last_failure"] = {
+                "trade_date": day,
+                "category": getattr(exc, "category", "client_or_validation"),
+                "endpoint": getattr(exc, "endpoint", f"query_all_stock({day})"),
+                "error_code": getattr(exc, "error_code", None),
+                "message": str(exc),
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            checkpoint["verified_dates"] = verified_dates
+            checkpoint["completed_dates"] = sorted(completed)
+            checkpoint["provider_package_version"] = session.package_version
+            _atomic_json(checkpoint, checkpoint_path)
+            raise
+        verified_dates[day] = artifact
         completed.add(day)
         checkpoint["completed_dates"] = sorted(completed)
+        checkpoint["verified_dates"] = verified_dates
+        checkpoint.pop("last_failure", None)
         _flush_baostock_requests(session, request_log_path, checkpoint, checkpoint_path)
+        if progress_callback is not None:
+            progress_callback({
+                "trade_date": day,
+                "completed_dates": len(completed),
+                "total_dates": len(open_dates),
+                "request_count": checkpoint.get("request_count", 0),
+            })
 
     # Persist metadata requests too, including when the first date batch is empty.
     if session.request_log:
@@ -203,9 +461,10 @@ def create_baostock_universe_snapshot(
         _atomic_json(checkpoint, checkpoint_path)
 
     remaining = [day for day in open_dates if day not in completed]
-    if remaining:
+    if remaining or defer_finalize:
         return {
             "state": "partial",
+            "state_reason": "awaiting_remaining_dates" if remaining else "awaiting_price_snapshot_for_final_audit",
             "snapshot_id": snapshot_id,
             "partial_path": str(work),
             "completed_dates": len(completed),
@@ -214,7 +473,7 @@ def create_baostock_universe_snapshot(
             "resume_command": f"cehuan universe-snapshot --start {start} --end {end} --snapshot-id {snapshot_id} --resume",
         }
 
-    request_log = [json.loads(line) for line in request_log_path.read_text(encoding="utf-8").splitlines() if line]
+    request_log = [json.loads(line) for line in request_log_path.read_text(encoding="utf-8").splitlines() if line] if request_log_path.exists() else []
     basic_retrieved = next(
         (entry["completed_at_utc"] for entry in request_log if entry["endpoint"] == "query_stock_basic"),
         None,
@@ -409,6 +668,9 @@ def create_baostock_universe_snapshot(
         "snapshot_id": snapshot_id,
         "provider": "BaoStock",
         "provider_package_version": checkpoint.get("provider_package_version"),
+        "capture_policy": capture_policy,
+        "request_count": checkpoint.get("request_count", 0),
+        "attempt_count": checkpoint.get("attempt_count", 0),
         "date_range": {"start": start, "end": end},
         "open_date_count": len(open_dates),
         "membership_source": "query_all_stock(day), one call per open trade date",
@@ -444,6 +706,105 @@ def create_baostock_universe_snapshot(
     _atomic_json(manifest, work / "manifest.json")
     os.replace(work, destination)
     return {"state": "complete", "snapshot_path": str(destination), **manifest}
+
+
+def export_baostock_universe_symbol_union(
+    universe_path: str | Path,
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Export the union of type-1 stocks present on any captured historical date."""
+    source = Path(universe_path).expanduser().resolve()
+    output = Path(output_path).expanduser().resolve()
+    manifest_path = source / "manifest.json"
+    partial_checkpoint = source / "checkpoint.json"
+    daily_hashes: dict[str, str] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        membership_path = source / "securities_by_date.csv"
+        membership = pd.read_csv(membership_path, dtype=str, keep_default_na=False)
+        expected_hash = manifest.get("files_sha256", {}).get("securities_by_date.csv")
+        if expected_hash and _sha256(membership_path) != expected_hash:
+            raise ValueError("已封存股票池文件哈希不匹配")
+        required = {"trade_date", "symbol", "pool_status"}
+        if not required.issubset(membership.columns):
+            raise ValueError("封存的股票池字段不完整")
+        symbols = set(membership.loc[membership["pool_status"].eq("STOCK_MEMBER"), "symbol"].map(_canonical_vendor_symbol))
+        snapshot_id = str(manifest["snapshot_id"])
+        date_start = str(manifest["date_range"]["start"])
+        date_end = str(manifest["date_range"]["end"])
+        date_count = int(manifest.get("open_date_count", membership["trade_date"].nunique()))
+        member_rows = int(len(membership))
+        daily_hashes = {
+            name.removeprefix("raw/daily_securities/").removesuffix(".csv"): digest
+            for name, digest in manifest.get("files_sha256", {}).items()
+            if name.startswith("raw/daily_securities/")
+        }
+        source_manifest_sha256 = _sha256(manifest_path)
+        source_membership_sha256 = _sha256(membership_path)
+    else:
+        if not partial_checkpoint.is_file():
+            raise FileNotFoundError(f"找不到已完成或完整日期列表 partial 股票池：{source}")
+        checkpoint = json.loads(partial_checkpoint.read_text(encoding="utf-8"))
+        request = checkpoint.get("request", {})
+        snapshot_id = str(request.get("snapshot_id", source.name.lstrip(".")))
+        calendar_path = source / "trading_calendar.csv"
+        basics_path = source / "raw" / "stock_basic_all_types.csv"
+        calendar = pd.read_csv(calendar_path, dtype=str, keep_default_na=False)
+        if not {"trade_date", "is_open"}.issubset(calendar.columns):
+            raise ValueError("partial 股票池交易日历字段不完整")
+        open_dates = sorted(calendar.loc[calendar["is_open"].astype(str).str.lower().eq("true"), "trade_date"].tolist())
+        completed = set(checkpoint.get("completed_dates", []))
+        if completed != set(open_dates):
+            raise ValueError(f"股票池日期尚未全部验证：{len(completed)}/{len(open_dates)}")
+        verified = checkpoint.get("verified_dates", {})
+        basic_verified = checkpoint.get("verified_artifacts", {}).get("raw/stock_basic_all_types.csv", {})
+        if basic_verified.get("sha256") != _sha256(basics_path):
+            raise ValueError("partial 股票池基础资料缺少有效哈希或文件已变化")
+        basics = pd.read_csv(basics_path, dtype=str, keep_default_na=False)
+        required_basic = {"code", "type"}
+        if not required_basic.issubset(basics.columns):
+            raise ValueError("partial 股票池基础资料字段不完整")
+        stock_codes = set(basics.loc[basics["type"].eq("1"), "code"].map(_canonical_vendor_symbol))
+        symbols: set[str] = set()
+        member_rows = 0
+        for day in open_dates:
+            daily_path = source / "raw" / "daily_securities" / f"{day}.csv"
+            artifact = _validate_daily_list_file(daily_path, day)
+            expected = verified.get(day, {}).get("sha256")
+            if not expected or artifact["sha256"] != expected:
+                raise ValueError(f"日期 {day} 的股票池文件缺少有效哈希或文件已变化")
+            raw = pd.read_csv(daily_path, dtype=str, keep_default_na=False)
+            daily_codes = set(raw["code"].map(_canonical_vendor_symbol))
+            symbols.update(daily_codes.intersection(stock_codes))
+            member_rows += len(raw)
+            daily_hashes[day] = artifact["sha256"]
+        date_start = open_dates[0]
+        date_end = open_dates[-1]
+        date_count = len(open_dates)
+        source_manifest_sha256 = None
+        source_membership_sha256 = None
+    if not symbols:
+        raise ValueError("历史股票池中未发现可导出的 type=1 股票代码")
+    if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
+        raise FileExistsError(f"目标代码清单或清单元数据已存在，拒绝覆盖：{output}")
+    symbol_frame = pd.DataFrame({"symbol": sorted(symbols)})
+    _atomic_csv(symbol_frame, output)
+    symbol_manifest = {
+        "source_universe_snapshot_id": snapshot_id,
+        "source_date_range": {"start": date_start, "end": date_end, "date_count": date_count},
+        "source_member_rows_scanned": member_rows,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_membership_sha256": source_membership_sha256,
+        "source_daily_file_hashes": daily_hashes,
+        "union_rule": "Union of codes present in at least one date-specific member response and type=1 in the captured stock_basic table.",
+        "uses_current_list_to_backfill": False,
+        "symbol_count": len(symbols),
+        "symbols_file": str(output),
+        "symbols_file_sha256": _sha256(output),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _atomic_json(symbol_manifest, output.with_suffix(output.suffix + ".manifest.json"))
+    return symbol_manifest
 
 
 def filter_bars_to_point_in_time_universe(
@@ -500,12 +861,32 @@ def filter_bars_to_point_in_time_universe(
     ]].copy()
     if not status_discrepancies.empty:
         status_discrepancies["discrepancy"] = "DAILY_LIST_VS_DAILY_KLINE_TRADE_STATUS_MISMATCH"
-    discrepancies = pd.concat([no_bar, status_discrepancies], ignore_index=True, sort=False)
+    unknown_trade_status = joined.loc[joined["has_bar"] & ~daily_status.isin(["0", "1"]), [
+        "trade_date_key", "symbol_key", "daily_trade_status",
+    ]].copy()
+    if not unknown_trade_status.empty:
+        unknown_trade_status["discrepancy"] = "DAILY_LIST_TRADE_STATUS_UNKNOWN"
+    unknown_suspension = joined.loc[known_status & ~known_bar_suspension, [
+        "trade_date_key", "symbol_key", "daily_trade_status",
+    ]].copy()
+    if not unknown_suspension.empty:
+        unknown_suspension["discrepancy"] = "DAILY_KLINE_SUSPENSION_STATUS_UNKNOWN"
     overlapping_columns = set(pool.columns).intersection(quotes.columns) - {"trade_date_key", "symbol_key"}
     bar_columns_after_merge = {
         column: f"{column}_bar" if column in overlapping_columns else column
         for column in BAR_COLUMNS
     }
+    st_column = bar_columns_after_merge["is_st"]
+    unknown_st = joined.loc[joined["has_bar"] & joined[st_column].isna(), [
+        "trade_date_key", "symbol_key", "daily_trade_status",
+    ]].copy()
+    if not unknown_st.empty:
+        unknown_st["discrepancy"] = "DAILY_KLINE_ST_STATUS_UNKNOWN"
+    discrepancies = pd.concat(
+        [no_bar, status_discrepancies, unknown_trade_status, unknown_suspension, unknown_st],
+        ignore_index=True,
+        sort=False,
+    )
     filtered = joined.loc[joined["has_bar"], list(bar_columns_after_merge.values())].rename(
         columns={value: key for key, value in bar_columns_after_merge.items()}
     ).copy()
@@ -515,6 +896,29 @@ def filter_bars_to_point_in_time_universe(
         joined.get("basic_status_at_retrieval", pd.Series(index=joined.index, dtype="string")).astype("string").eq("0")
         & joined.get("basic_out_date", pd.Series(index=joined.index, dtype="string")).astype("string").ne("")
     )
+    st_unknown_rows = int((joined["has_bar"] & joined[st_column].isna()).sum())
+    unknown_trade_status_rows = int((~daily_status.isin(["0", "1"])).sum())
+    unknown_suspension_rows = int((known_status & ~known_bar_suspension).sum())
+    reconciliation_errors = []
+    for count, message in (
+        (int((~joined["has_bar"]).sum()), "点时股票池成员缺少规范日线"),
+        (int(mismatch.sum()), "每日证券名单与日线停牌状态不一致"),
+        (unknown_trade_status_rows, "每日证券名单的交易状态未知"),
+        (unknown_suspension_rows, "日线停牌状态未知"),
+        (st_unknown_rows, "点时 ST 状态未知"),
+    ):
+        if count:
+            reconciliation_errors.append(f"{message}：{count} 行")
+    reconciliation_quality = {
+        "healthy": not reconciliation_errors,
+        "errors": reconciliation_errors,
+        "daily_stock_member_rows": int(len(pool)),
+        "missing_bar_rows": int((~joined["has_bar"]).sum()),
+        "suspension_status_mismatch_rows": int(mismatch.sum()),
+        "unknown_daily_trade_status_rows": unknown_trade_status_rows,
+        "unknown_suspension_status_rows": unknown_suspension_rows,
+        "unknown_st_status_rows": st_unknown_rows,
+    }
     summary = {
         "daily_stock_member_rows": int(len(pool)),
         "members_with_bars": int(joined["has_bar"].sum()),
@@ -524,6 +928,10 @@ def filter_bars_to_point_in_time_universe(
         "st_unknown_member_rows": int((~joined["has_bar"] | joined[bar_columns_after_merge["is_st"]].isna()).sum()),
         "daily_trade_status_comparable_rows": int(comparable.sum()),
         "daily_trade_status_mismatch_rows": int(mismatch.sum()),
+        "daily_trade_status_unknown_rows": unknown_trade_status_rows,
+        "daily_kline_suspension_status_unknown_rows": unknown_suspension_rows,
+        "st_status_unknown_rows": st_unknown_rows,
+        "reconciliation_quality": reconciliation_quality,
         "eventually_delisted_member_rows": int(eventual_delisted.sum()),
         "eventually_delisted_member_rows_with_bars": int((eventual_delisted & joined["has_bar"]).sum()),
         "eventually_delisted_price_coverage_fraction": (
@@ -584,6 +992,17 @@ def audit_baostock_universe_prices(
     manifest_path = universe_root / "manifest.json"
     if not membership_path.exists() or not manifest_path.exists():
         raise FileNotFoundError("--universe 需要指向包含 manifest.json 和 securities_by_date.csv 的快照目录")
+    universe_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    membership_sha256 = _sha256(membership_path)
+    expected_membership_sha256 = universe_manifest.get("files_sha256", {}).get("securities_by_date.csv")
+    universe_source_errors = []
+    if expected_membership_sha256 is None:
+        universe_source_errors.append("点时股票池 manifest 缺少 securities_by_date.csv 的哈希")
+    elif expected_membership_sha256 != membership_sha256:
+        universe_source_errors.append("点时股票池文件哈希与 manifest.json 不一致")
+    universe_date_range = universe_manifest.get("date_range", {})
+    universe_start = str(universe_date_range.get("start") or "")[:10]
+    universe_end = str(universe_date_range.get("end") or "")[:10]
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     bars_path = Path(bars_path).expanduser().resolve()
@@ -600,9 +1019,14 @@ def audit_baostock_universe_prices(
     quote_groups = iter(_iter_csv_groups(bars_path, "trade_date", bar_columns))
     current_members = next(membership_groups, None)
     current_quotes = next(quote_groups, None)
+    first_member_date = current_members[0] if current_members is not None else None
     coverage_rows: list[dict[str, Any]] = []
     member_total = bar_total = missing_total = 0
+    pre_universe_warmup_bar_rows = 0
+    bars_on_missing_universe_date = 0
+    bars_after_universe_window = 0
     st_known_total = status_comparable_total = status_mismatch_total = 0
+    daily_status_unknown_total = suspension_status_unknown_total = st_status_unknown_total = 0
     delisted_total = delisted_with_bars_total = quote_outside_total = 0
     discrepancy_count = 0
     filtered_temp = output / ".point_in_time_bars.csv.tmp"
@@ -637,12 +1061,35 @@ def audit_baostock_universe_prices(
         missing_symbols = sorted(member_symbols - quote_symbols)
         extra_symbols = sorted(quote_symbols - member_symbols)
         discrepancies: list[dict[str, object]] = []
+        if member_day != day and quote_day == day and not quote_frame.empty:
+            if (universe_start and day < universe_start) or (
+                not universe_start and first_member_date and day < first_member_date
+            ):
+                pre_universe_warmup_bar_rows += len(quote_frame)
+            elif universe_end and day > universe_end:
+                bars_after_universe_window += len(quote_frame)
+            else:
+                bars_on_missing_universe_date += len(quote_frame)
+                for symbol in sorted(quote_symbols):
+                    discrepancies.append({
+                        "trade_date": day,
+                        "symbol": symbol,
+                        "discrepancy": "TRADING_DAY_MISSING_FROM_POINT_IN_TIME_UNIVERSE",
+                    })
         for symbol in missing_symbols:
             discrepancies.append({
                 "trade_date": day,
                 "symbol": symbol,
                 "daily_trade_status": members_by_symbol.loc[symbol, "daily_trade_status"],
                 "discrepancy": "DAILY_STOCK_MEMBER_WITHOUT_CANONICAL_BAR",
+            })
+        daily_status_unknown = ~stock_members["daily_trade_status"].astype(str).isin(["0", "1"])
+        for symbol in stock_members.loc[daily_status_unknown, "symbol_key"].astype(str):
+            discrepancies.append({
+                "trade_date": day,
+                "symbol": symbol,
+                "daily_trade_status": members_by_symbol.loc[symbol, "daily_trade_status"],
+                "discrepancy": "DAILY_LIST_TRADE_STATUS_UNKNOWN",
             })
         if matching_symbols:
             ordered_matches = sorted(matching_symbols)
@@ -654,8 +1101,12 @@ def audit_baostock_universe_prices(
             suspended = parse_optional_bool(matched_quotes["is_suspended"]) if "is_suspended" in matched_quotes else pd.Series(pd.NA, index=matched_quotes.index, dtype="boolean")
             comparable = daily_status.isin(["0", "1"]) & suspended.notna()
             mismatch = comparable & daily_status.eq("0").ne(suspended.fillna(False).astype(bool))
+            unknown_suspension = daily_status.isin(["0", "1"]) & suspended.isna()
+            unknown_st = st_values.isna()
             status_comparable = int(comparable.sum())
             status_mismatch = int(mismatch.sum())
+            suspension_unknown_count = int(unknown_suspension.sum())
+            st_unknown_count = int(unknown_st.sum())
             for symbol, quote_status in zip(matched_quotes.index[mismatch], suspended.loc[mismatch]):
                 discrepancies.append({
                     "trade_date": day,
@@ -664,8 +1115,25 @@ def audit_baostock_universe_prices(
                     "is_suspended": quote_status,
                     "discrepancy": "DAILY_LIST_VS_DAILY_KLINE_TRADE_STATUS_MISMATCH",
                 })
+            for symbol in matched_quotes.index[unknown_suspension]:
+                discrepancies.append({
+                    "trade_date": day,
+                    "symbol": str(symbol),
+                    "daily_trade_status": daily_status.loc[symbol],
+                    "is_suspended": pd.NA,
+                    "discrepancy": "DAILY_KLINE_SUSPENSION_STATUS_UNKNOWN",
+                })
+            for symbol in matched_quotes.index[unknown_st]:
+                discrepancies.append({
+                    "trade_date": day,
+                    "symbol": str(symbol),
+                    "daily_trade_status": daily_status.loc[symbol],
+                    "is_st": pd.NA,
+                    "discrepancy": "DAILY_KLINE_ST_STATUS_UNKNOWN",
+                })
         else:
             st_known = status_comparable = status_mismatch = 0
+            suspension_unknown_count = st_unknown_count = 0
         if discrepancies:
             pd.DataFrame(discrepancies).to_csv(
                 discrepancy_temp,
@@ -713,38 +1181,93 @@ def audit_baostock_universe_prices(
             st_known_total += st_known
             status_comparable_total += status_comparable
             status_mismatch_total += status_mismatch
+            daily_status_unknown_total += int(daily_status_unknown.sum())
+            suspension_status_unknown_total += suspension_unknown_count
+            st_status_unknown_total += st_unknown_count
             delisted_total += eventually_delisted
             delisted_with_bars_total += delisted_with_bars
-        quote_outside_total += len(extra_symbols)
+        if member_day == day:
+            quote_outside_total += len(extra_symbols)
 
     if not filtered_temp.exists():
         pd.DataFrame(columns=BAR_COLUMNS).to_csv(filtered_temp, index=False, encoding="utf-8")
     if not discrepancy_temp.exists():
-        pd.DataFrame(columns=["trade_date", "symbol", "daily_trade_status", "is_suspended", "discrepancy"]).to_csv(
+        pd.DataFrame(columns=["trade_date", "symbol", "daily_trade_status", "is_suspended", "is_st", "discrepancy"]).to_csv(
             discrepancy_temp, index=False, encoding="utf-8",
         )
     os.replace(filtered_temp, output / "point_in_time_bars.csv")
     os.replace(discrepancy_temp, output / "universe_price_discrepancies.csv")
     coverage = pd.DataFrame(coverage_rows)
     _atomic_csv(coverage, output / "daily_price_coverage.csv")
-    universe_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     source_quality_path = bars_path.parent / "quality.json"
     source_quality = json.loads(source_quality_path.read_text(encoding="utf-8")) if source_quality_path.exists() else None
+    source_manifest_path = bars_path.parent / "manifest.json"
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8")) if source_manifest_path.exists() else None
     filtered_path = output / "point_in_time_bars.csv"
     filtered_hash = _sha256(filtered_path)
+    raw_errors = list(source_quality.get("errors", [])) if source_quality else []
+    if not source_quality:
+        raw_errors.append("来源快照没有可验证的 quality.json")
+    elif not source_quality.get("healthy") and not raw_errors:
+        raw_errors.append("来源 quality.json 标记原始行情质量未通过")
+    source_bars_hash = _sha256(bars_path)
+    if not source_manifest:
+        raw_errors.append("来源快照没有 manifest.json，无法验证原始行情文件哈希")
+    else:
+        expected_bars_hash = source_manifest.get("file_sha256", {}).get(bars_path.name)
+        if expected_bars_hash is None:
+            raw_errors.append(f"来源 manifest.json 未登记 {bars_path.name} 的哈希")
+        elif expected_bars_hash != source_bars_hash:
+            raw_errors.append("原始行情文件哈希与来源 manifest.json 不一致")
+    raw_bar_quality = {
+        "healthy": not raw_errors and bool(source_quality and source_quality.get("healthy")),
+        "errors": raw_errors,
+        "warnings": list(source_quality.get("warnings", [])) if source_quality else [],
+        "source_quality_file": str(source_quality_path) if source_quality else None,
+        "source_manifest_file": str(source_manifest_path) if source_manifest else None,
+        "source_bars_sha256": source_bars_hash,
+    }
+    reconciliation_errors = list(universe_source_errors)
+    for count, message in (
+        (missing_total, "点时股票池成员缺少规范日线"),
+        (bars_on_missing_universe_date, "行情交易日缺少对应的点时股票池名单"),
+        (status_mismatch_total, "每日证券名单与日线停牌状态不一致"),
+        (daily_status_unknown_total, "每日证券名单的交易状态未知"),
+        (suspension_status_unknown_total, "日线停牌状态未知"),
+        (st_status_unknown_total, "点时 ST 状态未知"),
+    ):
+        if count:
+            reconciliation_errors.append(f"{message}：{count} 行；详见 universe_price_discrepancies.csv")
+    universe_reconciliation_quality = {
+        "healthy": not reconciliation_errors,
+        "errors": reconciliation_errors,
+        "daily_stock_member_rows": member_total,
+        "members_without_bars": missing_total,
+        "bars_on_missing_universe_date": bars_on_missing_universe_date,
+        "pre_universe_warmup_bar_rows": pre_universe_warmup_bar_rows,
+        "bars_after_universe_window": bars_after_universe_window,
+        "daily_trade_status_mismatch_rows": status_mismatch_total,
+        "daily_trade_status_unknown_rows": daily_status_unknown_total,
+        "daily_kline_suspension_status_unknown_rows": suspension_status_unknown_total,
+        "st_status_unknown_rows": st_status_unknown_total,
+        "detail_file": str(output / "universe_price_discrepancies.csv"),
+        "source_artifact": "securities_by_date.csv",
+        "source_artifact_sha256": membership_sha256,
+        "expected_source_artifact_sha256": expected_membership_sha256,
+        "source_artifact_errors": universe_source_errors,
+    }
+    overall_errors = raw_errors + reconciliation_errors
     prevalidated_warnings = list(source_quality.get("warnings", [])) if source_quality else []
     if missing_total:
         prevalidated_warnings.append(f"点时股票池有 {missing_total} 个股票日缺少日线")
-    if status_mismatch_total:
-        prevalidated_warnings.append(f"日期名单与日线停牌状态有 {status_mismatch_total} 行不一致")
     prevalidated_quality = {
-        "healthy": bool(source_quality and source_quality.get("healthy")),
-        "errors": source_quality.get("errors", []) if source_quality else [
-            "来源快照没有可验证的 quality.json；不能用于紧凑内存预验证回测",
-        ],
+        "healthy": bool(raw_bar_quality["healthy"] and universe_reconciliation_quality["healthy"]),
+        "errors": overall_errors,
         "warnings": prevalidated_warnings,
-        "source_quality_file": str(source_quality_path) if source_quality else None,
-        "source_bars_sha256": _sha256(bars_path),
+        "raw_bar_quality": raw_bar_quality,
+        "universe_reconciliation_quality": universe_reconciliation_quality,
+        "source_quality_file": raw_bar_quality["source_quality_file"],
+        "source_bars_sha256": raw_bar_quality["source_bars_sha256"],
         "data_sha256": filtered_hash,
         "result_type": "prevalidated_source_snapshot_after_streaming_point_in_time_audit",
         "universe_snapshot_id": universe_manifest.get("snapshot_id"),
@@ -763,11 +1286,17 @@ def audit_baostock_universe_prices(
         "daily_stock_member_rows": member_total,
         "members_with_bars": bar_total,
         "members_without_bars": missing_total,
+        "bars_on_missing_universe_date": bars_on_missing_universe_date,
+        "pre_universe_warmup_bar_rows": pre_universe_warmup_bar_rows,
+        "bars_after_universe_window": bars_after_universe_window,
         "price_coverage_fraction": bar_total / member_total if member_total else None,
         "st_known_member_rows": st_known_total,
         "st_unknown_member_rows": member_total - st_known_total,
         "daily_trade_status_comparable_rows": status_comparable_total,
         "daily_trade_status_mismatch_rows": status_mismatch_total,
+        "daily_trade_status_unknown_rows": daily_status_unknown_total,
+        "daily_kline_suspension_status_unknown_rows": suspension_status_unknown_total,
+        "st_status_unknown_rows": st_status_unknown_total,
         "eventually_delisted_member_rows": delisted_total,
         "eventually_delisted_member_rows_with_bars": delisted_with_bars_total,
         "eventually_delisted_price_coverage_fraction": delisted_with_bars_total / delisted_total if delisted_total else None,
@@ -775,6 +1304,9 @@ def audit_baostock_universe_prices(
         "daily_coverage_file": str(output / "daily_price_coverage.csv"),
         "discrepancy_file": str(output / "universe_price_discrepancies.csv"),
         "prevalidated_quality_file": str(output / "point_in_time_quality.json"),
+        "raw_bar_quality": raw_bar_quality,
+        "universe_reconciliation_quality": universe_reconciliation_quality,
+        "healthy": bool(raw_bar_quality["healthy"] and universe_reconciliation_quality["healthy"]),
     }
     _atomic_json(result, output / "audit.json")
     return result

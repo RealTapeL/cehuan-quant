@@ -24,9 +24,17 @@
 
 BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `uv sync --extra baostock` 后，可执行 `cehuan snapshot --symbols SH600519,SZ000001 --start 20100101 --end 20261026`。命令保存未复权日线、`adjustflag=1` 后复权日线、复权因子、全量股票基础表、原始交易日历和规范化交易日历，并生成 `bars.csv`、质量报告、`manifest.json` 和 SHA-256 文件清单。指定的指数基准另存为 `benchmark.csv`，不会加入选股池；回测使用 `--benchmark-data` 显式加载。
 
-`snapshot` 支持 `--symbols-file`、`--batch-size`（每批 1–30 只）、`--max-batches` 和 `--resume`。大任务的每批行情与复权因子独立保存；中断后用相同的代码清单、日期、基准、批大小和 `--snapshot-id ... --resume` 接着运行。最终快照以有序分块归并生成 `bars.csv`，避免把全历史行情一次性装入内存，并保留每批原始响应。未指定 `--max-batches` 时会顺序完成全部批次。
+`snapshot` 支持 `--symbols-file`、`--batch-size`（每批 1–30 只）、`--max-batches` 和 `--resume`。大任务的每批行情与复权因子独立保存；批次清单记录超时、最小请求间隔、重试数、退避和日请求预算。中断后用相同的代码清单、日期、基准、批大小和 `--snapshot-id ... --resume` 接着运行。最终快照以有序分块归并生成 `bars.csv`，避免把全历史行情一次性装入内存，并保留每批原始响应。未指定 `--max-batches` 时会顺序完成全部批次。
 
 `cehuan universe-snapshot --start ... --end ... --snapshot-id ...` 按交易日请求 `query_all_stock(day)`，每个日期的原始列表单独保存，支持 `--batch-size N` 与 `--resume`。最终 `securities_by_date.csv` 按日追加写出，避免将全历史成员记录长期保存在内存；同时保留日期列表成员、最新基础资料类型、挂牌区间核对、当日 `tradeStatus`、ST 状态来源以及候选资格状态。`reconciliation.csv` 列出基础资料挂牌区间认为在市、但日期列表未出现的证券；`daily_coverage.csv` 汇总证券类型、交易状态、ST 未知、行情覆盖和已退市样本覆盖。`universe-audit` 也按日期流式对齐行情和成员名单。可用 `--bars data/private/snapshots/.../bars.csv` 核对行情覆盖。股票池成员由日期列表确定，但类型来自单独查询的基础资料；基础资料类型缺失的证券保留为 `UNKNOWN_TYPE` 并排除，不会推断成股票。
+
+`universe-audit` 分别报告 `raw_bar_quality`（原始规范行情质量与来源 manifest 哈希）和 `universe_reconciliation_quality`（逐日成员覆盖、交易/停牌状态及 ST）。缺日线、状态冲突或关键状态未知时，对账健康状态为 false；`backtest --universe`、`baseline-diagnostics` 和紧凑数据预验证均拒绝把未通过的结果列作正式基线。逐条差异保留日期和代码，整体覆盖率不能替代核查。
+
+BaoStock 0.9.4 原始 `socketutil.send_msg` 在 `recv()` 返回空字节时不会退出，可能永久空转；适配器在单连接会话中安装 EOF 防护，并设置 20 秒 socket 超时。进程内线程锁和跨进程文件锁共同避免本机并发会话。默认请求最小间隔 1 秒；连接错误最多重试 1 次并指数退避，明确的 `10001001`“用户未登录”响应最多重新登录 1 次后重试原请求；其他 API/权限错误不自动重试。默认本地每日预算 49,000 次（包含分页请求），低于官方 50,000 次限制。断点逐日记录 CSV 哈希和行数；续跑先校验成员、日历、基础资料和追加请求日志。哈希不同或结构不符即停止，不覆盖原文件。原有无哈希断点首次续跑时仅在结构、代码唯一性检查通过后登记本地哈希，并标明迁移来源。具体限制与源码行为见[数据源审计](data-provider-audit.md)。
+
+若 BaoStock 在探测后仍不可用，可用 `cehuan universe-import` 导入另一供应商的历史成员 CSV。必须包含 `trade_date,symbol,source,source_record_date,source_retrieved_at_utc`；`source_record_date` 必须逐行等于 `trade_date`。可选字段为 `security_type,daily_trade_status,is_suspended,is_st,st_status_source,name`。缺失状态保持未知，重复 `(trade_date,symbol)` 拒绝导入。命令保留原文件与哈希，不会查询今天的股票列表或回填历史。模板与示例见[历史股票池 CSV 导入规范](historical-universe-import.md)。
+
+点时名单全部验证后，`cehuan universe-symbols --universe <snapshot-or-partial> --output data/private/.../symbols.csv` 可导出整个历史窗口中至少出现过一次的 `type=1` 证券并集，原始日名单和基础资料哈希会写入 `.manifest.json`。股票行情快照按此并集查询；股票池保持 partial，待 `snapshot` 取得行情/复权因子后，再用 `universe-snapshot --resume --bars <bars.csv>` 对齐停牌、ST 和缺失行情并封存。`--defer-finalize` 用于在成员日期采集完成后暂停自动封存。
 
 大快照核验通过后，可将生成的点时行情 CSV 交给 `backtest --prevalidated-quality <point_in_time_quality.json>`。该报告由 `universe-audit` 生成，绑定过滤后文件的 SHA-256，并继承源快照质量结果。该模式按类别编码日期、代码和低基数元数据节省内存；不得用它跳过质量或股票池校验。
 
@@ -38,7 +46,7 @@ BaoStock 的 `volume` 映射为股、`amount` 映射为元；`tradestatus=0` 映
 
 `examples/trading_calendar_template.csv` 接受 `trade_date,is_open,previous_trade_date,source,retrieved_at_utc`，也识别 Tushare 风格的 `cal_date` 和 `pretrade_date` 列。`quality --calendar` 会检查每个行情日期是否为已知开市日；`plan --calendar` 会校验历史行情覆盖，并标注日历给出的下一个开市日期。请保留文件版本和来源，模板本身不包含真实交易日。
 
-BaoStock 快照现在可以为明确指定的证券提供日线 ST/停牌状态以及上市、退市日期，但本项目尚未建立完整全市场的历史证券状态表，也没有接入 Tushare。Tushare 文档列出上市/退市、交易日历、停复牌、涨跌停及历史 ST 接口，权限按端点分别控制；本机没有 Token，账户积分和实际覆盖未知。证券交易规则仍通过有效日期 CSV 输入，缺项保持未知。
+BaoStock 日线可为取得的日期提供 ST/停牌状态，日期成员接口单独提供成员与 `tradeStatus`。2023–2025 点时股票池与行情快照已完成，但审计因一项证券代码迁移缺行和 20 条挂牌元数据差异未通过，不能作为正式基线输入；全历史股票池仍未完成。Tushare 文档列出上市/退市、交易日历、停复牌、涨跌停及历史 ST 接口，权限按端点分别控制；本机没有 Token，账户积分和实际覆盖未知。证券交易规则仍通过有效日期 CSV 输入，缺项保持未知。详见[数据源审计](data-provider-audit.md)与[三年数据审计](three-year-data-audit.md)。
 
 参考文档：[AKShare A 股历史行情与复权说明](https://akshare.akfamily.xyz/data/stock/stock.html)、[AKShare 数据风险提示](https://github.com/akfamily/akshare/blob/main/docs/data_tips.md)；[BaoStock API](https://www.baostock.com/api/)、[证券基本资料](https://www.baostock.com/mainContent?file=stockBasic.md)、[复权因子](https://www.baostock.com/mainContent?file=factorInfo.md)；[Tushare 股票基础信息](https://tushare.pro/document/1?doc_id=25)、[交易日历](https://tushare.pro/document/2?doc_id=26)、[每日停复牌](https://tushare.pro/document/2?doc_id=214)、[每日涨跌停价](https://tushare.pro/document/2?doc_id=183)、[历史 ST 名单](https://tushare.pro/document/2?doc_id=397)、[复权因子](https://tushare.pro/document/2?doc_id=28)。
 

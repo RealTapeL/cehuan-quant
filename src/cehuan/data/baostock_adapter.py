@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import csv
+import fcntl
 import heapq
 import json
 import os
+import socket
 import tempfile
+import threading
 import time
+import zlib
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -26,6 +30,48 @@ HISTORY_FIELDS = (
 )
 INDEX_FIELDS = "date,code,open,high,low,close,volume,amount"
 SOURCE_NAME = "baostock.query_history_k_data_plus"
+
+
+def _safe_baostock_send_msg(
+    message: str,
+    default_socket: Any,
+    *,
+    message_header_length: int,
+    message_split: str,
+    compressed_message_types: set[str] | tuple[str, ...],
+) -> str | None:
+    """Read one BaoStock protocol response and treat EOF as a transport error.
+
+    BaoStock 0.9.4 loops forever when ``recv`` returns ``b""`` before its
+    terminator arrives. A socket timeout cannot stop that EOF loop, so the
+    adapter installs this small protocol-compatible guard for its session.
+    """
+    if default_socket is None:
+        return None
+    default_socket.sendall((message + "\n").encode("utf-8"))
+    receive = bytearray()
+    terminator = b"<![CDATA[]]>\n"
+    while not receive.endswith(terminator):
+        chunk = default_socket.recv(8192)
+        if not chunk:
+            raise EOFError("BaoStock socket closed before the response terminator")
+        receive.extend(chunk)
+
+    raw = bytes(receive)
+    header_bytes = raw[:message_header_length]
+    try:
+        header = header_bytes.decode("utf-8")
+        header_parts = header.split(message_split)
+        if len(header_parts) < 3:
+            raise ValueError("BaoStock response header is incomplete")
+        if header_parts[1] in compressed_message_types:
+            compressed_length = int(header_parts[2])
+            compressed_body = raw[message_header_length:message_header_length + compressed_length]
+            body = zlib.decompress(compressed_body).decode("utf-8")
+            return header + body
+        return raw.decode("utf-8")
+    except (UnicodeDecodeError, ValueError, zlib.error) as exc:
+        raise ConnectionError(f"BaoStock response framing is invalid: {exc}") from exc
 
 
 def _vendor_code(symbol: object) -> str:
@@ -48,60 +94,448 @@ def _canonical_vendor_symbol(value: object) -> str:
     return canonical_symbol(raw)
 
 
-def _query_frame(response: Any, endpoint: str) -> pd.DataFrame:
-    if str(response.error_code) != "0":
-        raise RuntimeError(f"BaoStock {endpoint} 失败：{response.error_code} {response.error_msg}")
+class BaoStockError(RuntimeError):
+    """A BaoStock failure with a stable stage and retry classification."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        endpoint: str,
+        error_code: str | None = None,
+        error_msg: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.endpoint = endpoint
+        self.error_code = error_code
+        self.error_msg = error_msg
+
+
+def _error_category(error_code: object | None, error_msg: object | None = None) -> str:
+    code = str(error_code or "")
+    if isinstance(error_msg, (ConnectionError, TimeoutError, EOFError)):
+        return "transport"
+    message = str(error_msg or "").lower()
+    if code == "10001001":
+        return "session_expired"
+    if code.startswith("10002") or any(token in message for token in (
+        "network", "socket", "connection", "connect", "recv", "receive", "timeout", "timed out",
+        "reset by peer", "broken pipe", "remote end closed", "connection aborted", "ssl",
+        "连接", "接收", "超时",
+    )):
+        return "transport"
+    if code == "10001011":
+        return "provider_access_denied"
+    return "provider_api"
+
+
+def _raise_for_response(response: Any, endpoint: str) -> None:
+    code = str(getattr(response, "error_code", "unknown"))
+    message = str(getattr(response, "error_msg", "missing response status"))
+    if code != "0":
+        category = _error_category(code, message)
+        raise BaoStockError(
+            f"BaoStock {endpoint} 失败：{code} {message}",
+            category=category,
+            endpoint=endpoint,
+            error_code=code,
+            error_msg=message,
+        )
+
+
+def _query_frame(response: Any, endpoint: str, before_page: Any | None = None) -> tuple[pd.DataFrame, int]:
+    _raise_for_response(response, endpoint)
     fields = list(response.fields)
     rows: list[list[str]] = []
-    while response.next():
+    pages = 1 if len(getattr(response, "data", [])) else 0
+    while True:
+        data = getattr(response, "data", [])
+        current_row = int(getattr(response, "cur_row_num", 0))
+        page_size = int(getattr(response, "per_page_count", 0) or 0)
+        if data and current_row >= len(data) and len(data) == page_size and before_page is not None:
+            before_page()
+        prior_page = int(getattr(response, "cur_page_num", 1) or 1)
+        if not response.next():
+            _raise_for_response(response, endpoint)
+            # BaoStock's pinned 0.9.4 SDK returns False on a socket receive
+            # failure without changing error_code. A full page still present
+            # after next() means pagination did not complete.
+            data = getattr(response, "data", [])
+            current_row = int(getattr(response, "cur_row_num", 0))
+            page_size = int(getattr(response, "per_page_count", 0) or 0)
+            if data and current_row >= len(data) and page_size > 0 and len(data) == page_size:
+                raise BaoStockError(
+                    f"BaoStock {endpoint} 分页未完成：SDK 在完整页面后停止，可能是连接中断",
+                    category="transport",
+                    endpoint=endpoint,
+                    error_code="10002007",
+                    error_msg="pagination stopped after a full page",
+                )
+            break
+        if int(getattr(response, "cur_page_num", 1) or 1) > prior_page:
+            pages += 1
         rows.append(response.get_row_data())
-    return pd.DataFrame(rows, columns=fields)
+    return pd.DataFrame(rows, columns=fields), pages
 
 
 class BaoStockSession:
     """Small, explicit BaoStock session. No requests are sent at import time."""
 
-    def __init__(self) -> None:
+    _session_lock = threading.Lock()
+
+    def __init__(
+        self,
+        *,
+        socket_timeout_seconds: float = 20.0,
+        minimum_interval_seconds: float = 1.0,
+        max_retries: int = 1,
+        retry_base_seconds: float = 2.0,
+        daily_request_budget: int = 49_000,
+        lock_path: str | Path | None = None,
+    ) -> None:
+        if (
+            socket_timeout_seconds <= 0 or minimum_interval_seconds < 0 or max_retries < 0
+            or retry_base_seconds < 0 or not 1 <= daily_request_budget <= 49_000
+        ):
+            raise ValueError("BaoStock timeout、限速和重试参数必须为非负值，timeout 必须大于 0")
         self.bs: Any | None = None
         self.package_version: str | None = None
         self.request_log: list[dict[str, Any]] = []
+        self.socket_timeout_seconds = float(socket_timeout_seconds)
+        self.minimum_interval_seconds = float(minimum_interval_seconds)
+        self.max_retries = int(max_retries)
+        self.retry_base_seconds = float(retry_base_seconds)
+        self.daily_request_budget = int(daily_request_budget)
+        self.lock_path = (
+            Path(lock_path).expanduser().resolve()
+            if lock_path is not None
+            else Path(__file__).resolve().parents[3] / "data" / "private" / ".baostock-session.lock"
+        )
+        self._request_day: str | None = None
+        self._requests_today = 0
+        self._previous_socket_timeout: float | None = None
+        self._socket_timeout_saved = False
+        self._last_request_started: float | None = None
+        self._lock_acquired = False
+        self._process_lock_handle: Any | None = None
+        self._socketutil_module: Any | None = None
+        self._original_send_msg: Any | None = None
 
     def __enter__(self) -> "BaoStockSession":
+        if not self._session_lock.acquire(blocking=False):
+            raise BaoStockError(
+                "当前进程已有 BaoStock 会话；拒绝启动并发请求",
+                category="local_concurrency_stop",
+                endpoint="session_lock",
+                error_code="LOCAL_CONCURRENT_SESSION",
+                error_msg="thread-level BaoStock lock is already held",
+            )
+        self._lock_acquired = True
         try:
+            self._acquire_process_lock()
+            self._previous_socket_timeout = socket.getdefaulttimeout()
+            self._socket_timeout_saved = True
+            # BaoStock 0.9.4 creates raw sockets without setting a timeout. Set
+            # the process default only for this serialized session so login,
+            # connect, and recv cannot block forever.
+            socket.setdefaulttimeout(self.socket_timeout_seconds)
             import baostock as bs
+            self._install_receive_eof_guard()
         except ImportError as exc:
+            self._restore_session_globals()
             raise RuntimeError("缺少 BaoStock，可运行 `uv sync --extra baostock` 安装可选数据适配器") from exc
+        except Exception:
+            self._restore_session_globals()
+            raise
         try:
             self.package_version = version("baostock")
         except PackageNotFoundError:
             self.package_version = "unknown"
         self.bs = bs
-        login = bs.login()
-        if str(login.error_code) != "0":
+        try:
+            self._login_with_retry()
+        except (Exception, KeyboardInterrupt):
             self.bs = None
-            raise RuntimeError(f"BaoStock 登录失败：{login.error_code} {login.error_msg}")
+            self._close_default_socket()
+            self._restore_session_globals()
+            raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self.bs is not None:
-            self.bs.logout()
-            self.bs = None
+        try:
+            if self.bs is not None:
+                try:
+                    self.bs.logout()
+                except Exception as logout_error:
+                    self.request_log.append({
+                        "endpoint": "logout",
+                        "status": "failed",
+                        "category": "transport",
+                        "error_msg": str(logout_error),
+                        "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    })
+                self.bs = None
+        finally:
+            self._close_default_socket()
+            self._restore_session_globals()
+
+    def _restore_session_globals(self) -> None:
+        try:
+            if self._socketutil_module is not None and self._original_send_msg is not None:
+                self._socketutil_module.send_msg = self._original_send_msg
+                self._socketutil_module = None
+                self._original_send_msg = None
+            if self._socket_timeout_saved:
+                socket.setdefaulttimeout(self._previous_socket_timeout)
+                self._previous_socket_timeout = None
+                self._socket_timeout_saved = False
+            self._release_process_lock()
+        finally:
+            if self._lock_acquired:
+                self._lock_acquired = False
+                self._session_lock.release()
+
+    def _install_receive_eof_guard(self) -> None:
+        import baostock.common.context as context
+        import baostock.common.contants as constants
+        import baostock.util.socketutil as socketutil
+
+        self._socketutil_module = socketutil
+        self._original_send_msg = socketutil.send_msg
+
+        def guarded_send_msg(message: str) -> str | None:
+            return _safe_baostock_send_msg(
+                message,
+                getattr(context, "default_socket", None),
+                message_header_length=constants.MESSAGE_HEADER_LENGTH,
+                message_split=constants.MESSAGE_SPLIT,
+                compressed_message_types=constants.COMPRESSED_MESSAGE_TYPE_TUPLE,
+            )
+
+        socketutil.send_msg = guarded_send_msg
+
+    def _acquire_process_lock(self) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            owner = handle.read().strip() or "owner metadata unavailable"
+            handle.close()
+            raise BaoStockError(
+                f"检测到另一个进程正在使用 BaoStock：{owner}",
+                category="local_concurrency_stop",
+                endpoint="process_lock",
+                error_code="LOCAL_CONCURRENT_SESSION",
+                error_msg=owner,
+            ) from exc
+        self._process_lock_handle = handle
+        handle.seek(0)
+        handle.truncate()
+        try:
+            handle.write(json.dumps({
+                "pid": os.getpid(),
+                "acquired_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }))
+            handle.flush()
+        except Exception:
+            self._release_process_lock()
+            raise
+
+    def _release_process_lock(self) -> None:
+        handle = self._process_lock_handle
+        self._process_lock_handle = None
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+    def _close_default_socket(self) -> None:
+        try:
+            import baostock.common.context as context
+            sock = getattr(context, "default_socket", None)
+            if sock is not None:
+                try:
+                    sock.close()
+                finally:
+                    context.default_socket = None
+        except ImportError:
+            pass
+
+    def _wait_for_request_slot(self) -> None:
+        now = time.monotonic()
+        if self._last_request_started is not None:
+            wait_seconds = self.minimum_interval_seconds - (now - self._last_request_started)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+        self._last_request_started = time.monotonic()
+
+    def _reserve_request(self, endpoint: str) -> None:
+        day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        if day != self._request_day:
+            self._request_day = day
+            self._requests_today = 0
+        if self._requests_today >= self.daily_request_budget:
+            raise BaoStockError(
+                f"BaoStock 单日安全请求预算已达 {self.daily_request_budget}，停止请求以避开官方 50,000 次上限",
+                category="daily_budget_stop",
+                endpoint=endpoint,
+                error_code="LOCAL_DAILY_BUDGET",
+                error_msg=f"requests_today={self._requests_today}; day={day}",
+            )
+        self._requests_today += 1
+
+    def _record_attempt(self, record: dict[str, Any]) -> None:
+        self.request_log.append(record)
+
+    def _login_once(self) -> Any:
+        started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        timer = time.perf_counter()
+        self._wait_for_request_slot()
+        self._reserve_request("login")
+        try:
+            login = self.bs.login()
+        except KeyboardInterrupt:
+            self._record_attempt({
+                "endpoint": "login",
+                "started_at_utc": started_at,
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "elapsed_seconds": round(time.perf_counter() - timer, 3),
+                "status": "interrupted",
+                "category": "operator_interrupted",
+                "error_msg": "KeyboardInterrupt during BaoStock login",
+                "request_count": 1,
+            })
+            raise
+        except Exception as exc:
+            error_code = "10002007" if isinstance(exc, EOFError) else None
+            self._record_attempt({
+                "endpoint": "login",
+                "started_at_utc": started_at,
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "elapsed_seconds": round(time.perf_counter() - timer, 3),
+                "status": "failed",
+                "category": "transport",
+                "error_code": error_code,
+                "error_msg": f"{type(exc).__name__}: {exc}",
+                "request_count": 1,
+            })
+            raise BaoStockError(
+                f"BaoStock 登录客户端异常：{type(exc).__name__}: {exc}",
+                category="transport",
+                endpoint="login",
+                error_code=error_code,
+                error_msg=str(exc),
+            ) from exc
+        record = {
+            "endpoint": "login",
+            "started_at_utc": started_at,
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "elapsed_seconds": round(time.perf_counter() - timer, 3),
+            "status": "success" if str(login.error_code) == "0" else "failed",
+            "error_code": str(login.error_code),
+            "error_msg": str(login.error_msg),
+            "category": "success" if str(login.error_code) == "0" else _error_category(login.error_code, login.error_msg),
+            "request_count": 1,
+        }
+        self._record_attempt(record)
+        if str(login.error_code) != "0":
+            category = _error_category(login.error_code, login.error_msg)
+            raise BaoStockError(
+                f"BaoStock 登录失败：{login.error_code} {login.error_msg}",
+                category=category,
+                endpoint="login",
+                error_code=str(login.error_code),
+                error_msg=str(login.error_msg),
+            )
+        return login
+
+    def _login_with_retry(self) -> None:
+        for attempt in range(self.max_retries + 1):
+            try:
+                self._login_once()
+                return
+            except BaoStockError as exc:
+                if exc.category != "transport" or attempt >= self.max_retries:
+                    raise
+                self._close_default_socket()
+                time.sleep(min(self.retry_base_seconds * (2**attempt), 30.0))
 
     def _query(self, endpoint: str, call: Any) -> pd.DataFrame:
         if self.bs is None:
             raise RuntimeError("BaoStockSession 尚未登录")
-        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        timer = time.perf_counter()
-        frame = _query_frame(call(), endpoint)
-        self.request_log.append({
-            "endpoint": endpoint,
-            "started_at_utc": started,
-            "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "elapsed_seconds": round(time.perf_counter() - timer, 3),
-            "row_count": int(len(frame)),
-            "fields": list(frame.columns),
-        })
-        return frame
+        for attempt in range(self.max_retries + 1):
+            started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            timer = time.perf_counter()
+            page_attempts = 1
+
+            def wait_for_page() -> None:
+                nonlocal page_attempts
+                self._reserve_request(endpoint)
+                page_attempts += 1
+                self._wait_for_request_slot()
+
+            try:
+                self._wait_for_request_slot()
+                self._reserve_request(endpoint)
+                response = call()
+                frame, pages = _query_frame(response, endpoint, wait_for_page)
+                self._record_attempt({
+                    "endpoint": endpoint,
+                    "started_at_utc": started,
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "elapsed_seconds": round(time.perf_counter() - timer, 3),
+                    "row_count": int(len(frame)),
+                    "page_count": pages,
+                    "request_count": page_attempts,
+                    "status": "success",
+                    "category": "success",
+                })
+                return frame
+            except (Exception, KeyboardInterrupt) as exc:
+                interrupted = isinstance(exc, KeyboardInterrupt)
+                if interrupted:
+                    category = "operator_interrupted"
+                    error_code = None
+                    error_msg = "KeyboardInterrupt during BaoStock request"
+                elif isinstance(exc, BaoStockError):
+                    category = exc.category
+                    error_code = exc.error_code
+                    error_msg = exc.error_msg or str(exc)
+                else:
+                    category = _error_category(None, exc)
+                    error_code = "10002007" if isinstance(exc, EOFError) else None
+                    error_msg = str(exc)
+                self._record_attempt({
+                    "endpoint": endpoint,
+                    "started_at_utc": started,
+                    "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "elapsed_seconds": round(time.perf_counter() - timer, 3),
+                    "status": "failed",
+                    "category": category,
+                    "error_code": error_code,
+                    "error_msg": error_msg,
+                    "attempt": attempt + 1,
+                    "request_count": page_attempts,
+                })
+                if interrupted:
+                    raise
+                if category not in {"transport", "session_expired"} or attempt >= self.max_retries:
+                    if isinstance(exc, BaoStockError):
+                        raise
+                    raise BaoStockError(
+                        f"BaoStock {endpoint} 客户端异常：{type(exc).__name__}: {exc}",
+                        category=category,
+                        endpoint=endpoint,
+                        error_msg=str(exc),
+                    ) from exc
+                self._close_default_socket()
+                time.sleep(min(self.retry_base_seconds * (2**attempt), 30.0))
+                self._login_once()
 
     def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
         return self._query(
@@ -277,6 +711,73 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_json_atomic(value: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _verify_snapshot_chunk(
+    chunk_path: Path,
+    *,
+    expected_snapshot_id: str,
+    expected_symbols: list[str],
+    expected_start: str,
+    expected_end: str,
+) -> dict[str, Any]:
+    """Validate every committed chunk artifact before it is trusted on resume."""
+    manifest_path = chunk_path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"已存在的行情批次缺少 manifest.json，保留现场并停止：{chunk_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("snapshot_id") != expected_snapshot_id:
+        raise ValueError(f"行情批次编号与预期不符：{chunk_path.name}")
+    if manifest.get("date_range") != {"start": expected_start, "end": expected_end}:
+        raise ValueError(f"行情批次 {chunk_path.name} 的日期范围与任务不符")
+    if manifest.get("universe", {}).get("symbols") != expected_symbols:
+        raise ValueError(f"行情批次 {chunk_path.name} 的证券清单与任务不符")
+    hashes = manifest.get("file_sha256")
+    if not isinstance(hashes, dict) or not hashes:
+        raise ValueError(f"行情批次 {chunk_path.name} 缺少文件哈希清单")
+    root = chunk_path.resolve()
+    actual_files = {
+        str(path.relative_to(chunk_path))
+        for path in chunk_path.rglob("*")
+        if path.is_file() and path.name != "manifest.json"
+    }
+    if actual_files != set(hashes):
+        missing = sorted(set(hashes) - actual_files)
+        unlisted = sorted(actual_files - set(hashes))
+        raise ValueError(
+            f"行情批次 {chunk_path.name} 文件清单与哈希不一致；缺失={missing[:5]}，未登记={unlisted[:5]}"
+        )
+    for relative, expected_hash in hashes.items():
+        artifact = (chunk_path / relative).resolve()
+        if not artifact.is_relative_to(root):
+            raise ValueError(f"行情批次 {chunk_path.name} 含越界文件路径：{relative}")
+        if _sha256(artifact) != expected_hash:
+            raise ValueError(f"行情批次 {chunk_path.name} 文件哈希不匹配：{relative}")
+    if hashes.get("bars.csv") != manifest.get("normalized_bars_sha256"):
+        raise ValueError(f"行情批次 {chunk_path.name} 的规范行情哈希字段不匹配")
+    quality = manifest.get("quality", {})
+    if not quality.get("healthy"):
+        raise ValueError(
+            f"行情批次 {chunk_path.name} 质量未通过：" + "; ".join(quality.get("errors", []))
+        )
+    return manifest
+
+
+def _capture_policy(session: Any) -> dict[str, Any]:
+    return {
+        "socket_timeout_seconds": float(getattr(session, "socket_timeout_seconds", 20.0)),
+        "minimum_interval_seconds": float(getattr(session, "minimum_interval_seconds", 1.0)),
+        "max_retries": int(getattr(session, "max_retries", 0)),
+        "retry_base_seconds": float(getattr(session, "retry_base_seconds", 0.0)),
+        "daily_request_budget": int(getattr(session, "daily_request_budget", 49_000)),
+    }
 
 
 def _merge_sorted_bar_chunks(chunk_files: list[Path], output_path: Path) -> dict[str, Any]:
@@ -495,6 +996,7 @@ def _create_baostock_snapshot_chunk(
             "manifest_generated_at_utc": generated_at,
             "provider": "BaoStock",
             "provider_package_version": session.package_version,
+            "capture_policy": _capture_policy(session),
             "provider_package_metadata": "PyPI package; see docs/data-provider-audit.md for provenance caveats",
             "api_endpoints": ["query_trade_dates", "query_stock_basic", "query_history_k_data_plus", "query_adjust_factor"],
             "date_range": {"start": start, "end": end},
@@ -551,7 +1053,7 @@ def _create_baostock_snapshot_chunk(
         )
         os.replace(temp_path, destination)
         return {"snapshot_path": str(destination), **manifest}
-    except Exception:
+    except BaseException:
         import shutil
 
         shutil.rmtree(temp_path, ignore_errors=True)
@@ -620,7 +1122,54 @@ def create_baostock_snapshot(
             raise FileExistsError(f"发现未完成快照；请添加 --resume：{partial}")
         partial.mkdir()
         checkpoint = {"request": request, "created_at_utc": created_at.isoformat(timespec="seconds")}
-        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_atomic(checkpoint, checkpoint_path)
+
+    chunks = [normalized_symbols[i:i + batch_size] for i in range(0, len(normalized_symbols), batch_size)]
+    chunk_ids = {f"chunk-{i:05d}" for i in range(1, len(chunks) + 1)}
+    verified_chunk_manifests: dict[str, dict[str, Any]] = {}
+    verified_chunk_manifest_hashes: dict[str, str] = {}
+    if resume:
+        recorded_ids = checkpoint.get("completed_chunks", [])
+        if not isinstance(recorded_ids, list) or len(recorded_ids) != len(set(recorded_ids)):
+            raise ValueError("批次 checkpoint 中的 completed_chunks 格式无效或存在重复项")
+        unexpected_ids = sorted(set(recorded_ids) - chunk_ids)
+        if unexpected_ids:
+            raise ValueError("批次 checkpoint 引用了请求范围之外的批次：" + ", ".join(unexpected_ids))
+        recorded_hashes = checkpoint.get("completed_chunk_manifest_sha256", {})
+        if not isinstance(recorded_hashes, dict):
+            raise ValueError("批次 checkpoint 中的 manifest 哈希映射格式无效")
+        for index, chunk_symbols in enumerate(chunks, start=1):
+            chunk_id = f"chunk-{index:05d}"
+            chunk_path = partial / chunk_id
+            manifest_path = chunk_path / "manifest.json"
+            if not chunk_path.exists():
+                if chunk_id in recorded_ids:
+                    raise ValueError(f"checkpoint 标记已完成但批次目录缺失：{chunk_id}")
+                continue
+            if not manifest_path.exists():
+                raise ValueError(f"发现未封存的批次目录，停止以保留现场：{chunk_path}")
+            manifest = _verify_snapshot_chunk(
+                chunk_path,
+                expected_snapshot_id=chunk_id,
+                expected_symbols=chunk_symbols,
+                expected_start=start,
+                expected_end=end,
+            )
+            manifest_hash = _sha256(manifest_path)
+            checkpoint_hash = recorded_hashes.get(chunk_id)
+            if checkpoint_hash is not None and checkpoint_hash != manifest_hash:
+                raise ValueError(f"行情批次 {chunk_id} 的 manifest 哈希与 checkpoint 不一致")
+            verified_chunk_manifests[chunk_id] = manifest
+            verified_chunk_manifest_hashes[chunk_id] = manifest_hash
+        unverified_recorded = sorted(set(recorded_ids) - set(verified_chunk_manifests))
+        if unverified_recorded:
+            raise ValueError("以下已登记批次未能完成哈希核验：" + ", ".join(unverified_recorded))
+        # Older checkpoints did not contain manifest hashes. After verifying all
+        # files against each immutable chunk manifest, seed the stronger record.
+        checkpoint["completed_chunks"] = sorted(verified_chunk_manifests)
+        checkpoint["completed_chunk_manifest_sha256"] = verified_chunk_manifest_hashes
+        checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _write_json_atomic(checkpoint, checkpoint_path)
 
     shared_dir = partial / "shared"
     shared_dir.mkdir(exist_ok=True)
@@ -636,54 +1185,110 @@ def create_baostock_snapshot(
         _write_source_csv(shared_basics, shared_basics_path)
         checkpoint["metadata_requests"] = list(session.request_log)
         session.request_log.clear()
-        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_atomic(checkpoint, checkpoint_path)
     else:
         shared_calendar = pd.read_csv(shared_calendar_path, dtype=str)
         shared_basics = pd.read_csv(shared_basics_path, dtype=str, keep_default_na=False)
     metadata_requests = list(checkpoint.get("metadata_requests", []))
 
-    chunks = [normalized_symbols[i:i + batch_size] for i in range(0, len(normalized_symbols), batch_size)]
     completed_this_call = 0
     chunk_summaries: list[dict[str, Any]] = []
     for index, chunk_symbols in enumerate(chunks, start=1):
         chunk_id = f"chunk-{index:05d}"
         chunk_path = partial / chunk_id
         if (chunk_path / "manifest.json").exists():
-            chunk_manifest = json.loads((chunk_path / "manifest.json").read_text(encoding="utf-8"))
+            chunk_manifest = verified_chunk_manifests.get(chunk_id)
+            if chunk_manifest is None:
+                chunk_manifest = _verify_snapshot_chunk(
+                    chunk_path,
+                    expected_snapshot_id=chunk_id,
+                    expected_symbols=chunk_symbols,
+                    expected_start=start,
+                    expected_end=end,
+                )
+                manifest_hash = _sha256(chunk_path / "manifest.json")
+                verified_chunk_manifest_hashes[chunk_id] = manifest_hash
+                verified_chunk_manifests[chunk_id] = chunk_manifest
             chunk_summaries.append({
                 "chunk_id": chunk_id,
                 "symbols": chunk_symbols,
                 "snapshot_path": chunk_id,
                 "normalized_bar_rows": chunk_manifest["coverage"]["normalized_bar_rows"],
+                "capture_policy": chunk_manifest.get("capture_policy"),
                 "requests": chunk_manifest["requests"],
             })
             continue
         if max_batches is not None and completed_this_call >= max_batches:
             break
         session.request_log.clear()
-        chunk_result = _create_baostock_snapshot_chunk(
-            session,
-            chunk_symbols,
-            start,
-            end,
-            partial,
-            chunk_id,
-            benchmark_symbol if index == 1 else None,
-            shared_calendar=shared_calendar,
-            shared_basics=shared_basics,
-            metadata_requests=metadata_requests,
+        try:
+            chunk_result = _create_baostock_snapshot_chunk(
+                session,
+                chunk_symbols,
+                start,
+                end,
+                partial,
+                chunk_id,
+                benchmark_symbol if index == 1 else None,
+                shared_calendar=shared_calendar,
+                shared_basics=shared_basics,
+                metadata_requests=metadata_requests,
+            )
+        except (Exception, KeyboardInterrupt) as exc:
+            failed_attempts = checkpoint.setdefault("failed_chunk_attempts", [])
+            attempt_number = 1 + sum(
+                1 for item in failed_attempts if item.get("chunk_id") == chunk_id
+            )
+            attempt_requests = [dict(item) for item in session.request_log]
+            failed_attempts.append({
+                "chunk_id": chunk_id,
+                "attempt_number": attempt_number,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "error": {
+                    "category": (
+                        "operator_interrupted"
+                        if isinstance(exc, KeyboardInterrupt)
+                        else getattr(exc, "category", "client_or_validation")
+                    ),
+                    "endpoint": getattr(exc, "endpoint", None),
+                    "error_code": getattr(exc, "error_code", None),
+                    "message": str(exc) or type(exc).__name__,
+                },
+                "request_count": sum(int(item.get("request_count", 1)) for item in attempt_requests),
+                "attempt_count": len(attempt_requests),
+                "requests": attempt_requests,
+            })
+            checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            try:
+                _write_json_atomic(checkpoint, checkpoint_path)
+            except Exception as checkpoint_error:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"此外，批次失败日志写入断点也失败：{checkpoint_error}")
+            raise
+        committed_manifest = _verify_snapshot_chunk(
+            chunk_path,
+            expected_snapshot_id=chunk_id,
+            expected_symbols=chunk_symbols,
+            expected_start=start,
+            expected_end=end,
         )
+        verified_chunk_manifests[chunk_id] = committed_manifest
+        verified_chunk_manifest_hashes[chunk_id] = _sha256(chunk_path / "manifest.json")
         chunk_summaries.append({
             "chunk_id": chunk_id,
             "symbols": chunk_symbols,
             "snapshot_path": chunk_id,
             "normalized_bar_rows": chunk_result["coverage"]["normalized_bar_rows"],
-            "requests": chunk_result["requests"],
+            "capture_policy": chunk_result.get("capture_policy"),
+            # A new chunk result may expose the session's mutable request_log.
+            # Copy it before the next iteration clears/reuses that list.
+            "requests": list(chunk_result["requests"]),
         })
         completed_this_call += 1
-        checkpoint["completed_chunks"] = [item["chunk_id"] for item in chunk_summaries]
+        checkpoint["completed_chunks"] = sorted(verified_chunk_manifests)
+        checkpoint["completed_chunk_manifest_sha256"] = verified_chunk_manifest_hashes
         checkpoint["updated_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        checkpoint_path.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_json_atomic(checkpoint, checkpoint_path)
 
     completed_ids = {item["chunk_id"] for item in chunk_summaries}
     missing_chunks = [f"chunk-{i:05d}" for i in range(1, len(chunks) + 1) if f"chunk-{i:05d}" not in completed_ids]
@@ -763,13 +1368,35 @@ def create_baostock_snapshot(
             (partial / "benchmark_quality.json").write_bytes(benchmark_quality_path.read_bytes())
     files = [p for p in sorted(partial.rglob("*")) if p.is_file() and p.name not in {"manifest.json", "batch_checkpoint.json"}]
     hashes = {str(p.relative_to(partial)): _sha256(p) for p in files}
-    requests = metadata_requests + [request for chunk in chunk_summaries for request in chunk["requests"]]
+    requests = list(metadata_requests)
+    for failure in checkpoint.get("failed_chunk_attempts", []):
+        for request in failure.get("requests", []):
+            requests.append({
+                **request,
+                "snapshot_chunk_id": failure.get("chunk_id"),
+                "snapshot_chunk_attempt": failure.get("attempt_number"),
+                "recorded_as_failed_chunk_attempt": True,
+            })
+    requests.extend(request for chunk in chunk_summaries for request in chunk["requests"])
+    request_summary = {
+        "request_count": sum(int(request.get("request_count", 1)) for request in requests),
+        "attempt_count": len(requests),
+        "failed_attempt_count": sum(
+            request.get("status") in {"failed", "interrupted"} for request in requests
+        ),
+        "failed_chunk_attempt_count": len(checkpoint.get("failed_chunk_attempts", [])),
+    }
+    capture_policy_by_chunk = {
+        item["chunk_id"]: json.loads((partial / item["chunk_id"] / "manifest.json").read_text(encoding="utf-8")).get("capture_policy")
+        for item in chunk_summaries
+    }
     manifest = {
         "snapshot_id": identifier,
         "created_at_utc": checkpoint.get("created_at_utc"),
         "manifest_generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "provider": "BaoStock",
         "provider_package_version": session.package_version,
+        "capture_policy_by_chunk": capture_policy_by_chunk,
         "api_endpoints": ["query_trade_dates", "query_stock_basic", "query_history_k_data_plus", "query_adjust_factor"],
         "date_range": {"start": start, "end": end},
         "universe": {
@@ -811,6 +1438,11 @@ def create_baostock_snapshot(
             "share_lot_rules": "unknown",
         },
         "requests": requests,
+        "request_summary": request_summary,
+        "failed_chunk_attempts": [
+            {key: value for key, value in attempt.items() if key != "requests"}
+            for attempt in checkpoint.get("failed_chunk_attempts", [])
+        ],
         "quality": quality,
         "benchmark_quality": benchmark_manifest.get("benchmark_quality"),
         "file_sha256": hashes,

@@ -25,6 +25,13 @@ def run_baseline_sensitivity(
     point_in_time_bars, universe_coverage, discrepancies = filter_bars_to_point_in_time_universe(
         bars, membership,
     )
+    reconciliation = universe_coverage["reconciliation_quality"]
+    if not reconciliation["healthy"]:
+        raise ValueError(
+            "点时股票池对账未通过，不能把该结果作为正式基线："
+            + "; ".join(reconciliation["errors"])
+            + "；请先运行 universe-audit 并核对逐条差异"
+        )
     if point_in_time_bars.empty:
         raise ValueError("每日股票池与行情没有交集")
     base_config = copy.deepcopy(frozen_config)

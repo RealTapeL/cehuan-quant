@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from cehuan.backtest.engine import run_backtest
 from cehuan.config import load_config
@@ -118,6 +119,63 @@ def test_backtest_uses_independent_configured_index_benchmark():
     assert result["metrics"]["benchmark_data_version_sha256"]
     assert any("价格指数" in item for item in result["metrics"]["limitations"])
     assert not any("输入股票池等权" in item for item in result["metrics"]["limitations"])
+
+
+@pytest.mark.parametrize("drop_position", [5, -1], ids=["middle-session", "last-session"])
+def test_backtest_rejects_missing_configured_benchmark_session(drop_position):
+    config = load_config()
+    config["benchmark"]["symbol"] = "SH000300"
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    stock_data = bars(16)
+    index_data = stock_data.drop_duplicates("trade_date").copy().sort_values("trade_date")
+    missing_date = index_data.iloc[drop_position]["trade_date"]
+    index_data = index_data.loc[index_data["trade_date"] != missing_date].copy()
+    index_data["symbol"] = "SH000300"
+    index_data["name"] = "CSI 300"
+    index_data["is_listed"] = False
+    index_data["is_st"] = False
+    index_data["has_price_limit"] = False
+    index_data["data_source"] = "synthetic_index_test"
+
+    with pytest.raises(ValueError, match=f"基准数据缺少评价区间交易日：{missing_date}"):
+        run_backtest(stock_data, 100_000, config, benchmark_frame=index_data)
+
+
+def test_existing_st_position_can_be_exited_but_is_not_a_new_buy_candidate():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars(16)
+    data["is_st"] = False
+    last_day = data["trade_date"].max()
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == last_day), "is_st"] = True
+    data["buy_min_shares"] = pd.NA
+    data["buy_step_shares"] = pd.NA
+    positions = pd.DataFrame([{
+        "symbol": "SIM001", "shares": 500, "available_to_sell": 500, "average_cost": 10.0,
+    }])
+
+    plan = generate_plan(data, 100_000, config, positions=positions)
+
+    held = plan.loc[plan["symbol"] == "SIM001"].iloc[0]
+    assert held["action"] == "SELL"
+    assert held["planned_shares"] == 500
+    assert "ST 等状态可按卖出规则退出" in held["major_risks"]
+
+
+def test_backtest_sells_existing_holding_after_it_becomes_st():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars(16)
+    data["is_st"] = False
+    st_start_date = data.loc[data["trade_date"] == data["trade_date"].drop_duplicates().iloc[6], "trade_date"].iloc[0]
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] >= st_start_date), "is_st"] = True
+
+    result = run_backtest(data, 100_000, config)
+
+    sim001_trades = result["trades"].loc[result["trades"]["symbol"] == "SIM001"]
+    assert "BUY" in sim001_trades["side"].tolist()
+    assert "SELL" in sim001_trades["side"].tolist()
+    assert sim001_trades.loc[sim001_trades["side"] == "SELL", "trade_date"].min() > st_start_date
 
 
 def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:

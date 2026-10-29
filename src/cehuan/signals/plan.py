@@ -11,7 +11,8 @@ from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
     round_order_quantity,
-    status_is_eligible,
+    status_is_buy_eligible,
+    status_is_sell_eligible,
 )
 
 
@@ -97,7 +98,7 @@ def generate_plan(
             continue
         if float(row["momentum"]) < float(strategy.get("min_momentum", 0.0)):
             continue
-        eligible, reason = status_is_eligible(row, market)
+        eligible, reason = status_is_buy_eligible(row, market)
         if eligible:
             eligible_rows.append(row)
         elif reason:
@@ -177,7 +178,7 @@ def generate_plan(
             add_row(symbol, "HOLD", current_shares, current_shares, None, None,
                     "最新数据中没有该证券的行情行", "缺失日线不能据此认定停牌或可卖；人工核验", "未生成委托价格；先核对持仓与停牌状态")
             continue
-        eligible, reason = status_is_eligible(row, market)
+        eligible, reason = status_is_sell_eligible(row, market)
         if not eligible:
             add_row(symbol, "HOLD", current_shares, current_shares, None, latest_prices.get(symbol),
                     "持仓状态无法通过数据校验", f"{reason}；核对可卖数量及交易状态", "不建议据本计划卖出；先人工核验")
@@ -221,7 +222,7 @@ def generate_plan(
             action = "SELL" if sell_quantity else "HOLD"
             add_row(symbol, "SELL", current_shares, 0, 0.0, latest_prices.get(symbol),
                     "当前不在符合规则的目标排名内",
-                    "须核对 T+1 可卖数量、涨跌停及华泰费用",
+                    "ST 等状态可按卖出规则退出；仍须核对 T+1 可卖数量、停牌/跌停和华泰费用",
                     "参考最近收盘价；下一交易日开盘前复核，跌停或停牌时不执行")
             rows[-1]["target_shares"] = current_shares - sell_quantity
             rows[-1]["planned_shares"] = sell_quantity
