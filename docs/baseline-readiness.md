@@ -54,10 +54,12 @@ uv run cehuan backtest \
 
 ## 目前为什么仍会阻断
 
-当前回测引擎尚未把经审计的有效日期规则、历史费率及完整公司行动账本用于逐日组合模拟。因此 readiness 报告会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。不得手工删除阻断项。公司行动的目标账本与合成样例先记录在[账务契约设计稿](corporate-action-accounting-contract.md)，该文档本身不代表执行层已实现。
+正式 readiness 仍会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。研究模式已能在**无公司行动、无身份变更**窗口中由 `ledger_v2` 消费逐证券有效日期规则与逐日费率；这还不等于完整公司行动账本接入、真实历史规则/费率核验或正式多年基线能力。不得手工删除阻断项。公司行动的目标账本与合成样例先记录在[账务契约设计稿](corporate-action-accounting-contract.md)，已有账本事件操作仍未接入回测执行路径。
 
 正式回测唯一支持的行情输入是同一次 `universe-audit` 生成的 `--data <point_in_time_bars.csv>` 与 `--prevalidated-quality <point_in_time_quality.json>`。`--formal --universe` 会被拒绝，避免把原始快照与过滤后内存数据混用。`--readiness-universe` 仍指向原始股票池快照目录，用于重新核验成员、manifest 和证据；它不是行情过滤参数。若同时提供 `--readiness-quality`，其文件内容必须与 `--prevalidated-quality` 相同。
 
 探索回测可使用 `--diagnostic --universe`，也可使用 `--diagnostic --prevalidated-quality`；没有显式诊断标记不能把结果称为正式基线。`baseline-diagnostics` 产生规则回退和假设敏感性场景，也必须显式传 `--diagnostic`。研究诊断结果仍不是模拟账户或华泰真实账户结果。
+
+对于不含身份变更和公司行动的窗口，可额外提供成对的 `--market-rules` 与 `--fees`，并指定 `--diagnostic --accounting-mode ledger_v2`。该模式按有效日期消费规则与费率、禁止交易单位回退；佣金、印花税、过户费分别进入账本并写入成交明细，模拟价格影响单独报告。CLI 将实际读取的规则、费率文件复制进实验目录并记录原始 SHA-256。真实的 2023–2025 文件仍缺失，现阶段只由合成测试覆盖。该模式没有逐日交易所涨跌停价和特殊无涨跌幅报价上下界；遇到不能计算边界的日期会阻断订单。它不支持项目当前登记的代码变更及换股事件，不能用于该三年全窗口，也不会解除正式门控。表头模板见 `examples/market_rules_template.csv` 和 `examples/fee_schedule_template.csv`。
 
 三年快照的内部覆盖率只对已分类沪深 `type=1` 股票日成立；北交所未覆盖。2026-10-29 本机已重新核验私有快照、归档 25 份身份/退市来源并完成未知类型审计：53 个代码、13,197 个成员日均有交易所基金名录/基金交易表或基金公告支持为非股票，`UNRESOLVED=0`、`ADDED_AS_STOCK=0`；剩余 43 个代码的逐项来源与 SHA-256 见[证据表](evidence/unknown-type-remaining-43-audit.csv)。来源文本由 Codex 核对，用户人工签认仍待完成。`SZ000851` 的深交所终止上市决定与发行人摘牌原件已归档；深交所决定没有单列代码和最终摘牌日，后者由发行人原件确认。点时股票池无需因未知类型重建。v3 `point_in_time_quality.healthy=true`、`baseline_ready=false`；前者只表示已分类沪深股票数据范围内的内部对账。完整限制和文件版本见[三年数据准备记录](data-preparation-2023-2025.md)。该数据集不支持 2026-10-29 当日计划。

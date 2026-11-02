@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, is_dataclass
 import hashlib
 import json
 import shutil
@@ -173,6 +174,10 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--unknown-type-bars", help="未知类型行情覆盖检查所用的原始规范 bars.csv")
     backtest.add_argument("--formal", action="store_true", help="正式历史基线；必须提供通过审计且与本次输入完全匹配的 readiness 报告")
     backtest.add_argument("--diagnostic", action="store_true", help="显式运行非正式研究诊断，可使用配置回退规则")
+    backtest.add_argument(
+        "--accounting-mode", choices=("legacy", "ledger_shadow", "ledger_v2"), default="legacy",
+        help="研究账务路径；ledger_v2 是非正式诊断，不能用于 formal",
+    )
     backtest.add_argument("--readiness", help="由 baseline-readiness 生成的就绪报告")
     backtest.add_argument("--readiness-universe", help="正式模式下绑定 readiness 的点时股票池快照目录")
     backtest.add_argument("--readiness-quality", help="正式模式下绑定 readiness 的点时质量 JSON")
@@ -618,6 +623,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if (args.universe or args.prevalidated_quality) and not (args.formal or args.diagnostic):
                 raise ValueError("点时股票池/预验证行情必须显式选择 --formal 或 --diagnostic")
+            if args.accounting_mode != "legacy" and not args.diagnostic:
+                raise ValueError("ledger 账务模式仅供非正式研究，请显式附加 --diagnostic")
+            if not args.formal and (bool(args.market_rules) != bool(args.fees)):
+                raise ValueError("研究诊断的 --market-rules 与 --fees 必须成对提供")
+            if not args.formal and (args.market_rules or args.fees) and not args.diagnostic:
+                raise ValueError("有效日期规则/费率只允许用于显式 --diagnostic 研究")
+            if not args.formal and (args.market_rules or args.fees) and args.accounting_mode != "ledger_v2":
+                raise ValueError("研究诊断使用有效日期规则/费率时必须设置 --accounting-mode ledger_v2")
             if not args.formal and args.readiness:
                 raise ValueError("--readiness 只能与 --formal 一起使用")
             identity_path = _configured_path(config, "security_identity_events_file", args.identity_events)
@@ -766,6 +779,25 @@ def main(argv: list[str] | None = None) -> int:
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
             benchmark = read_bars(args.benchmark_data) if args.benchmark_data else None
+            research_market_rules = None
+            research_fee_schedule = None
+            research_market_rules_path = None
+            research_fee_schedule_path = None
+            research_market_rules_sha256 = None
+            research_fee_schedule_sha256 = None
+            if not args.formal and args.market_rules and args.fees:
+                rules_path = Path(args.market_rules).expanduser()
+                fees_path = Path(args.fees).expanduser()
+                if not rules_path.is_absolute():
+                    rules_path = REPO_ROOT / rules_path
+                if not fees_path.is_absolute():
+                    fees_path = REPO_ROOT / fees_path
+                research_market_rules_path = rules_path.resolve()
+                research_fee_schedule_path = fees_path.resolve()
+                research_market_rules_sha256 = sha256_file(research_market_rules_path)
+                research_fee_schedule_sha256 = sha256_file(research_fee_schedule_path)
+                research_market_rules = pd.read_csv(rules_path, dtype=str, keep_default_na=False)
+                research_fee_schedule = pd.read_csv(fees_path, dtype=str, keep_default_na=False)
             result = run_backtest(
                 bars,
                 args.cash,
@@ -782,18 +814,36 @@ def main(argv: list[str] | None = None) -> int:
                 evaluation_start=evaluation_start,
                 evaluation_end=evaluation_end,
                 readiness_context=readiness_context,
+                accounting_mode=args.accounting_mode,
+                market_rule_schedule=research_market_rules,
+                fee_schedule=research_fee_schedule,
             )
             if universe_summary is not None:
                 result["metrics"]["point_in_time_universe_audit"] = universe_summary
+            if research_market_rules_path is not None and research_fee_schedule_path is not None:
+                if sha256_file(research_market_rules_path) != research_market_rules_sha256:
+                    raise ValueError("回测期间市场规则文件发生变化；本次实验结果不予保存")
+                if sha256_file(research_fee_schedule_path) != research_fee_schedule_sha256:
+                    raise ValueError("回测期间费率文件发生变化；本次实验结果不予保存")
+                result["metrics"]["market_rule_schedule_input_sha256"] = research_market_rules_sha256
+                result["metrics"]["fee_schedule_input_sha256"] = research_fee_schedule_sha256
             experiment = str(result["metrics"]["experiment_id"])
             folder = REPO_ROOT / "outputs" / "experiments" / experiment
             folder.mkdir(parents=True, exist_ok=True)
+            if research_market_rules_path is not None and research_fee_schedule_path is not None:
+                shutil.copyfile(research_market_rules_path, folder / "market_rule_schedule.csv")
+                shutil.copyfile(research_fee_schedule_path, folder / "fee_schedule.csv")
             _write_json(result["metrics"], folder / "metrics.json")
             result["equity_curve"].to_csv(folder / "equity_curve.csv", index=False)
             result["trades"].to_csv(folder / "trades.csv", index=False)
             result["blocked_orders"].to_csv(folder / "blocked_orders.csv", index=False)
             result["security_events"].to_csv(folder / "security_events.csv", index=False)
             result["open_positions"].to_csv(folder / "open_positions.csv", index=False)
+            if "accounting_journal" in result:
+                result["accounting_journal"].to_csv(folder / "accounting_journal.csv", index=False)
+            if "accounting_snapshot" in result:
+                snapshot = result["accounting_snapshot"]
+                _write_json(asdict(snapshot) if is_dataclass(snapshot) else snapshot, folder / "accounting_snapshot.json")
             if universe_summary is not None:
                 _write_json(universe_summary, folder / "point_in_time_universe_audit.json")
                 universe_discrepancies.to_csv(folder / "point_in_time_universe_discrepancies.csv", index=False)

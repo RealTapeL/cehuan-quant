@@ -21,6 +21,8 @@ from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
 from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
+from cehuan.data.fee_schedule import map_fee_schedule_to_sessions, normalize_fee_schedule, scheduled_fee_components
+from cehuan.data.market_rules import attach_market_rule_schedule, normalize_market_rule_schedule
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import (
     normalize_security_identity_events,
@@ -73,14 +75,31 @@ def _normalized_event_table_digest(frame: pd.DataFrame) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _normalized_table_digest(frame: pd.DataFrame) -> str:
+    canonical = frame.copy()
+    canonical = canonical.sort_values(list(canonical.columns), kind="stable", na_position="first")
+    for column in canonical.columns:
+        canonical[column] = canonical[column].astype("string").fillna("")
+    payload = canonical.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _fees(notional: float, side: str, costs: dict[str, Any]) -> float:
+    return sum(_fee_components(notional, side, costs).values())
+
+
+def _fee_components(notional: float, side: str, costs: dict[str, Any]) -> dict[str, float]:
     commission = max(
         float(costs.get("minimum_commission_cny", 0.0)),
         notional * float(costs.get("commission_rate", 0.0)),
     )
     stamp = notional * float(costs.get("stamp_duty_sell_rate", 0.0)) if side == "SELL" else 0.0
     transfer = notional * float(costs.get("transfer_fee_rate", 0.0))
-    return commission + stamp + transfer
+    return {
+        "commission_cny": commission,
+        "stamp_duty_cny": stamp,
+        "transfer_fee_cny": transfer,
+    }
 
 
 def _price_limit_block(
@@ -88,14 +107,20 @@ def _price_limit_block(
     previous_close: float | None,
     side: str,
     market: dict[str, Any],
+    *,
+    require_quote_bounds: bool = False,
 ) -> str | None:
     if previous_close is None or pd.isna(previous_close) or not math.isfinite(float(previous_close)) or float(previous_close) <= 0:
+        if require_quote_bounds:
+            return "计算价格约束缺少有效前收盘，按保守规则阻断"
         return None
     previous_close = float(previous_close)
     has_limit = row.get("has_price_limit", pd.NA)
     if pd.isna(has_limit):
         has_limit = bool(market.get("assume_price_limit_applies_when_unknown", True))
     if not bool(has_limit):
+        if require_quote_bounds:
+            return "当日无涨跌幅限制，但缺少适用的开盘报价边界数据，按保守规则阻断"
         return None
     pct_value = row.get("price_limit_pct", pd.NA)
     limit_pct = float(pct_value) if not pd.isna(pct_value) else float(market["default_price_limit_pct"])
@@ -253,6 +278,8 @@ def run_backtest(
     evaluation_end: str | None = None,
     readiness_context: dict[str, str | Path] | None = None,
     accounting_mode: str = "legacy",
+    market_rule_schedule: pd.DataFrame | None = None,
+    fee_schedule: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -270,6 +297,13 @@ def run_backtest(
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(security_identity_events, pd.DataFrame):
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
+    if (market_rule_schedule is None) != (fee_schedule is None):
+        raise ValueError("有效日期规则和历史费率必须成对提供")
+    use_effective_schedules = market_rule_schedule is not None
+    if use_effective_schedules and formal:
+        raise ValueError("研究诊断用有效日期规则/费率不能替代正式 readiness 输入")
+    if use_effective_schedules and accounting_mode != "ledger_v2":
+        raise ValueError("当前有效日期规则/费率接入仅支持 accounting_mode='ledger_v2' 的非正式研究诊断")
     if initial_cash_cny <= 0:
         raise ValueError("回测资金必须大于 0；请显式传入演示或研究资金")
     data = normalize_bar_frame(
@@ -278,6 +312,12 @@ def run_backtest(
         compact=mutate_input,
         assume_sorted=mutate_input,
     )
+    normalized_market_rules = None
+    normalized_fee_schedule = None
+    if use_effective_schedules:
+        normalized_market_rules = normalize_market_rule_schedule(market_rule_schedule)
+        normalized_fee_schedule = normalize_fee_schedule(fee_schedule)
+        data = attach_market_rule_schedule(data, normalized_market_rules)
     if formal:
         if (
             readiness_report is None or readiness_input_hashes is None or not evaluation_start
@@ -398,6 +438,10 @@ def run_backtest(
     day_starts = np.concatenate(([0], boundaries))
     day_ends = np.concatenate((boundaries, [len(data)]))
     dates = [data.iloc[start]["trade_date"] for start in day_starts]
+    scheduled_fees_by_date = (
+        map_fee_schedule_to_sessions(normalized_fee_schedule, dates)
+        if normalized_fee_schedule is not None else {}
+    )
     date_session_index = {
         pd.Timestamp(value).strftime("%Y-%m-%d"): index for index, value in enumerate(dates)
     }
@@ -532,7 +576,7 @@ def run_backtest(
                 if row is None or pd.isna(row["open"]) or float(row["open"]) <= 0:
                     continue
                 target_amount = estimate_equity * weight
-                minimum, step = order_constraints(row, "BUY", market, allow_fallback=True)
+                minimum, step = order_constraints(row, "BUY", market, allow_fallback=not use_effective_schedules)
                 raw_target = int(target_amount / float(row["open"]))
                 target_shares[symbol] = round_order_quantity(raw_target, minimum, step)
 
@@ -555,25 +599,33 @@ def run_backtest(
                     if quantity:
                         blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
                     continue
-                minimum, step = order_constraints(row, "SELL", market, allow_fallback=True)
+                minimum, step = order_constraints(row, "SELL", market, allow_fallback=not use_effective_schedules)
                 quantity = round_order_quantity(
                     quantity, minimum, step,
                     allow_full_liquidation=True, full_position_shares=current,
                 )
                 if quantity <= 0:
                     continue
-                eligible, reason = status_is_sell_eligible(row, market, require_order_rules=False)
+                eligible, reason = status_is_sell_eligible(row, market, require_order_rules=use_effective_schedules)
                 if not eligible:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": reason})
                     continue
-                limit_reason = _price_limit_block(row, row.get("previous_close"), "SELL", market)
+                limit_reason = _price_limit_block(
+                    row, row.get("previous_close"), "SELL", market,
+                    require_quote_bounds=use_effective_schedules,
+                )
                 if limit_reason:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reason": limit_reason})
                     continue
                 reference = float(row["open"])
                 fill_price = reference * (1.0 - slippage)
                 notional = quantity * fill_price
-                fees = _fees(notional, "SELL", costs)
+                fee_row = scheduled_fees_by_date.get(day_date)
+                fee_components = (
+                    scheduled_fee_components(notional, "SELL", fee_row)
+                    if fee_row is not None else _fee_components(notional, "SELL", costs)
+                )
+                fees = sum(fee_components.values())
                 acquisition_date = holding_since.get(symbol, "")
                 if execution_ledger is None:
                     allocated_basis = cost_basis_cny.get(symbol, 0.0) * quantity / current if current else 0.0
@@ -589,14 +641,36 @@ def run_backtest(
                         side="SELL",
                         quantity=quantity,
                         price_cny=Decimal(str(fill_price)),
-                        fees=(FeeItem("aggregate_fees", Decimal(str(fees))),),
+                        fees=tuple(
+                            FeeItem(name, Decimal(str(amount)))
+                            for name, amount in fee_components.items()
+                        ),
                     ))
                     entry_details = dict(entry.details)
                     allocated_basis = float(Decimal(entry_details["allocated_cost_basis_cny"]))
                     realized_pnl = float(Decimal(entry_details["realized_pnl_cny"]))
                     sync_projection_from_ledger()
                 total_turnover += notional
-                trades.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": allocated_basis, "realized_pnl_cny": realized_pnl, "holding_since": acquisition_date, "reason": "目標排名/權重調整；次交易日開盤模擬"})
+                execution_impact = quantity * (reference - fill_price)
+                trades.append({
+                    "trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity,
+                    "reference_price": reference, "estimated_fill_price": fill_price,
+                    "notional_cny": notional, "fees_cny": fees,
+                    "commission_cny": fee_components["commission_cny"],
+                    "stamp_duty_cny": fee_components["stamp_duty_cny"],
+                    "transfer_fee_cny": fee_components["transfer_fee_cny"],
+                    "execution_impact_vs_reference_cny": execution_impact,
+                    "allocated_cost_basis_cny": allocated_basis, "realized_pnl_cny": realized_pnl,
+                    "holding_since": acquisition_date, "reason": "目标排名/权重调整；次交易日开盘模拟",
+                })
+                if fee_row is not None:
+                    trades[-1].update({"fee_source": fee_row["source"], "fee_valid_from": fee_row["valid_from"].date().isoformat()})
+                if use_effective_schedules:
+                    trades[-1].update({
+                        "market_rule_source": row["market_rule_source"],
+                        "market_rule_source_sha256": row["market_rule_source_sha256"],
+                        "market_rule_valid_from": pd.Timestamp(row["market_rule_valid_from"]).date().isoformat(),
+                    })
                 if holdings.get(symbol, 0) <= 0:
                     holdings.pop(symbol, None)
                     cost_basis_cny.pop(symbol, None)
@@ -610,15 +684,18 @@ def run_backtest(
                     if quantity > 0:
                         blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": "當日無行情行，交易狀態無法確認"})
                     continue
-                minimum, step = order_constraints(row, "BUY", market, allow_fallback=True)
+                minimum, step = order_constraints(row, "BUY", market, allow_fallback=not use_effective_schedules)
                 quantity = round_order_quantity(quantity, minimum, step)
                 if quantity < minimum:
                     continue
-                eligible, reason = status_is_buy_eligible(row, market, require_order_rules=False)
+                eligible, reason = status_is_buy_eligible(row, market, require_order_rules=use_effective_schedules)
                 if not eligible:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": reason})
                     continue
-                limit_reason = _price_limit_block(row, row.get("previous_close"), "BUY", market)
+                limit_reason = _price_limit_block(
+                    row, row.get("previous_close"), "BUY", market,
+                    require_quote_bounds=use_effective_schedules,
+                )
                 if limit_reason:
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reason": limit_reason})
                     continue
@@ -626,7 +703,12 @@ def run_backtest(
                 fill_price = reference * (1.0 + slippage)
                 while quantity >= minimum:
                     notional = quantity * fill_price
-                    fees = _fees(notional, "BUY", costs)
+                    fee_row = scheduled_fees_by_date.get(day_date)
+                    fee_components = (
+                        scheduled_fee_components(notional, "BUY", fee_row)
+                        if fee_row is not None else _fee_components(notional, "BUY", costs)
+                    )
+                    fees = sum(fee_components.values())
                     if execution_ledger is None:
                         cash_sufficient = notional + fees <= cash
                     else:
@@ -641,7 +723,12 @@ def run_backtest(
                     blocked_orders.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": desired - current, "reason": "可用現金不足，按買入單位縮減後仍無法成交"})
                     continue
                 notional = quantity * fill_price
-                fees = _fees(notional, "BUY", costs)
+                fee_row = scheduled_fees_by_date.get(day_date)
+                fee_components = (
+                    scheduled_fee_components(notional, "BUY", fee_row)
+                    if fee_row is not None else _fee_components(notional, "BUY", costs)
+                )
+                fees = sum(fee_components.values())
                 if execution_ledger is None:
                     cash -= notional + fees
                     holdings[symbol] = current + quantity
@@ -655,12 +742,34 @@ def run_backtest(
                         side="BUY",
                         quantity=quantity,
                         price_cny=Decimal(str(fill_price)),
-                        fees=(FeeItem("aggregate_fees", Decimal(str(fees))),),
+                        fees=tuple(
+                            FeeItem(name, Decimal(str(amount)))
+                            for name, amount in fee_components.items()
+                        ),
                         sellable_from=dates[index + 1],
                     ))
                     sync_projection_from_ledger()
                 total_turnover += notional
-                trades.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": 0.0, "realized_pnl_cny": pd.NA, "holding_since": holding_since[symbol], "reason": "收盤排名入選；次交易日開盤模擬"})
+                execution_impact = quantity * (fill_price - reference)
+                trades.append({
+                    "trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity,
+                    "reference_price": reference, "estimated_fill_price": fill_price,
+                    "notional_cny": notional, "fees_cny": fees,
+                    "commission_cny": fee_components["commission_cny"],
+                    "stamp_duty_cny": fee_components["stamp_duty_cny"],
+                    "transfer_fee_cny": fee_components["transfer_fee_cny"],
+                    "execution_impact_vs_reference_cny": execution_impact,
+                    "allocated_cost_basis_cny": 0.0, "realized_pnl_cny": pd.NA,
+                    "holding_since": holding_since[symbol], "reason": "收盘排名入选；次交易日开盘模拟",
+                })
+                if fee_row is not None:
+                    trades[-1].update({"fee_source": fee_row["source"], "fee_valid_from": fee_row["valid_from"].date().isoformat()})
+                if use_effective_schedules:
+                    trades[-1].update({
+                        "market_rule_source": row["market_rule_source"],
+                        "market_rule_source_sha256": row["market_rule_source_sha256"],
+                        "market_rule_valid_from": pd.Timestamp(row["market_rule_valid_from"]).date().isoformat(),
+                    })
             pending_targets = None
 
         for symbol in holdings:
@@ -697,7 +806,7 @@ def run_backtest(
         equity_rows.append({"trade_date": day_date, "equity_cny": equity, "cash_cny": cash, "holdings_count": len(holdings)})
 
         if index >= lookback and (index - lookback) % rebalance_sessions == 0 and index + 1 < len(dates):
-            ranked = rank_precomputed_day(day, strategy, market, require_order_rules=False)
+            ranked = rank_precomputed_day(day, strategy, market, require_order_rules=use_effective_schedules)
             selected = ranked.head(int(strategy["max_positions"]))
             if not selected.empty:
                 target_weight = min(
@@ -769,6 +878,16 @@ def run_backtest(
     data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
     ).hexdigest()
+    market_rule_schedule_digest = (
+        _normalized_table_digest(normalized_market_rules) if normalized_market_rules is not None else None
+    )
+    fee_schedule_digest = (
+        _normalized_table_digest(normalized_fee_schedule) if normalized_fee_schedule is not None else None
+    )
+    if market_rule_schedule_digest is not None and fee_schedule_digest is not None:
+        data_digest = hashlib.sha256(
+            f"{data_digest}:{market_rule_schedule_digest}:{fee_schedule_digest}".encode("utf-8")
+        ).hexdigest()
     identity_event_data_sha256 = None
     if not identity_events.empty:
         identity_event_data_sha256 = hashlib.sha256(
@@ -824,14 +943,21 @@ def run_backtest(
         int(config.get("backtest", {}).get("rolling_window_sessions", 60)),
         int(config.get("backtest", {}).get("rolling_step_sessions", 20)),
     )
+    trade_frame = pd.DataFrame(trades)
     metrics = _metrics(equity_series, curve["return"], total_turnover / max(float(equity_series.mean()), 1.0), benchmark)
     limitations = [
         "基线以收盘 t 的信号在下一交易日开盘模拟；不代表可成交价格。",
         "日线 OHLC 无法重建开盘队列、盘口流动性、真实停牌日与部分涨跌停成交。",
         "使用原始价结算，没有现金分红、送转、配股、退市与历史成分股处理；结果仅为技术验证。",
-        "配置中的费用费率统一应用于整段历史，不代表历史逐年费率或个人账户实际佣金。",
-        "缺失的涨跌幅阈值、是否限价状态或交易单位使用配置回退假设；成交结果仅用于研究，计划生成要求完整点时证券规则。",
     ]
+    if normalized_fee_schedule is None:
+        limitations.append("配置中的费用费率统一应用于整段历史，不代表历史逐年费率或个人账户实际佣金。")
+    else:
+        limitations.append("使用输入费率表按有效日期计算；其证据登记/人工复核状态由维护者提供，不代表华泰账户实际佣金或费用取整明细。")
+    if normalized_market_rules is None:
+        limitations.append("缺失的涨跌幅阈值、是否限价状态或交易单位使用配置回退假设；成交结果仅用于研究，计划生成要求完整点时证券规则。")
+    else:
+        limitations.append("使用输入交易规则表逐证券、逐有效日期匹配；本研究模式仍不替代正式点时审计或公告人工复核。")
     if benchmark_data is not None:
         limitations.append("沪深300基准采用价格指数收盘价，不含成分股分红的总回报。")
     else:
@@ -845,6 +971,12 @@ def run_backtest(
         "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
         "corporate_actions_sha256": corporate_action_data_sha256,
         "corporate_action_event_ids": action_events["event_id"].astype(str).tolist() if not action_events.empty else [],
+        "market_rule_schedule_sha256": market_rule_schedule_digest,
+        "market_rule_schedule_rows": int(len(normalized_market_rules)) if normalized_market_rules is not None else 0,
+        "fee_schedule_sha256": fee_schedule_digest,
+        "fee_schedule_rows": int(len(normalized_fee_schedule)) if normalized_fee_schedule is not None else 0,
+        "market_rule_mode": "effective_dated_schedule" if normalized_market_rules is not None else "config_fallback",
+        "fee_mode": "effective_dated_schedule" if normalized_fee_schedule is not None else "config_flat_assumption",
         "benchmark_data_version_sha256": benchmark_data_digest,
         "code_version": __version__,
         **_git_metadata(),
@@ -869,6 +1001,12 @@ def run_backtest(
         "initial_cash_cny": initial_cash_cny,
         "trade_count": len(trades),
         "blocked_order_count": len(blocked_orders),
+        "total_commission_cny": float(trade_frame.get("commission_cny", pd.Series(dtype=float)).fillna(0).sum()),
+        "total_stamp_duty_cny": float(trade_frame.get("stamp_duty_cny", pd.Series(dtype=float)).fillna(0).sum()),
+        "total_transfer_fee_cny": float(trade_frame.get("transfer_fee_cny", pd.Series(dtype=float)).fillna(0).sum()),
+        "total_execution_impact_vs_reference_cny": float(
+            trade_frame.get("execution_impact_vs_reference_cny", pd.Series(dtype=float)).fillna(0).sum()
+        ),
         "market_rule_fallback_row_count": rule_fallback_rows,
         "market_rule_fallback_assumptions": {
             "price_limit_pct": market.get("default_price_limit_pct"),
@@ -887,7 +1025,13 @@ def run_backtest(
     result = {
         "metrics": metrics,
         "equity_curve": curve,
-        "trades": pd.DataFrame(trades, columns=["trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price", "notional_cny", "fees_cny", "allocated_cost_basis_cny", "realized_pnl_cny", "holding_since", "reason"]),
+        "trades": trade_frame.reindex(columns=[
+            "trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price",
+            "notional_cny", "fees_cny", "commission_cny", "stamp_duty_cny", "transfer_fee_cny",
+            "execution_impact_vs_reference_cny", "fee_source", "fee_valid_from", "market_rule_source",
+            "market_rule_source_sha256", "market_rule_valid_from", "allocated_cost_basis_cny",
+            "realized_pnl_cny", "holding_since", "reason",
+        ]),
         "blocked_orders": pd.DataFrame(blocked_orders, columns=["trade_date", "symbol", "side", "quantity", "reason"]),
         "security_events": pd.DataFrame(security_events),
         "open_positions": pd.DataFrame([

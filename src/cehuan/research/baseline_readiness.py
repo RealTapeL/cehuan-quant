@@ -13,6 +13,8 @@ import pandas as pd
 
 from cehuan.data.canonical import normalize_bar_frame
 from cehuan.data.corporate_actions import normalize_corporate_actions
+from cehuan.data.fee_schedule import FEE_SCHEDULE_COLUMNS
+from cehuan.data.market_rules import MARKET_RULE_COLUMNS
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import (
     audit_out_date_boundary_evidence,
@@ -45,17 +47,8 @@ ACTION_COVERAGE_COLUMNS = [
     "symbol", "valid_from", "valid_to", "source", "source_sha256",
     "review_status", "reviewed_by", "reviewed_at",
 ]
-FEE_COLUMNS = [
-    "valid_from", "valid_to", "market", "commission_rate", "minimum_commission_cny",
-    "stamp_duty_sell_rate", "transfer_fee_rate", "source", "source_sha256",
-    "review_status", "reviewed_by", "reviewed_at",
-]
-RULE_COLUMNS = [
-    "symbol", "board", "valid_from", "valid_to", "is_listed", "is_suspended", "is_st",
-    "has_price_limit", "price_limit_pct", "buy_min_shares", "buy_step_shares",
-    "sell_min_shares", "sell_step_shares", "source", "source_sha256",
-    "review_status", "reviewed_by", "reviewed_at",
-]
+FEE_COLUMNS = FEE_SCHEDULE_COLUMNS
+RULE_COLUMNS = MARKET_RULE_COLUMNS
 
 
 def _git_state() -> tuple[str | None, bool | None]:

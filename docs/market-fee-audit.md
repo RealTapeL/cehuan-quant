@@ -25,13 +25,38 @@ data/private/evidence/preparation-20261029/market-fees/originals/
 
 项目只提交来源链接和本机归档文件的 SHA-256，不提交原件。来源内容由 Codex 对归档文本作过核对；reviewed_by 不代表用户或维护者人工签认。哈希只证明本机归档字节未改变，不证明来源解释完整。
 
-## 正式费率文件仍被阻断
+## 接入状态与正式费率文件
+
+回测现已提供**非正式研究诊断**入口，按证券和交易日连接 `market-rules.csv`，并按交易日连接 `fee-schedule.csv`。规则、费率列名与正式 readiness 审计共用同一份 schema 常量；入口会拒绝缺列、无效日期、重叠/缺覆盖区间、未明确状态、来源散列格式错误或没有 `REVIEWED` 元数据的记录。接入后，规则表会覆盖行情文件中同名状态字段；实际买卖不使用手数回退值。实验元数据记录两张规范化表的 SHA-256，CLI 还将原文件复制到实验目录并记录原文件 SHA-256。成交明细与账本流水分别列出佣金、印花税和过户费；参考价与模拟成交价之间的影响另列，不并入监管/券商费用。
+
+费率分项必须互斥：`commission_rate` 不含单列的印花税和过户费；券商佣金内部已包含的经手费/监管费应留在佣金项中。若交割单只给出合并扣费、无法拆分过户费，不能同时把整笔合并佣金和过户费全额录入，否则会重复计费。
+
+该表的 `price_limit_pct` 仍由“前收盘 × 阈值 + 配置 tick”近似判断是否触板，不是交易所逐日发布的涨跌停价；有效日期规则表目前没有逐日涨停价、跌停价和板块最小报价单位字段。对 `has_price_limit=false` 或缺少有效前收盘的证券日，诊断路径会保守阻断订单，因为它没有可核验的替代报价边界。该约束减少了无依据的成交模拟，但也会漏掉部分本可成交的订单。
+
+2026-11-02 的本机合成性能烟测使用 1,000 个证券、30 个连续模拟日期（30,000 证券日），`ledger_v2` 加有效日期规则/费率运行耗时 6.724 秒，进程峰值 RSS 244.6 MiB，产出 41 笔模拟成交、规则回退行 0。该数据不含真实交易日历或公司行动；RSS 包括 Python 与依赖库基线，仅作为当前实现的粗略工程检查，不代表三年私有快照性能。
+
+该诊断入口只允许 `ledger_v2`，且明确要求公司行动与证券身份事件表为空。因此它**不能用于本项目含 `SZ300114 → SZ302132` 或 `SH601989` 换股的 2023–2025 全窗口**，也不接管现有默认回测路径。可在确认不含身份事件/公司行动的研究片段上这样调用：
+
+```bash
+uv run cehuan backtest \
+  --data data/private/<event-free-research-window>/bars.csv \
+  --cash 100000 --config configs/default.toml \
+  --identity-events examples/empty_security_identity_events.csv \
+  --corporate-actions examples/empty_corporate_actions.csv \
+  --market-rules data/private/<reviewed-audit>/market-rules.csv \
+  --fees data/private/<reviewed-audit>/fee-schedule.csv \
+  --diagnostic --accounting-mode ledger_v2
+```
+
+`examples/market_rules_template.csv` 和 `examples/fee_schedule_template.csv` 只有表头，不是可用规则或费用文件。不能用它们直接运行。`examples/empty_security_identity_events.csv` 和 `examples/empty_corporate_actions.csv` 只表示空表结构，**不构成某个历史窗口没有事件的证据**；只有独立核查确认指定窗口没有事件，才可用它们进行诊断。费率仍按当前计算口径应用佣金最低值、卖方印花税和过户费；逐笔税费取整、交易所规费与券商佣金的拆分方式尚未作为独立列建模。完整结果仍标作研究诊断，不构成华泰成交成本校准。
+
+正式费率文件仍被阻断：
 
 现在还不能生成已审核的 fee-schedule.csv：
 
 - 华泰个人佣金率、最低佣金和交割单计费口径未知；
 - 中国结算过户费 2022 原始通知和收费表原件未成功归档，生效日期没有完成原始文件核验；
-- 回测费率读取目前没有执行，也不能假定示例配置等于用户实际成本；
+- 真实历史费率文件尚未准备，回测的日期连接能力仅由合成输入覆盖测试；
 - 还需用脱敏成交样例核对佣金、印花税、过户费的方向、取整和最低收费。
 
-在这些缺口关闭前，可以使用显式标记的研究费率情景做敏感性分析；结果不得称为个人华泰成本，也不得用于解锁正式基线。详见[正式基线门控](baseline-readiness.md)。
+在这些缺口关闭前，可以使用有明确来源登记的研究费率情景做诊断；结果不得称为个人华泰成本，也不得用于解锁正式基线。正式门控继续验证原始输入，但执行引擎尚未将公司行动账本、有效规则、历史费用整体用于可发布的多年正式绩效。详见[正式基线门控](baseline-readiness.md)。
