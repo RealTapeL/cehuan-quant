@@ -257,6 +257,7 @@ def test_claim_with_value_must_have_source_and_nav_includes_it_once():
     claim = NoncashClaim(
         "claim-1", "event-1", "SH600000", "SH600000", Decimal("10"), 10,
         "2026-11-05", Decimal("95"), "synthetic valuation", "PENDING_TRADABLE",
+        valuation_as_of="2026-11-02",
     )
     ledger = PortfolioLedger(Decimal("100"), claims=(claim,))
 
@@ -264,6 +265,7 @@ def test_claim_with_value_must_have_source_and_nav_includes_it_once():
 
     assert result.status == "VALUED"
     assert result.nav_cny == Decimal("195")
+    assert ledger.mark_to_market("2026-11-03", {}).status == "UNVALUED"
 
     with pytest.raises(ValueError, match="valuation_source"):
         NoncashClaim(

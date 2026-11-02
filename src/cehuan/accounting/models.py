@@ -205,6 +205,7 @@ class NoncashClaim:
     status: str
     cost_basis_cny: Decimal = Decimal("0")
     acquired_on: date | None = None
+    valuation_as_of: date | None = None
 
     def __post_init__(self) -> None:
         if not str(self.claim_id).strip() or not str(self.event_id).strip():
@@ -218,9 +219,14 @@ class NoncashClaim:
         valuation = None if self.valuation_cny is None else decimal_value(
             self.valuation_cny, "valuation_cny", nonnegative=True
         )
+        valuation_as_of = calendar_date(self.valuation_as_of, "valuation_as_of", optional=True)
         basis = decimal_value(self.cost_basis_cny, "cost_basis_cny", nonnegative=True)
         if valuation is not None and not str(self.valuation_source or "").strip():
             raise ValueError("有估值的权利必须登记 valuation_source")
+        if valuation is not None and valuation_as_of is None:
+            raise ValueError("有估值的权利必须登记 valuation_as_of")
+        if valuation is None and valuation_as_of is not None:
+            raise ValueError("未估值权利不能登记 valuation_as_of")
         object.__setattr__(self, "claim_id", str(self.claim_id).strip())
         object.__setattr__(self, "event_id", str(self.event_id).strip())
         object.__setattr__(self, "old_symbol", security_symbol(self.old_symbol, "old_symbol"))
@@ -232,6 +238,7 @@ class NoncashClaim:
         object.__setattr__(self, "valuation_source", str(self.valuation_source).strip() if self.valuation_source else None)
         object.__setattr__(self, "cost_basis_cny", basis)
         object.__setattr__(self, "acquired_on", calendar_date(self.acquired_on, "acquired_on", optional=True))
+        object.__setattr__(self, "valuation_as_of", valuation_as_of)
         status = str(self.status).strip()
         if not status:
             raise ValueError("权利状态不能为空")

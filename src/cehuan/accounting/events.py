@@ -213,4 +213,118 @@ class RightsOfferingEvent:
         object.__setattr__(self, "known_at_utc", known_at)
 
 
+@dataclass(frozen=True)
+class ShareSwapMergerEvent:
+    event_id: str
+    old_symbol: str
+    new_symbol: str
+    old_last_trade_date: date | str
+    record_date: date | str
+    old_delisting_date: date | str
+    new_share_registration_date: date | str
+    new_shares_tradable_date: date | str
+    allocation_result_announcement_date: date | str
+    share_ratio: Decimal
+    integer_allocation_method: str
+    known_at_utc: datetime | str
+    implementation_source: ActionSource
+    old_last_trade_source: ActionSource
+    allocation_source: ActionSource
+
+    def __post_init__(self) -> None:
+        event_id = str(self.event_id).strip()
+        if not event_id:
+            raise ValueError("換股 event_id 不能为空")
+        old = security_symbol(self.old_symbol, "old_symbol")
+        new = security_symbol(self.new_symbol, "new_symbol")
+        if old == new:
+            raise ValueError("吸收合并换股的旧代码和新代码必须不同")
+        old_last = calendar_date(self.old_last_trade_date, "old_last_trade_date")
+        record = calendar_date(self.record_date, "record_date")
+        delist = calendar_date(self.old_delisting_date, "old_delisting_date")
+        registration = calendar_date(self.new_share_registration_date, "new_share_registration_date")
+        tradable = calendar_date(self.new_shares_tradable_date, "new_shares_tradable_date")
+        allocation_date = calendar_date(
+            self.allocation_result_announcement_date, "allocation_result_announcement_date"
+        )
+        if not old_last <= record <= delist < registration <= tradable:
+            raise ValueError("换股日期顺序必须为旧股交易、登记、摘牌、新股登记、可流通")
+        if not record <= allocation_date <= tradable:
+            raise ValueError("换股结果公告日必须位于登记日与新股可流通日之间")
+        if self.integer_allocation_method != "FRACTIONAL_REMAINDER_RANKING_RANDOM_TIEBREAK":
+            raise ValueError("换股整数股分配方法未知或未登记")
+        ratio = decimal_value(self.share_ratio, "share_ratio", nonnegative=True)
+        if ratio <= 0:
+            raise ValueError("share_ratio 必须大于 0")
+        known_at = _aware_instant(self.known_at_utc, "known_at_utc")
+        _require_known_by(known_at, old_last, time(15, 0), "换股实施方案")
+        if not all(isinstance(source, ActionSource) for source in (
+            self.implementation_source, self.old_last_trade_source, self.allocation_source
+        )):
+            raise ValueError("换股事件需要实施、旧股最后交易及分配结果三份来源登记")
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "old_symbol", old)
+        object.__setattr__(self, "new_symbol", new)
+        object.__setattr__(self, "old_last_trade_date", old_last)
+        object.__setattr__(self, "record_date", record)
+        object.__setattr__(self, "old_delisting_date", delist)
+        object.__setattr__(self, "new_share_registration_date", registration)
+        object.__setattr__(self, "new_shares_tradable_date", tradable)
+        object.__setattr__(self, "allocation_result_announcement_date", allocation_date)
+        object.__setattr__(self, "share_ratio", ratio)
+        object.__setattr__(self, "known_at_utc", known_at)
+
+
+@dataclass(frozen=True)
+class DelistingEvent:
+    event_id: str
+    symbol: str
+    last_trade_date: date | str
+    delisting_date: date | str
+    known_at_utc: datetime | str
+    source: ActionSource
+    cash_settlement_per_share_cny: Decimal | None = None
+    payable_date: date | str | None = None
+    settlement_known_at_utc: datetime | str | None = None
+    settlement_source: ActionSource | None = None
+
+    def __post_init__(self) -> None:
+        event_id = str(self.event_id).strip()
+        if not event_id:
+            raise ValueError("退市 event_id 不能为空")
+        last_trade = calendar_date(self.last_trade_date, "last_trade_date")
+        delist = calendar_date(self.delisting_date, "delisting_date")
+        if delist < last_trade:
+            raise ValueError("delisting_date 不能早于 last_trade_date")
+        known_at = _aware_instant(self.known_at_utc, "known_at_utc")
+        _require_known_by(known_at, last_trade, time(15, 0), "退市处理方案")
+        settlement = None if self.cash_settlement_per_share_cny is None else decimal_value(
+            self.cash_settlement_per_share_cny,
+            "cash_settlement_per_share_cny",
+            nonnegative=True,
+        )
+        payable = calendar_date(self.payable_date, "payable_date", optional=True)
+        settlement_known = (
+            None if self.settlement_known_at_utc is None
+            else _aware_instant(self.settlement_known_at_utc, "settlement_known_at_utc")
+        )
+        if settlement is not None:
+            if payable is None or payable < delist:
+                raise ValueError("现金结算必须登记不早于摘牌日的 payable_date")
+            if settlement_known is None or not isinstance(self.settlement_source, ActionSource):
+                raise ValueError("现金结算金额必须附独立的可得时间和来源原件")
+        elif payable is not None or settlement_known is not None or self.settlement_source is not None:
+            raise ValueError("未确认现金结算金额时不能登记结算日期或来源")
+        if not isinstance(self.source, ActionSource):
+            raise ValueError("退市事件必须绑定 ActionSource")
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "symbol", security_symbol(self.symbol, "symbol"))
+        object.__setattr__(self, "last_trade_date", last_trade)
+        object.__setattr__(self, "delisting_date", delist)
+        object.__setattr__(self, "known_at_utc", known_at)
+        object.__setattr__(self, "cash_settlement_per_share_cny", settlement)
+        object.__setattr__(self, "payable_date", payable)
+        object.__setattr__(self, "settlement_known_at_utc", settlement_known)
+
+
 RightsDisposition = Literal["SUBSCRIBE", "DECLINE"]

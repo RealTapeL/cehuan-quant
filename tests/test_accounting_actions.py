@@ -7,10 +7,12 @@ from cehuan.accounting import (
     ActionSource,
     CashDividendEvent,
     CodeChangeEvent,
+    DelistingEvent,
     PortfolioLedger,
     PriceMark,
     RightsOfferingEvent,
     ShareDistributionEvent,
+    ShareSwapMergerEvent,
     TradeFill,
     PositionLot,
 )
@@ -82,6 +84,26 @@ def _rights() -> RightsOfferingEvent:
         subscription_price_cny=Decimal("5"),
         known_at_utc="2026-10-20T08:00:00Z",
         source=_source(),
+    )
+
+
+def _share_swap() -> ShareSwapMergerEvent:
+    return ShareSwapMergerEvent(
+        event_id="swap-1",
+        old_symbol="SH601989",
+        new_symbol="SH600150",
+        old_last_trade_date="2025-08-12",
+        record_date="2025-09-04",
+        old_delisting_date="2025-09-05",
+        new_share_registration_date="2025-09-11",
+        new_shares_tradable_date="2025-09-16",
+        allocation_result_announcement_date="2025-09-12",
+        share_ratio=Decimal("0.1339"),
+        integer_allocation_method="FRACTIONAL_REMAINDER_RANKING_RANDOM_TIEBREAK",
+        known_at_utc="2025-08-10T08:00:00Z",
+        implementation_source=_source(),
+        old_last_trade_source=_source(),
+        allocation_source=_source(),
     )
 
 
@@ -315,6 +337,179 @@ def test_event_id_cannot_be_reused_for_a_different_event_family():
     )
     with pytest.raises(ValueError, match="已用于其他事件类型"):
         ledger.apply_code_change(event, as_of=event.effective_date)
+
+
+def test_share_swap_keeps_claim_untradable_then_creates_separate_new_lot():
+    old_lot = PositionLot(
+        lot_id="old-china-shipbuilding-lot", symbol="SH601989", total_shares=1000,
+        sellable_shares=0, cost_basis_cny=Decimal("12000"),
+        acquired_on="2024-01-03", sellable_from="2024-01-04",
+    )
+    preexisting_new_lot = PositionLot(
+        lot_id="existing-new-code-lot", symbol="SH600150", total_shares=50,
+        sellable_shares=50, cost_basis_cny=Decimal("5000"),
+        acquired_on="2024-04-01", sellable_from="2024-04-02",
+    )
+    ledger = PortfolioLedger(Decimal("1000"), positions=(old_lot, preexisting_new_lot))
+    event = _share_swap()
+    ledger.record_share_swap(event, as_of=event.record_date)
+    ledger.begin_share_swap(event, as_of=event.old_delisting_date)
+
+    assert ledger.cash_cny == Decimal("1000")
+    assert {lot.symbol for lot in ledger.positions} == {"SH600150"}
+    assert len(ledger.positions) == 1
+    assert ledger.claims[0].status == "ALLOCATION_UNRESOLVED"
+    assert ledger.mark_to_market(
+        event.old_delisting_date,
+        {"SH600150": _price("20", event.old_delisting_date.isoformat())},
+    ).status == "UNVALUED"
+
+    with pytest.raises(ValueError, match="未确认"):
+        ledger.settle_share_swap(event, as_of=event.new_shares_tradable_date)
+    with pytest.raises(ValueError, match="整数边界"):
+        ledger.confirm_share_swap_allocation(
+            event, as_of=event.allocation_result_announcement_date,
+            final_allocated_new_shares=132, allocation_evidence="synthetic allocation result",
+            account_allocation_source=_source(),
+        )
+    with pytest.raises(ValueError, match="独立证据"):
+        ledger.confirm_share_swap_allocation(
+            event, as_of=event.allocation_result_announcement_date,
+            final_allocated_new_shares=134, allocation_evidence="",
+            account_allocation_source=_source(),
+        )
+    ledger.confirm_share_swap_allocation(
+        event, as_of=event.allocation_result_announcement_date,
+        final_allocated_new_shares=134,
+        allocation_evidence="synthetic account-level allocation confirmation",
+        account_allocation_source=_source(),
+    )
+
+    with pytest.raises(ValueError, match="可卖股数不足"):
+        ledger.apply_fill(TradeFill(
+            fill_id="sell-unlisted-swap-shares", trade_date="2025-09-15",
+            symbol="SH600150", side="SELL", quantity=51, price_cny=Decimal("20"),
+        ))
+    allotment = ledger.settle_share_swap(event, as_of=event.new_shares_tradable_date)
+    assert ledger.settle_share_swap(event, as_of=event.new_shares_tradable_date) == allotment
+    swap_lot = next(lot for lot in ledger.positions if lot.source_event_id == event.event_id)
+    existing_lot = next(lot for lot in ledger.positions if lot.lot_id == "existing-new-code-lot")
+    assert swap_lot.total_shares == 134
+    assert swap_lot.cost_basis_cny == Decimal("12000")
+    assert swap_lot.acquired_on == date(2024, 1, 3)
+    assert existing_lot.total_shares == 50
+    assert existing_lot.cost_basis_cny == Decimal("5000")
+    assert existing_lot.acquired_on == date(2024, 4, 1)
+    assert swap_lot.sellable_on(date(2025, 9, 15)) == 0
+    assert swap_lot.sellable_on(date(2025, 9, 16)) == 134
+    assert ledger.cash_cny == Decimal("1000")
+    assert all(entry.entry_type not in {"BUY", "SELL"} for entry in ledger.journal)
+
+
+def test_share_swap_claim_valuation_is_for_one_date_only():
+    old_lot = PositionLot(
+        lot_id="old", symbol="SH601989", total_shares=1000, sellable_shares=0,
+        cost_basis_cny=Decimal("12000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
+    )
+    ledger = PortfolioLedger(Decimal("1000"), positions=(old_lot,))
+    event = _share_swap()
+    ledger.record_share_swap(event, as_of=event.record_date)
+    ledger.begin_share_swap(event, as_of=event.old_delisting_date)
+    ledger.confirm_share_swap_allocation(
+        event, as_of=event.allocation_result_announcement_date,
+        final_allocated_new_shares=134,
+        allocation_evidence="synthetic allocation confirmation",
+        account_allocation_source=_source(),
+        valuation_cny=Decimal("2500"), valuation_source="synthetic same-day valuation fixture",
+    )
+
+    valued = ledger.mark_to_market(
+        event.allocation_result_announcement_date,
+        {"SH600150": _price("20", event.allocation_result_announcement_date.isoformat())},
+    )
+    stale = ledger.mark_to_market(
+        "2025-09-15", {"SH600150": _price("20", "2025-09-15")}
+    )
+    assert valued.status == "VALUED"
+    assert stale.status == "UNVALUED"
+    assert any("估值日期" in reason for reason in stale.reasons)
+
+
+def test_delisting_cash_settlement_moves_to_receivable_and_never_reuses_old_price():
+    lot = PositionLot(
+        lot_id="delisted-lot", symbol="SH600000", total_shares=100, sellable_shares=100,
+        cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
+    )
+    event = DelistingEvent(
+        event_id="delisting-cash", symbol="SH600000", last_trade_date="2026-10-30",
+        delisting_date="2026-11-02", known_at_utc="2026-10-20T08:00:00Z", source=_source(),
+        cash_settlement_per_share_cny=Decimal("30"), payable_date="2026-11-10",
+        settlement_known_at_utc="2026-10-30T06:00:00Z", settlement_source=_source(),
+    )
+    ledger = PortfolioLedger(Decimal("500"), positions=(lot,))
+    ledger.record_delisting(event, as_of=event.last_trade_date)
+    ledger.apply_delisting(event, as_of=event.delisting_date, tax_cny=Decimal("0"))
+
+    assert ledger.positions == ()
+    before_payment = ledger.mark_to_market(event.delisting_date, {})
+    assert before_payment.status == "VALUED"
+    assert before_payment.nav_cny == Decimal("3500.00")
+    assert ledger.cash_cny == Decimal("500")
+    assert ledger.settle_receivable("delisting:delisting-cash", settled_on="2026-11-10")
+    after_payment = ledger.mark_to_market("2026-11-10", {})
+    assert ledger.cash_cny == Decimal("3500.00")
+    assert after_payment.nav_cny == Decimal("3500.00")
+    assert all(entry.entry_type not in {"BUY", "SELL"} for entry in ledger.journal)
+
+
+def test_delisting_cash_amount_announced_after_close_cannot_backfill_delisting_nav():
+    lot = PositionLot(
+        lot_id="delisted-lot", symbol="SH600000", total_shares=100, sellable_shares=100,
+        cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
+    )
+    event = DelistingEvent(
+        event_id="late-delisting-cash", symbol="SH600000", last_trade_date="2026-10-30",
+        delisting_date="2026-11-02", known_at_utc="2026-10-20T08:00:00Z", source=_source(),
+        cash_settlement_per_share_cny=Decimal("30"), payable_date="2026-11-10",
+        settlement_known_at_utc="2026-11-02T08:30:00Z", settlement_source=_source(),
+    )
+    ledger = PortfolioLedger(Decimal("500"), positions=(lot,))
+    ledger.record_delisting(event, as_of=event.last_trade_date)
+    ledger.apply_delisting(event, as_of=event.delisting_date, tax_cny=None)
+    assert ledger.mark_to_market(event.delisting_date, {}).status == "UNVALUED"
+
+    with pytest.raises(ValueError, match="尚不可得"):
+        ledger.resolve_delisted_cash_settlement(event, as_of=event.delisting_date, tax_cny=Decimal("0"))
+    ledger.resolve_delisted_cash_settlement(event, as_of="2026-11-03", tax_cny=Decimal("0"))
+    with pytest.raises(ValueError, match="早于账本最新过账日"):
+        ledger.mark_to_market("2026-11-02", {})
+    assert ledger.mark_to_market("2026-11-03", {}).nav_cny == Decimal("3500.00")
+
+
+def test_delisting_without_settlement_stays_unvalued_until_same_day_claim_mark():
+    lot = PositionLot(
+        lot_id="delisted-lot", symbol="SZ000001", total_shares=100, sellable_shares=0,
+        cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
+    )
+    event = DelistingEvent(
+        event_id="delisting-unresolved", symbol="SZ000001", last_trade_date="2026-10-30",
+        delisting_date="2026-11-02", known_at_utc="2026-10-20T08:00:00Z", source=_source(),
+    )
+    ledger = PortfolioLedger(Decimal("500"), positions=(lot,))
+    ledger.record_delisting(event, as_of=event.last_trade_date)
+    ledger.apply_delisting(event, as_of=event.delisting_date, tax_cny=None)
+    assert ledger.positions == ()
+    assert ledger.mark_to_market(event.delisting_date, {}).status == "UNVALUED"
+
+    ledger.resolve_delisted_claim(
+        event, as_of="2026-11-03", valuation_cny=Decimal("3000"),
+        valuation_source="synthetic reviewed transfer-right valuation",
+    )
+    valued = ledger.mark_to_market("2026-11-03", {})
+    next_day = ledger.mark_to_market("2026-11-04", {})
+    assert valued.status == "VALUED" and valued.nav_cny == Decimal("3500")
+    assert next_day.status == "UNVALUED"
+    assert any("估值日期" in reason for reason in next_day.reasons)
 
 
 def test_action_event_requires_timestamped_source_and_explicit_booking_date():

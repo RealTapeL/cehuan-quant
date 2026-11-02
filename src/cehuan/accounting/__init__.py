@@ -5,8 +5,10 @@ from cehuan.accounting.events import (
     ActionSource,
     CashDividendEvent,
     CodeChangeEvent,
+    DelistingEvent,
     RightsOfferingEvent,
     ShareDistributionEvent,
+    ShareSwapMergerEvent,
 )
 from cehuan.accounting.models import (
     CashReceivable,
@@ -27,6 +29,7 @@ __all__ = [
     "CashDividendEvent",
     "ActionSource",
     "CodeChangeEvent",
+    "DelistingEvent",
     "EntitledLot",
     "EntitlementSnapshot",
     "FeeItem",
@@ -39,5 +42,6 @@ __all__ = [
     "PriceMark",
     "RightsOfferingEvent",
     "ShareDistributionEvent",
+    "ShareSwapMergerEvent",
     "TradeFill",
 ]
