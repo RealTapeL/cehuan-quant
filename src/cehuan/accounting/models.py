@@ -273,6 +273,61 @@ class LedgerEntry:
 
 
 @dataclass(frozen=True)
+class EntitledLot:
+    lot_id: str
+    quantity: int
+    cost_basis_cny: Decimal
+    acquired_on: date
+    sellable_from: date
+
+    def __post_init__(self) -> None:
+        lot_id = str(self.lot_id).strip()
+        if not lot_id:
+            raise ValueError("EntitledLot.lot_id 不能为空")
+        quantity = share_count(self.quantity, "EntitledLot.quantity")
+        basis = decimal_value(self.cost_basis_cny, "EntitledLot.cost_basis_cny", nonnegative=True)
+        acquired = calendar_date(self.acquired_on, "EntitledLot.acquired_on")
+        sellable = calendar_date(self.sellable_from, "EntitledLot.sellable_from")
+        if sellable < acquired:
+            raise ValueError("EntitledLot.sellable_from 不能早于 acquired_on")
+        object.__setattr__(self, "lot_id", lot_id)
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "cost_basis_cny", basis)
+        object.__setattr__(self, "acquired_on", acquired)
+        object.__setattr__(self, "sellable_from", sellable)
+
+
+@dataclass(frozen=True)
+class EntitlementSnapshot:
+    event_id: str
+    symbol: str
+    captured_on: date
+    lots: tuple[EntitledLot, ...]
+
+    def __post_init__(self) -> None:
+        event_id = str(self.event_id).strip()
+        if not event_id:
+            raise ValueError("EntitlementSnapshot.event_id 不能为空")
+        lots = tuple(self.lots)
+        if not all(isinstance(lot, EntitledLot) for lot in lots):
+            raise ValueError("EntitlementSnapshot.lots 必须由 EntitledLot 构成")
+        if len({lot.lot_id for lot in lots}) != len(lots):
+            raise ValueError("EntitlementSnapshot 中 lot_id 不能重复")
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "symbol", security_symbol(self.symbol, "EntitlementSnapshot.symbol"))
+        object.__setattr__(self, "captured_on", calendar_date(self.captured_on, "EntitlementSnapshot.captured_on"))
+        object.__setattr__(self, "lots", lots)
+
+    @property
+    def total_shares(self) -> int:
+        return sum(lot.quantity for lot in self.lots)
+
+    @property
+    def total_cost_basis_cny(self) -> Decimal:
+        return sum((lot.cost_basis_cny for lot in self.lots), start=Decimal("0"))
+
+
+@dataclass(frozen=True)
 class NavResult:
     status: Literal["VALUED", "UNVALUED"]
     valuation_date: date
@@ -293,3 +348,4 @@ class LedgerSnapshot:
     receivables: tuple[CashReceivable, ...]
     claims: tuple[NoncashClaim, ...]
     journal: tuple[LedgerEntry, ...]
+    entitlements: tuple[EntitlementSnapshot, ...] = ()

@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Callable, Iterable, Mapping
 
+from cehuan.accounting.events import (
+    ActionSource,
+    CashDividendEvent,
+    CodeChangeEvent,
+    RightsDisposition,
+    RightsOfferingEvent,
+    ShareDistributionEvent,
+)
 from cehuan.accounting.models import (
     CashReceivable,
+    EntitledLot,
+    EntitlementSnapshot,
     LedgerEntry,
     LedgerSnapshot,
     NavResult,
@@ -22,11 +33,11 @@ from cehuan.accounting.models import (
 
 
 class PortfolioLedger:
-    """Small pure-Python ledger with atomic, idempotent fill postings.
+    """Pure-Python research ledger with atomic, idempotent state transitions.
 
-    Corporate-action handlers are deliberately separate from this T1 core.
-    All monetary values are Decimal; prices and balances are never silently
-    converted from float or defaulted to zero.
+    The methods are synthetic accounting primitives; this class is not yet
+    connected to the production backtest path. Monetary values use Decimal,
+    and unknown valuations never silently become zero.
     """
 
     def __init__(
@@ -47,8 +58,10 @@ class PortfolioLedger:
         self._initial_position_shares = self._position_totals(self._positions.values())
         self._receivables = self._index_unique(receivables, "receivable_id", "应收款")
         self._claims = self._index_unique(claims, "claim_id", "非现金权利")
+        self._action_entitlements: dict[str, EntitlementSnapshot] = {}
         self._journal: list[LedgerEntry] = []
         self._operations: dict[str, tuple[str, tuple[LedgerEntry, ...]]] = {}
+        self._event_families: dict[str, str] = {}
         self.assert_invariants()
 
     @staticmethod
@@ -72,8 +85,10 @@ class PortfolioLedger:
         candidate._positions = self._positions.copy()
         candidate._receivables = self._receivables.copy()
         candidate._claims = self._claims.copy()
+        candidate._action_entitlements = self._action_entitlements.copy()
         candidate._journal = self._journal.copy()
         candidate._operations = self._operations.copy()
+        candidate._event_families = self._event_families.copy()
         return candidate
 
     def _adopt(self, candidate: PortfolioLedger) -> None:
@@ -81,8 +96,10 @@ class PortfolioLedger:
         self._positions = candidate._positions
         self._receivables = candidate._receivables
         self._claims = candidate._claims
+        self._action_entitlements = candidate._action_entitlements
         self._journal = candidate._journal
         self._operations = candidate._operations
+        self._event_families = candidate._event_families
 
     @staticmethod
     def _digest(payload: Mapping[str, object]) -> str:
@@ -125,8 +142,23 @@ class PortfolioLedger:
         phase = str(phase).strip().upper()
         if not event_id or not phase:
             raise ValueError("账本操作必须有 event_id 和 phase")
+        if phase == "FILL":
+            event_family = "TRADE_FILL"
+        elif phase.startswith("DIVIDEND_") or phase == "DIVIDEND_PAYMENT":
+            event_family = "CASH_DIVIDEND"
+        elif phase.startswith("DISTRIBUTION_") or phase == "SHARE_DISTRIBUTION":
+            event_family = "SHARE_DISTRIBUTION"
+        elif phase.startswith("RIGHTS_"):
+            event_family = "RIGHTS_OFFERING"
+        elif phase == "IDENTITY_MIGRATION":
+            event_family = "CODE_CHANGE_1_TO_1"
+        else:
+            event_family = phase
         operation_key = f"{self.portfolio_id}:{event_id}:{phase}"
         digest = self._digest(payload)
+        known_family = self._event_families.get(event_id)
+        if known_family is not None and known_family != event_family:
+            raise ValueError(f"event_id {event_id} 已用于其他事件类型：{known_family}")
         previous = self._operations.get(operation_key)
         if previous is not None:
             if previous[0] != digest:
@@ -134,6 +166,7 @@ class PortfolioLedger:
             return previous[1]
 
         candidate = self._copy()
+        candidate._event_families[event_id] = event_family
         entries = mutate(candidate, operation_key)
         candidate._journal.extend(entries)
         candidate._operations[operation_key] = (digest, entries)
@@ -176,6 +209,9 @@ class PortfolioLedger:
             receivables=self.receivables,
             claims=self.claims,
             journal=self.journal,
+            entitlements=tuple(
+                self._action_entitlements[key] for key in sorted(self._action_entitlements)
+            ),
         )
 
     def assert_invariants(self) -> None:
@@ -216,6 +252,621 @@ class PortfolioLedger:
             raise ValueError("账本分录导致证券持仓为负")
         if actual_positions != expected_positions:
             raise ValueError("账本持仓与分录股数变化不一致")
+
+    @staticmethod
+    def _source_details(source: ActionSource) -> dict[str, str]:
+        return {
+            "source_id": source.source_id,
+            "source_url": source.url,
+            "source_sha256": source.sha256,
+            "source_title": source.title,
+            "source_page_reference": source.page_reference,
+            "reviewed_by": source.reviewed_by,
+            "reviewed_at": source.reviewed_at.isoformat(),
+        }
+
+    @staticmethod
+    def _cent(value: Decimal) -> Decimal:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _capture_entitlement(
+        self,
+        *,
+        event_id: str,
+        symbol: str,
+        record_date: date,
+        phase: str,
+        payload: Mapping[str, object],
+        source: ActionSource,
+    ) -> tuple[LedgerEntry, ...]:
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            if event_id in candidate._action_entitlements:
+                raise ValueError(f"公司行动 event_id 已有持仓权利快照：{event_id}")
+            lots = tuple(sorted(
+                (
+                    EntitledLot(
+                        lot_id=lot.lot_id,
+                        quantity=lot.total_shares,
+                        cost_basis_cny=lot.cost_basis_cny,
+                        acquired_on=lot.acquired_on,
+                        sellable_from=lot.sellable_from,
+                    )
+                    for lot in candidate._positions.values()
+                    if lot.symbol == symbol
+                ),
+                key=lambda item: (item.acquired_on, item.lot_id),
+            ))
+            entitlement = EntitlementSnapshot(event_id, symbol, record_date, lots)
+            candidate._action_entitlements[event_id] = entitlement
+            return (candidate._entry(
+                operation_key, event_id, phase, record_date, "ENTITLEMENT_SNAPSHOT",
+                Decimal("0"), (), {
+                    "symbol": symbol,
+                    "eligible_shares": entitlement.total_shares,
+                    "eligible_lots": len(lots),
+                    **self._source_details(source),
+                },
+            ),)
+
+        return self._apply_once(event_id, phase, payload, mutate)
+
+    def _require_entitlement(
+        self, event_id: str, symbol: str, record_date: date
+    ) -> EntitlementSnapshot:
+        entitlement = self._action_entitlements.get(event_id)
+        if entitlement is None:
+            raise ValueError(f"{event_id}: 缺少登记日收盘持仓快照")
+        if entitlement.symbol != symbol or entitlement.captured_on != record_date:
+            raise ValueError(f"{event_id}: 事件证券或登记日与持仓快照不一致")
+        return entitlement
+
+    @staticmethod
+    def _event_source_payload(source: ActionSource) -> dict[str, str]:
+        return {
+            "source_id": source.source_id,
+            "source_url": source.url,
+            "source_sha256": source.sha256,
+            "source_title": source.title,
+            "source_page_reference": source.page_reference,
+            "reviewed_by": source.reviewed_by,
+            "reviewed_at": source.reviewed_at.isoformat(),
+        }
+
+    def record_cash_dividend(
+        self, event: CashDividendEvent, *, as_of: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, CashDividendEvent):
+            raise TypeError("record_cash_dividend 只接受 CashDividendEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.record_date:
+            raise ValueError("分红权利快照只能在登记日收盘处理")
+        payload = {
+            "event_id": event.event_id,
+            "symbol": event.symbol,
+            "record_date": event.record_date.isoformat(),
+            "ex_date": event.ex_date.isoformat(),
+            "payable_date": event.payable_date.isoformat(),
+            "gross_per_share_cny": str(event.gross_per_share_cny),
+            "known_at_utc": event.known_at_utc.isoformat(),
+            **self._event_source_payload(event.source),
+        }
+        return self._capture_entitlement(
+            event_id=event.event_id,
+            symbol=event.symbol,
+            record_date=event.record_date,
+            phase="DIVIDEND_RECORD",
+            payload=payload,
+            source=event.source,
+        )
+
+    def record_share_distribution(
+        self, event: ShareDistributionEvent, *, as_of: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, ShareDistributionEvent):
+            raise TypeError("record_share_distribution 只接受 ShareDistributionEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.record_date:
+            raise ValueError("送转权利快照只能在登记日收盘处理")
+        payload = {
+            "event_id": event.event_id,
+            "symbol": event.symbol,
+            "record_date": event.record_date.isoformat(),
+            "effective_date": event.effective_date.isoformat(),
+            "tradable_date": event.tradable_date.isoformat(),
+            "ratio": str(event.shares_per_old_share),
+            "known_at_utc": event.known_at_utc.isoformat(),
+            **self._event_source_payload(event.source),
+        }
+        return self._capture_entitlement(
+            event_id=event.event_id,
+            symbol=event.symbol,
+            record_date=event.record_date,
+            phase="DISTRIBUTION_RECORD",
+            payload=payload,
+            source=event.source,
+        )
+
+    def record_rights_offering(
+        self, event: RightsOfferingEvent, *, as_of: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, RightsOfferingEvent):
+            raise TypeError("record_rights_offering 只接受 RightsOfferingEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.record_date:
+            raise ValueError("配股权利快照只能在登记日收盘处理")
+        claim_id = f"rights:{event.event_id}"
+        payload = {
+            "event_id": event.event_id,
+            "symbol": event.symbol,
+            "record_date": event.record_date.isoformat(),
+            "rights_per_old_share": str(event.rights_per_old_share),
+            "subscription_price_cny": str(event.subscription_price_cny),
+            "tradable_date": event.tradable_date.isoformat(),
+            "known_at_utc": event.known_at_utc.isoformat(),
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            if event.event_id in candidate._action_entitlements:
+                raise ValueError(f"公司行动 event_id 已有持仓权利快照：{event.event_id}")
+            if claim_id in candidate._claims:
+                raise ValueError(f"配股权利已存在：{claim_id}")
+            lots = tuple(sorted(
+                (
+                    EntitledLot(
+                        lot_id=lot.lot_id,
+                        quantity=lot.total_shares,
+                        cost_basis_cny=lot.cost_basis_cny,
+                        acquired_on=lot.acquired_on,
+                        sellable_from=lot.sellable_from,
+                    )
+                    for lot in candidate._positions.values()
+                    if lot.symbol == event.symbol
+                ),
+                key=lambda item: (item.acquired_on, item.lot_id),
+            ))
+            entitlement = EntitlementSnapshot(event.event_id, event.symbol, event.record_date, lots)
+            candidate._action_entitlements[event.event_id] = entitlement
+            exact_rights = Decimal(entitlement.total_shares) * event.rights_per_old_share
+            candidate._claims[claim_id] = NoncashClaim(
+                claim_id=claim_id,
+                event_id=event.event_id,
+                old_symbol=event.symbol,
+                new_symbol=event.symbol,
+                exact_entitlement=exact_rights,
+                final_allocated_shares=None,
+                tradable_from=event.tradable_date,
+                valuation_cny=None,
+                valuation_source=None,
+                status="RIGHTS_DISPOSITION_REQUIRED" if exact_rights else "CANCELLED",
+                acquired_on=event.record_date,
+            )
+            return (candidate._entry(
+                operation_key, event.event_id, "RIGHTS_RECORD", event.record_date,
+                "RIGHTS_ENTITLEMENT", Decimal("0"), (), {
+                    "claim_id": claim_id,
+                    "eligible_old_shares": entitlement.total_shares,
+                    "exact_rights": exact_rights,
+                    "eligible_lots": len(lots),
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "RIGHTS_RECORD", payload, mutate)
+
+    def accrue_cash_dividend(
+        self,
+        event: CashDividendEvent,
+        *,
+        as_of: date | str,
+        tax_cny: Decimal | int | str | None,
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, CashDividendEvent):
+            raise TypeError("accrue_cash_dividend 只接受 CashDividendEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.ex_date:
+            raise ValueError("分红应收只能在除息日确认")
+        entitlement = self._require_entitlement(event.event_id, event.symbol, event.record_date)
+        gross = self._cent(event.gross_per_share_cny * entitlement.total_shares)
+        tax = None if tax_cny is None else self._cent(decimal_value(tax_cny, "tax_cny", nonnegative=True))
+        if gross == 0:
+            tax = Decimal("0")
+        if tax is not None and tax > gross:
+            raise ValueError("分红税费不能大于应收税前金额")
+        receivable_id = f"dividend:{event.event_id}"
+        payload = {
+            "event_id": event.event_id,
+            "receivable_id": receivable_id,
+            "ex_date": event.ex_date.isoformat(),
+            "gross_cny": str(gross),
+            "tax_cny": None if tax is None else str(tax),
+            "eligible_shares": entitlement.total_shares,
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            if event.ex_date < entitlement.captured_on:
+                raise ValueError("分红除息日早于登记日权利快照")
+            if receivable_id in candidate._receivables:
+                raise ValueError(f"分红应收款已存在：{receivable_id}")
+            receivable = CashReceivable(
+                receivable_id=receivable_id,
+                event_id=event.event_id,
+                gross_cny=gross,
+                tax_cny=tax,
+                recognized_on=event.ex_date,
+                payable_on=event.payable_date,
+            )
+            candidate._receivables[receivable_id] = receivable
+            return (candidate._entry(
+                operation_key, event.event_id, "DIVIDEND_ACCRUAL", event.ex_date,
+                "CASH_DIVIDEND_RECEIVABLE", Decimal("0"), (), {
+                    "receivable_id": receivable_id,
+                    "eligible_shares": entitlement.total_shares,
+                    "gross_cny": gross,
+                    "tax_cny": "UNKNOWN" if tax is None else tax,
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "DIVIDEND_ACCRUAL", payload, mutate)
+
+    def settle_receivable(
+        self, receivable_id: str, *, settled_on: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        identifier = str(receivable_id).strip()
+        if not identifier:
+            raise ValueError("receivable_id 不能为空")
+        day = calendar_date(settled_on, "settled_on")
+        receivable = self._receivables.get(identifier)
+        if receivable is None:
+            raise ValueError(f"应收款不存在：{identifier}")
+        payload = {
+            "receivable_id": identifier,
+            "event_id": receivable.event_id,
+            "settled_on": day.isoformat(),
+            "gross_cny": str(receivable.gross_cny),
+            "tax_cny": None if receivable.tax_cny is None else str(receivable.tax_cny),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            current = candidate._receivables[identifier]
+            if current.status != "PENDING":
+                raise ValueError(f"应收款 {identifier} 当前状态不是 PENDING")
+            if current.tax_cny is None:
+                raise ValueError(f"应收款 {identifier} 税费未知，不能确认到账净额")
+            if current.payable_on is None or day < current.payable_on:
+                raise ValueError(f"应收款 {identifier} 尚未到可确认到账日")
+            net = current.gross_cny - current.tax_cny
+            candidate._cash_cny += net
+            candidate._receivables[identifier] = replace(current, status="SETTLED")
+            return (candidate._entry(
+                operation_key, current.event_id, "RECEIVABLE_SETTLEMENT", day,
+                "CASH_RECEIVABLE_SETTLED", net, (), {
+                    "receivable_id": identifier,
+                    "gross_cny": current.gross_cny,
+                    "tax_cny": current.tax_cny,
+                    "net_cash_cny": net,
+                },
+            ),)
+
+        return self._apply_once(receivable.event_id, "DIVIDEND_PAYMENT", payload, mutate)
+
+    def apply_share_distribution(
+        self,
+        event: ShareDistributionEvent,
+        *,
+        as_of: date | str,
+        allocated_new_shares: int | None = None,
+        allocation_evidence: str | None = None,
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, ShareDistributionEvent):
+            raise TypeError("apply_share_distribution 只接受 ShareDistributionEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.effective_date:
+            raise ValueError("送转股数与成本只能在事件生效日处理")
+        entitlement = self._require_entitlement(event.event_id, event.symbol, event.record_date)
+        exact = Decimal(entitlement.total_shares) * event.shares_per_old_share
+        floor_shares = int(exact.to_integral_value(rounding=ROUND_FLOOR))
+        ceiling_shares = int(exact.to_integral_value(rounding=ROUND_CEILING))
+        if allocated_new_shares is None:
+            if floor_shares != ceiling_shares:
+                raise ValueError("送转产生非整数股，必须提供已核实的账户层最终获配股数")
+            allocated_new_shares = floor_shares
+        if isinstance(allocated_new_shares, bool) or not isinstance(allocated_new_shares, int):
+            raise ValueError("allocated_new_shares 必须是整数股数")
+        if not floor_shares <= allocated_new_shares <= ceiling_shares:
+            raise ValueError("账户层最终获配股数不在精确送转权利的整数边界内")
+        if floor_shares != ceiling_shares and not str(allocation_evidence or "").strip():
+            raise ValueError("非整数送转必须提供账户层最终分配依据")
+        payload = {
+            "event_id": event.event_id,
+            "symbol": event.symbol,
+            "effective_date": event.effective_date.isoformat(),
+            "tradable_date": event.tradable_date.isoformat(),
+            "ratio": str(event.shares_per_old_share),
+            "exact_entitlement": str(exact),
+            "allocated_new_shares": allocated_new_shares,
+            "allocation_evidence": allocation_evidence,
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            if event.effective_date < entitlement.captured_on:
+                raise ValueError("送转生效日早于登记日权利快照")
+            if entitlement.total_shares == 0 and allocated_new_shares != 0:
+                raise ValueError("无登记日持仓时不能分配送转股")
+            for old_lot in entitlement.lots:
+                current = candidate._positions.get(old_lot.lot_id)
+                if current is None or current.total_shares != old_lot.quantity or current.cost_basis_cny != old_lot.cost_basis_cny:
+                    raise ValueError(
+                        f"{old_lot.lot_id}: 登记日后持仓已变化；当前送转处理不支持事件前后未重放的交易"
+                    )
+
+            lot_allocations: dict[str, int] = {}
+            if allocated_new_shares:
+                raw_allocations = [
+                    (lot, Decimal(allocated_new_shares) * Decimal(lot.quantity) / Decimal(entitlement.total_shares))
+                    for lot in entitlement.lots
+                ]
+                lot_allocations = {lot.lot_id: int(raw.to_integral_value(rounding=ROUND_FLOOR)) for lot, raw in raw_allocations}
+                remainder = allocated_new_shares - sum(lot_allocations.values())
+                ranked = sorted(
+                    raw_allocations,
+                    key=lambda pair: (-(pair[1] - pair[1].to_integral_value(rounding=ROUND_FLOOR)), pair[0].acquired_on, pair[0].lot_id),
+                )
+                for lot, _raw in ranked[:remainder]:
+                    lot_allocations[lot.lot_id] += 1
+
+            position_delta = allocated_new_shares
+            for old_lot in entitlement.lots:
+                new_shares = lot_allocations.get(old_lot.lot_id, 0)
+                if new_shares <= 0:
+                    continue
+                current = candidate._positions[old_lot.lot_id]
+                combined_shares = current.total_shares + new_shares
+                new_basis = current.cost_basis_cny * Decimal(new_shares) / Decimal(combined_shares)
+                old_basis = current.cost_basis_cny - new_basis
+                candidate._positions[old_lot.lot_id] = replace(current, cost_basis_cny=old_basis)
+                new_lot_id = f"action:{event.event_id}:{old_lot.lot_id}"
+                if new_lot_id in candidate._positions:
+                    raise ValueError(f"送转新股批次已存在：{new_lot_id}")
+                candidate._positions[new_lot_id] = PositionLot(
+                    lot_id=new_lot_id,
+                    symbol=event.symbol,
+                    total_shares=new_shares,
+                    sellable_shares=0,
+                    cost_basis_cny=new_basis,
+                    acquired_on=old_lot.acquired_on,
+                    sellable_from=event.tradable_date,
+                    source_event_id=event.event_id,
+                )
+
+            return (candidate._entry(
+                operation_key, event.event_id, "SHARE_DISTRIBUTION", event.effective_date,
+                "SHARE_DISTRIBUTION", Decimal("0"), ((event.symbol, position_delta),), {
+                    "eligible_old_shares": entitlement.total_shares,
+                    "exact_new_shares": exact,
+                    "allocated_new_shares": allocated_new_shares,
+                    "cost_basis_before_cny": entitlement.total_cost_basis_cny,
+                    "tradable_date": event.tradable_date.isoformat(),
+                    "allocation_evidence": allocation_evidence or "EXACT_INTEGER_RATIO",
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "SHARE_DISTRIBUTION", payload, mutate)
+
+    def decide_rights_offering(
+        self,
+        event: RightsOfferingEvent,
+        *,
+        disposition: RightsDisposition,
+        as_of: date | str,
+        allocated_rights_shares: int | None = None,
+        allocation_evidence: str | None = None,
+        subscription_fee_cny: Decimal | int | str,
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, RightsOfferingEvent):
+            raise TypeError("decide_rights_offering 只接受 RightsOfferingEvent")
+        if disposition not in {"SUBSCRIBE", "DECLINE"}:
+            raise ValueError("配股处置必须显式选择 SUBSCRIBE 或 DECLINE")
+        day = calendar_date(as_of, "as_of")
+        claim_id = f"rights:{event.event_id}"
+        entitlement = self._require_entitlement(event.event_id, event.symbol, event.record_date)
+        exact = Decimal(entitlement.total_shares) * event.rights_per_old_share
+        max_shares = int(exact.to_integral_value(rounding=ROUND_CEILING))
+        if disposition == "SUBSCRIBE":
+            if not event.subscription_start_date <= day <= event.subscription_end_date:
+                raise ValueError("配股认购只能在公告的认购期间内处理")
+            if allocated_rights_shares is None:
+                if exact != exact.to_integral_value():
+                    raise ValueError("配股权利为非整数时必须提供已核实的账户层股数")
+                allocated_rights_shares = int(exact)
+            if isinstance(allocated_rights_shares, bool) or not isinstance(allocated_rights_shares, int):
+                raise ValueError("allocated_rights_shares 必须是整数股数")
+            floor_shares = int(exact.to_integral_value(rounding=ROUND_FLOOR))
+            if allocated_rights_shares <= 0 or not floor_shares <= allocated_rights_shares <= max_shares:
+                raise ValueError("认购股数必须是账户层精确配股权利的有效整数分配")
+            if exact != exact.to_integral_value() and not str(allocation_evidence or "").strip():
+                raise ValueError("非整数配股权利必须登记账户层分配依据")
+        else:
+            if day < event.subscription_end_date:
+                raise ValueError("放弃配股只能在认购期限结束后确认权利失效")
+            if allocated_rights_shares is not None:
+                raise ValueError("放弃配股不能同时提供认购股数")
+
+        fee = self._cent(decimal_value(subscription_fee_cny, "subscription_fee_cny", nonnegative=True))
+        notional = (
+            self._cent(event.subscription_price_cny * allocated_rights_shares + fee)
+            if disposition == "SUBSCRIBE" and allocated_rights_shares is not None
+            else Decimal("0")
+        )
+        payload = {
+            "event_id": event.event_id,
+            "claim_id": claim_id,
+            "disposition": disposition,
+            "as_of": day.isoformat(),
+            "allocated_rights_shares": allocated_rights_shares,
+            "allocation_evidence": allocation_evidence,
+            "subscription_fee_cny": str(fee),
+            "cash_out_cny": str(notional),
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            claim = candidate._claims.get(claim_id)
+            if claim is None or claim.status != "RIGHTS_DISPOSITION_REQUIRED":
+                raise ValueError(f"配股权利 {claim_id} 不在待处置状态")
+            if disposition == "DECLINE":
+                candidate._claims[claim_id] = replace(claim, status="CANCELLED")
+                entry_type = "RIGHTS_DECLINED"
+                cash_delta = Decimal("0")
+                details = {
+                    "claim_id": claim_id,
+                    "disposition": disposition,
+                    "expired_after_subscription_deadline": True,
+                }
+            else:
+                if candidate._cash_cny < notional:
+                    raise ValueError("配股认购后现金不足")
+                candidate._cash_cny -= notional
+                candidate._claims[claim_id] = replace(
+                    claim,
+                    final_allocated_shares=allocated_rights_shares,
+                    cost_basis_cny=notional,
+                    status="SUBSCRIBED_PENDING_ALLOTMENT",
+                )
+                entry_type = "RIGHTS_SUBSCRIBED"
+                cash_delta = -notional
+                details = {
+                    "claim_id": claim_id,
+                    "disposition": disposition,
+                    "allocated_rights_shares": allocated_rights_shares,
+                    "subscription_price_cny": event.subscription_price_cny,
+                    "subscription_fee_cny": fee,
+                    "cash_out_cny": notional,
+                    "allocation_evidence": allocation_evidence or "EXACT_INTEGER_ENTITLEMENT",
+                }
+            return (candidate._entry(
+                operation_key, event.event_id, "RIGHTS_DECISION", day,
+                entry_type, cash_delta, (), {
+                    **details,
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "RIGHTS_DECISION", payload, mutate)
+
+    def allot_rights_shares(
+        self,
+        event: RightsOfferingEvent,
+        *,
+        as_of: date | str,
+        final_allocated_shares: int | None = None,
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, RightsOfferingEvent):
+            raise TypeError("allot_rights_shares 只接受 RightsOfferingEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.tradable_date:
+            raise ValueError("配股新股只能在公告的可流通日登记")
+        claim_id = f"rights:{event.event_id}"
+        claim = self._claims.get(claim_id)
+        if claim is None:
+            raise ValueError(f"配股权利不存在：{claim_id}")
+        shares = claim.final_allocated_shares
+        if final_allocated_shares is not None:
+            if isinstance(final_allocated_shares, bool) or not isinstance(final_allocated_shares, int):
+                raise ValueError("final_allocated_shares 必须是整数股数")
+            if shares is not None and shares != final_allocated_shares:
+                raise ValueError("最终登记股数与已确认认购股数不一致")
+            shares = final_allocated_shares
+        if shares is None or shares <= 0:
+            raise ValueError("最终配股股数未确认，不能发放可交易新股")
+        lot_id = f"rights-allotment:{event.event_id}"
+        payload = {
+            "event_id": event.event_id,
+            "claim_id": claim_id,
+            "as_of": day.isoformat(),
+            "final_allocated_shares": shares,
+            "cost_basis_cny": str(claim.cost_basis_cny),
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            current_claim = candidate._claims[claim_id]
+            if current_claim.status != "SUBSCRIBED_PENDING_ALLOTMENT":
+                raise ValueError(f"配股权利 {claim_id} 不在待登记状态")
+            if lot_id in candidate._positions:
+                raise ValueError(f"配股新股批次已存在：{lot_id}")
+            candidate._positions[lot_id] = PositionLot(
+                lot_id=lot_id,
+                symbol=event.symbol,
+                total_shares=shares,
+                sellable_shares=0,
+                cost_basis_cny=current_claim.cost_basis_cny,
+                acquired_on=event.tradable_date,
+                sellable_from=event.tradable_date,
+                source_event_id=event.event_id,
+            )
+            candidate._claims[claim_id] = replace(
+                current_claim,
+                final_allocated_shares=shares,
+                status="SETTLED",
+            )
+            return (candidate._entry(
+                operation_key, event.event_id, "RIGHTS_ALLOTMENT", event.tradable_date,
+                "RIGHTS_SHARES_ALLOTTED", Decimal("0"), ((event.symbol, shares),), {
+                    "claim_id": claim_id,
+                    "lot_id": lot_id,
+                    "shares": shares,
+                    "cost_basis_cny": current_claim.cost_basis_cny,
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "RIGHTS_ALLOTMENT", payload, mutate)
+
+    def apply_code_change(
+        self, event: CodeChangeEvent, *, as_of: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        if not isinstance(event, CodeChangeEvent):
+            raise TypeError("apply_code_change 只接受 CodeChangeEvent")
+        day = calendar_date(as_of, "as_of")
+        if day != event.effective_date:
+            raise ValueError("1:1 代码迁移只能在已登记的生效日执行")
+        payload = {
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "old_symbol": event.old_symbol,
+            "new_symbol": event.new_symbol,
+            "effective_date": event.effective_date.isoformat(),
+            "security_identity": event.security_identity,
+            "share_ratio": str(event.share_ratio),
+            "known_at_utc": event.known_at_utc.isoformat(),
+            **self._event_source_payload(event.source),
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            old_lots = [lot for lot in candidate._positions.values() if lot.symbol == event.old_symbol]
+            migrated_shares = 0
+            for lot in old_lots:
+                candidate._positions[lot.lot_id] = replace(lot, symbol=event.new_symbol)
+                migrated_shares += lot.total_shares
+            return (candidate._entry(
+                operation_key, event.event_id, "IDENTITY_MIGRATION", event.effective_date,
+                "CODE_CHANGE_1_TO_1", Decimal("0"), (
+                    (event.old_symbol, -migrated_shares), (event.new_symbol, migrated_shares)
+                ), {
+                    "security_identity": event.security_identity,
+                    "migrated_lots": len(old_lots),
+                    "migrated_shares": migrated_shares,
+                    "ratio": "1:1",
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "IDENTITY_MIGRATION", payload, mutate)
 
     def apply_fill(self, fill: TradeFill) -> tuple[LedgerEntry, ...]:
         if not isinstance(fill, TradeFill):
