@@ -12,10 +12,13 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
+import re
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +27,7 @@ from typing import Any
 
 UNIVERSE_ID = "bs-universe-20230101-20251231-v1"
 BARS_ID = "bs-bars-universe-20221201-20251231-v1"
-DEFAULT_RUN_ID = "preparation-20261029-stage0-2"
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PUBLIC_EVIDENCE = (
     "docs/evidence/universe-outdate-boundary-audit.csv",
     "docs/evidence/event-source-index.csv",
@@ -68,6 +71,33 @@ def package_version(*candidates: str) -> str | None:
         except importlib.metadata.PackageNotFoundError:
             continue
     return None
+
+
+def new_run_id(now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return "preparation-" + timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
+
+
+def create_run_directory(path: Path) -> None:
+    if ".." in path.parts or not RUN_ID_PATTERN.fullmatch(path.name):
+        raise ValueError("run-id 只能包含字母、数字、点、下划线和连字符")
+    path.mkdir(parents=True, exist_ok=False)
+
+
+def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def verify_catalog(root: Path, snapshot: Path, manifest_name: str, catalog_key: str) -> dict[str, Any]:
@@ -230,21 +260,138 @@ def verify_source_registers(root: Path) -> dict[str, Any]:
     event_index_path = evidence_root / "event-source-archive-index.json"
     event_index = read_json(event_index_path)
     event_sources = event_index.get("sources", [])
-    event_missing = [
-        item.get("event_key", "") for item in event_sources
-        if not item.get("sha256") or item["sha256"] not in local_hashes
-    ]
+    errors: list[str] = []
+    event_index_by_key: dict[str, dict[str, Any]] = {}
+    duplicate_archive_keys: list[str] = []
+    event_archive_errors: list[str] = []
+    for item in event_sources:
+        key = item.get("event_key", "")
+        if not key or key in event_index_by_key:
+            duplicate_archive_keys.append(key or "<empty>")
+        else:
+            event_index_by_key[key] = item
+        archive_file = (root / str(item.get("archive_file", ""))).resolve()
+        if not archive_file.is_relative_to(root.resolve()):
+            event_archive_errors.append(f"event archive path escapes root: {key}")
+        elif not item.get("sha256") or not archive_file.is_file():
+            event_archive_errors.append(f"event archive missing: {key}")
+        elif sha256_file(archive_file) != item["sha256"]:
+            event_archive_errors.append(f"event archive digest mismatch: {key}")
+    errors.extend(event_archive_errors)
+    if duplicate_archive_keys:
+        errors.append("duplicate/empty private event keys: " + ", ".join(duplicate_archive_keys))
+
     event_public_rows = csv_rows(root / "docs/evidence/event-source-index.csv")
-    event_public_hashes = {row.get("archived_file_sha256", "") for row in event_public_rows}
-    event_archive_hashes = {item.get("sha256", "") for item in event_sources}
-    event_register_only = sorted(event_public_hashes - event_archive_hashes - {""})
-    event_archive_only = sorted(event_archive_hashes - event_public_hashes - {""})
+    public_by_key: dict[str, dict[str, str]] = {}
+    duplicate_public_keys: list[str] = []
+    for row in event_public_rows:
+        key = row.get("event_key", "")
+        if not key or key in public_by_key:
+            duplicate_public_keys.append(key or "<empty>")
+        else:
+            public_by_key[key] = row
+    if duplicate_public_keys:
+        errors.append("duplicate/empty public event keys: " + ", ".join(duplicate_public_keys))
+
+    event_key_missing_public = sorted(set(event_index_by_key) - set(public_by_key))
+    event_key_missing_private = sorted(set(public_by_key) - set(event_index_by_key))
+    event_key_mismatches: list[str] = []
+    event_dates_in_keys: list[str] = []
+    for key in sorted(set(event_index_by_key) & set(public_by_key)):
+        source = event_index_by_key[key]
+        public = public_by_key[key]
+        mismatches = []
+        for field, source_value, public_value in (
+            ("symbol", str(source.get("symbol", "")), public.get("symbol", "")),
+            ("event_type", str(source.get("event_type", "")), public.get("event_type", "")),
+            ("url", str(source.get("url", "")), public.get("official_source_url", "")),
+            ("sha256", str(source.get("sha256", "")), public.get("archived_file_sha256", "")),
+        ):
+            if source_value != public_value:
+                mismatches.append(field)
+        for event_date in re.findall(r"20\d{2}-\d{2}-\d{2}", key):
+            registered_dates = " ".join((
+                public.get("event_date_in_key", ""),
+                public.get("expected_dates", ""),
+                public.get("observed_dates", ""),
+            ))
+            if event_date not in registered_dates:
+                mismatches.append("event_date")
+                event_dates_in_keys.append(f"{key}:{event_date}")
+        if mismatches:
+            event_key_mismatches.append(f"{key}: {','.join(mismatches)}")
+    if event_key_missing_public:
+        errors.append("private event keys missing public rows: " + ", ".join(event_key_missing_public))
+    if event_key_missing_private:
+        errors.append("public event keys missing private records: " + ", ".join(event_key_missing_private))
+    if event_key_mismatches:
+        errors.append("event-key/source mismatches: " + "; ".join(event_key_mismatches))
 
     unknown_rows = csv_rows(root / "docs/evidence/unknown-type-remaining-43-audit.csv")
+    unknown_duplicate_symbols = sorted(
+        symbol for symbol in {row.get("symbol", "") for row in unknown_rows}
+        if not symbol or sum(row.get("symbol", "") == symbol for row in unknown_rows) > 1
+    )
+    if unknown_duplicate_symbols:
+        errors.append("duplicate/empty unknown-type symbols: " + ", ".join(unknown_duplicate_symbols))
+    unknown_index_path = evidence_root / "unknown-types-remaining/source-index.json"
+    unknown_index = read_json(unknown_index_path)
+    unknown_records = unknown_index.get("sources", [])
+    unknown_by_symbol: dict[str, dict[str, Any]] = {}
+    unknown_source_ids: set[str] = set()
+    unknown_index_errors: list[str] = []
+    for source in unknown_records:
+        source_id = str(source.get("source_id", ""))
+        if not source_id or source_id in unknown_source_ids:
+            unknown_index_errors.append(f"duplicate/empty unknown source_id: {source_id or '<empty>'}")
+        unknown_source_ids.add(source_id)
+        source_path = (root / str(source.get("archive_file", ""))).resolve()
+        if not source_path.is_relative_to(root.resolve()):
+            unknown_index_errors.append(f"unknown archive path escapes root: {source_id}")
+        elif not source_path.is_file() or sha256_file(source_path) != source.get("sha256"):
+            unknown_index_errors.append(f"unknown archive missing/hash mismatch: {source_id}")
+        for symbol_record in source.get("symbols", []):
+            symbol = str(symbol_record.get("symbol", ""))
+            if not symbol or symbol in unknown_by_symbol:
+                unknown_index_errors.append(f"duplicate/empty symbol in unknown source index: {symbol or '<empty>'}")
+            else:
+                unknown_by_symbol[symbol] = {**source, **symbol_record}
+    unknown_key_mismatches: list[str] = []
+    for public in unknown_rows:
+        symbol = public.get("symbol", "")
+        indexed = unknown_by_symbol.get(symbol)
+        if indexed is None:
+            unknown_key_mismatches.append(f"{symbol}: missing source-index row")
+            continue
+        fields = (
+            ("official_source_url", "url"),
+            ("archived_source_sha256", "sha256"),
+            ("source_pdf_page", "source_pdf_page"),
+            ("instrument_name", "instrument_name"),
+            ("source_title_excerpt", "source_title_excerpt"),
+            ("member_days", "member_days"),
+            ("first_seen_date", "first_seen_date"),
+            ("last_seen_date", "last_seen_date"),
+            ("classification", "classification"),
+            ("basis", "basis"),
+        )
+        mismatch_fields = [
+            public_field for public_field, index_field in fields
+            if str(public.get(public_field, "")) != str(indexed.get(index_field, ""))
+        ]
+        if mismatch_fields:
+            unknown_key_mismatches.append(f"{symbol}: {','.join(mismatch_fields)}")
+    unknown_index_extra_symbols = sorted(set(unknown_by_symbol) - {row.get("symbol", "") for row in unknown_rows})
     unknown_missing_hashes = sorted({
         row.get("archived_source_sha256", "") for row in unknown_rows
         if row.get("archived_source_sha256") and row["archived_source_sha256"] not in local_hashes
     })
+    if unknown_index_errors:
+        errors.extend(unknown_index_errors)
+    if unknown_key_mismatches:
+        errors.append("unknown-type symbol/source mismatches: " + "; ".join(unknown_key_mismatches))
+    if unknown_index_extra_symbols:
+        errors.append("extra symbols in private unknown source index: " + ", ".join(unknown_index_extra_symbols))
 
     fee_rows = csv_rows(root / "docs/evidence/market-fee-evidence.csv")
     fee_hash_fields = ("primary_source_sha256", "corroborating_source_sha256")
@@ -252,20 +399,39 @@ def verify_source_registers(root: Path) -> dict[str, Any]:
         row[field] for row in fee_rows for field in fee_hash_fields if row.get(field)
     }
     fee_unarchived_hashes = sorted(value for value in fee_populated_hashes if value not in local_hashes)
+    if unknown_missing_hashes:
+        errors.append("unknown-type evidence SHA not found locally: " + ", ".join(unknown_missing_hashes))
+    if fee_unarchived_hashes:
+        errors.append("fee evidence SHA not found locally: " + ", ".join(fee_unarchived_hashes))
 
     return {
         "event_archive_index": event_index_path.relative_to(root).as_posix(),
         "event_archive_index_sha256": sha256_file(event_index_path),
         "event_archive_source_count": len(event_sources),
-        "event_archived_sources_missing_or_hash_mismatched": event_missing,
+        "event_archive_errors": event_archive_errors,
+        "event_archived_sources_missing_or_hash_mismatched": event_archive_errors,
         "public_event_rows": len(event_public_rows),
-        "event_hashes_only_in_public_register": event_register_only,
-        "event_hashes_only_in_private_archive_index": event_archive_only,
+        "duplicate_archive_event_keys": sorted(duplicate_archive_keys),
+        "duplicate_public_event_keys": sorted(duplicate_public_keys),
+        "event_keys_missing_public_rows": event_key_missing_public,
+        "event_keys_missing_private_records": event_key_missing_private,
+        "event_key_source_mismatches": event_key_mismatches,
+        "event_dates_missing_from_register": sorted(set(event_dates_in_keys)),
+        "duplicate_unknown_type_symbols": unknown_duplicate_symbols,
         "unknown_43_public_rows": len(unknown_rows),
+        "unknown_source_index": unknown_index_path.relative_to(root).as_posix(),
+        "unknown_source_index_sha256": sha256_file(unknown_index_path),
+        "unknown_source_index_source_count": len(unknown_records),
+        "unknown_source_index_symbol_count": len(unknown_by_symbol),
+        "unknown_source_index_errors": unknown_index_errors,
+        "unknown_symbol_source_mismatches": unknown_key_mismatches,
+        "extra_symbols_in_unknown_source_index": unknown_index_extra_symbols,
         "unknown_source_hashes_missing_from_local_archive": unknown_missing_hashes,
         "fee_evidence_rows": len(fee_rows),
         "fee_source_hashes_populated": len(fee_populated_hashes),
         "fee_source_hashes_not_locally_archived": fee_unarchived_hashes,
+        "errors": errors,
+        "ok": not errors,
         "user_signoff_pending": True,
     }
 
@@ -273,12 +439,19 @@ def verify_source_registers(root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
+    parser.add_argument("--run-id", help="唯一运行 ID；默认自动生成 UTC 时间戳 ID")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     root = args.root.expanduser().resolve()
-    output_dir = (args.output_dir or root / "data/private/audits" / args.run_id).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir is None:
+        run_id = args.run_id or new_run_id()
+        output_dir = (root / "data/private/audits" / run_id).resolve()
+    else:
+        output_dir = args.output_dir.expanduser().resolve()
+        run_id = args.run_id or output_dir.name
+        if run_id != output_dir.name:
+            raise ValueError("指定 --output-dir 时，run-id 必须与目录名一致")
+    create_run_directory(output_dir)
 
     universe = root / "data/private/universes" / UNIVERSE_ID
     bars = root / "data/private/snapshots" / BARS_ID
@@ -308,7 +481,10 @@ def main() -> int:
     ]
     integrity["ok"] = all(integrity_checks)
     integrity_path = output_dir / "snapshot-integrity.json"
-    integrity_path.write_text(json.dumps(integrity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(
+        integrity_path,
+        json.dumps(integrity, ensure_ascii=False, indent=2) + "\n",
+    )
 
     unknown_path = root / "data/private/audits/preparation-20261029/unknown-types.csv"
     unknown_summary_path = unknown_path.with_suffix(unknown_path.suffix + ".summary.json")
@@ -352,6 +528,7 @@ def main() -> int:
         "data/private/audits/preparation-20261029/universe-audit-v3/daily_price_coverage.csv",
         "data/private/audits/preparation-20261029/universe-audit-v3/universe_price_discrepancies.csv",
         "data/private/evidence/preparation-20261029/event-source-archive-index.json",
+        "data/private/evidence/preparation-20261029/unknown-types-remaining/source-index.json",
     )
     missing_input_paths = [relative for relative in input_paths if not (root / relative).is_file()]
     input_file_hashes = {
@@ -360,17 +537,11 @@ def main() -> int:
         if (root / relative).is_file()
     }
     input_hashes_complete = not missing_input_paths
-    source_registers_ok = not any((
-        source_registers["event_archived_sources_missing_or_hash_mismatched"],
-        source_registers["event_hashes_only_in_public_register"],
-        source_registers["event_hashes_only_in_private_archive_index"],
-        source_registers["unknown_source_hashes_missing_from_local_archive"],
-        source_registers["fee_source_hashes_not_locally_archived"],
-    ))
+    source_registers_ok = source_registers["ok"]
     status = git_value(root, "status", "--porcelain")
     run = {
         "schema_version": 1,
-        "run_id": args.run_id,
+        "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "scope": "private snapshot manifest verification and stage 0-2 evidence refresh; no backtest, no strategy change, no personal trading plan",
         "git": {
@@ -441,9 +612,9 @@ def main() -> int:
         ],
     }
     run_path = output_dir / "run-manifest.json"
-    run_path.write_text(json.dumps(run, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(run_path, json.dumps(run, ensure_ascii=False, indent=2) + "\n")
     digest = sha256_file(run_path)
-    (output_dir / "run-manifest.sha256").write_text(f"{digest}  {run_path.name}\n", encoding="ascii")
+    atomic_write_text(output_dir / "run-manifest.sha256", f"{digest}  {run_path.name}\n", encoding="ascii")
 
     preparation_checks_ok = (
         integrity["ok"]

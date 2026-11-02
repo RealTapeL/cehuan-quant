@@ -87,11 +87,10 @@ uv run cehuan universe-audit \
 可在持有 `data/private/` 的机器上重建本轮私有运行清单，并重新校验股票池/行情 manifest 中的文件、只读备份、未知类型分类分区及公告来源散列：
 
 ```bash
-uv run python scripts/audit_preparation_inputs.py \
-  --run-id preparation-20261029-stage0-2
+uv run python scripts/audit_preparation_inputs.py
 ```
 
-工具只读取原始快照和证据原件；新报告写入 `data/private/audits/<run-id>/`，包括 `snapshot-integrity.json`、`run-manifest.json` 和清单散列。它不提交行情、账户资料或原始公告，不运行回测。`run-manifest.json` 记录生成时的 Git 提交和工作区状态；如报告生成后提交代码，应重新运行一次，让清单绑定最终提交。
+工具默认生成 UTC 时间戳 run-id，只读取原始快照和证据原件；新报告写入 `data/private/audits/<run-id>/`，包括 `snapshot-integrity.json`、`run-manifest.json` 和清单散列。已有目录会被拒绝，不覆盖旧结果。它不提交行情、账户资料或原始公告，不运行回测。`run-manifest.json` 记录生成时的 Git 提交和工作区状态；如报告生成后提交代码，应重新运行一次，让清单绑定最终提交。
 
 ## 阻断项与验收
 
