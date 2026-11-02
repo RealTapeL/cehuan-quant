@@ -43,6 +43,7 @@ development_fraction = 0.60
 validation_fraction = 0.20
 rolling_window_sessions = 60
 rolling_step_sessions = 20
+max_stale_price_age_sessions = 0
 
 [plan]
 cash_cny = 0.0

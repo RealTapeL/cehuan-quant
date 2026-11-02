@@ -124,6 +124,57 @@ def test_ledger_shadow_rejects_events_and_formal_mode():
         )
 
 
+def test_ledger_v2_uses_accounting_ledger_as_state_source_for_research_fills():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars()
+    data["symbol"] = data["symbol"].replace({"SIM001": "SZ000001", "SIM002": "SZ000002"})
+    legacy = run_backtest(
+        data, 100_000, config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+    )
+    ledger_result = run_backtest(
+        data, 100_000, config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+    )
+
+    assert ledger_result["metrics"]["accounting_mode"] == "ledger_v2"
+    assert ledger_result["metrics"]["result_type"] == "research_backtest_not_simulated_or_real_account"
+    assert ledger_result["trades"][['trade_date', 'symbol', 'side', 'quantity']].equals(
+        legacy["trades"][['trade_date', 'symbol', 'side', 'quantity']]
+    )
+    assert (ledger_result["equity_curve"]["equity_cny"] - legacy["equity_curve"]["equity_cny"]).abs().max() <= 0.01
+    assert (ledger_result["equity_curve"]["cash_cny"] - legacy["equity_curve"]["cash_cny"]).abs().max() <= 0.01
+    assert len(ledger_result["accounting_journal"]) == len(ledger_result["trades"])
+    assert sum(lot.total_shares for lot in ledger_result["accounting_snapshot"].positions) == int(
+        ledger_result["open_positions"]["shares"].sum()
+    )
+
+
+def test_ledger_v2_stops_on_missing_held_price_unless_stale_age_is_configured():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars()
+    data["symbol"] = data["symbol"].replace({"SIM001": "SZ000001", "SIM002": "SZ000002"})
+    missing_day = sorted(data["trade_date"].unique())[8]
+    data = data.loc[~((data["symbol"] == "SZ000001") & (data["trade_date"] == missing_day))].copy()
+    kwargs = {
+        "security_identity_events": pd.DataFrame(),
+        "corporate_actions": pd.DataFrame(),
+        "accounting_mode": "ledger_v2",
+    }
+
+    with pytest.raises(ValueError, match="无法计算可信 NAV"):
+        run_backtest(data, 100_000, config, **kwargs)
+
+    config["backtest"]["max_stale_price_age_sessions"] = 1
+    result = run_backtest(data, 100_000, config, **kwargs)
+    assert result["metrics"]["valuation_max_stale_age_sessions"] == 1
+
+
 def test_backtest_reports_ordered_development_validation_test_periods() -> None:
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})

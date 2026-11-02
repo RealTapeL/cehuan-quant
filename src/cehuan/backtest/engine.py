@@ -7,6 +7,7 @@ import subprocess
 import uuid
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from cehuan import __version__
+from cehuan.accounting import FeeItem, PortfolioLedger, PriceMark, TradeFill
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
@@ -260,14 +262,14 @@ def run_backtest(
     """
     started = time.perf_counter()
     accounting_mode = str(accounting_mode).strip().lower()
-    if accounting_mode not in {"legacy", "ledger_shadow"}:
-        raise ValueError("accounting_mode 只能是 legacy 或 ledger_shadow")
+    if accounting_mode not in {"legacy", "ledger_shadow", "ledger_v2"}:
+        raise ValueError("accounting_mode 只能是 legacy、ledger_shadow 或 ledger_v2")
     if formal and accounting_mode != "legacy":
-        raise ValueError("ledger_shadow 只是诊断旁路，不能用于 formal=True 的正式基线")
-    if accounting_mode == "ledger_shadow" and not isinstance(corporate_actions, pd.DataFrame):
-        raise ValueError("ledger_shadow 仅接受显式空 identity_events 与 corporate_actions 输入")
-    if accounting_mode == "ledger_shadow" and not isinstance(security_identity_events, pd.DataFrame):
-        raise ValueError("ledger_shadow 仅接受显式空 identity_events 与 corporate_actions 输入")
+        raise ValueError("ledger 诊断模式尚未通过正式门控，不能用于 formal=True 的正式基线")
+    if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(corporate_actions, pd.DataFrame):
+        raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
+    if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(security_identity_events, pd.DataFrame):
+        raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if initial_cash_cny <= 0:
         raise ValueError("回测资金必须大于 0；请显式传入演示或研究资金")
     data = normalize_bar_frame(
@@ -373,13 +375,16 @@ def run_backtest(
     rebalance_sessions = int(strategy["rebalance_sessions"])
     if rebalance_sessions < 1:
         raise ValueError("rebalance_sessions 必须大于 0")
+    max_stale_price_age = config.get("backtest", {}).get("max_stale_price_age_sessions", 0)
+    if isinstance(max_stale_price_age, bool) or not isinstance(max_stale_price_age, int) or max_stale_price_age < 0:
+        raise ValueError("backtest.max_stale_price_age_sessions 必须是非负整数")
 
     identity_events = normalize_security_identity_events(security_identity_events)
     action_events = normalize_corporate_actions(
         read_corporate_actions() if corporate_actions is None else corporate_actions
     )
-    if accounting_mode == "ledger_shadow" and (not identity_events.empty or not action_events.empty):
-        raise ValueError("ledger_shadow 当前仅支持无身份变更、无公司行动区间")
+    if accounting_mode in {"ledger_shadow", "ledger_v2"} and (not identity_events.empty or not action_events.empty):
+        raise ValueError("当前 ledger 诊断模式仅支持无身份变更、无公司行动区间")
     symbols_in_data = set(data["symbol"].astype(str).unique())
     if not identity_events.empty:
         identity_events = identity_events.loc[
@@ -393,6 +398,9 @@ def run_backtest(
     day_starts = np.concatenate(([0], boundaries))
     day_ends = np.concatenate((boundaries, [len(data)]))
     dates = [data.iloc[start]["trade_date"] for start in day_starts]
+    date_session_index = {
+        pd.Timestamp(value).strftime("%Y-%m-%d"): index for index, value in enumerate(dates)
+    }
     if len(dates) <= lookback + 1:
         raise ValueError(f"至少需要 {lookback + 2} 个交易日，当前只有 {len(dates)} 天")
 
@@ -401,6 +409,28 @@ def run_backtest(
     cost_basis_cny: dict[str, float] = {}
     holding_since: dict[str, str] = {}
     last_prices: dict[str, float] = {}
+    last_price_dates: dict[str, str] = {}
+    last_price_sources: dict[str, str] = {}
+    execution_ledger = (
+        PortfolioLedger(Decimal(str(initial_cash_cny)), portfolio_id="backtest-ledger-v2")
+        if accounting_mode == "ledger_v2" else None
+    )
+
+    def sync_projection_from_ledger() -> None:
+        nonlocal cash
+        if execution_ledger is None:
+            return
+        cash = float(execution_ledger.cash_cny)
+        holdings.clear()
+        cost_basis_cny.clear()
+        holding_since.clear()
+        for lot in execution_ledger.positions:
+            holdings[lot.symbol] = holdings.get(lot.symbol, 0) + lot.total_shares
+            cost_basis_cny[lot.symbol] = cost_basis_cny.get(lot.symbol, 0.0) + float(lot.cost_basis_cny)
+            acquired = lot.acquired_on.isoformat()
+            previous = holding_since.get(lot.symbol)
+            holding_since[lot.symbol] = min(previous, acquired) if previous else acquired
+
     pending_targets: dict[str, float] | None = None
     transition_signal_ready_index: dict[str, int] = {}
     equity_rows: list[dict[str, Any]] = []
@@ -544,15 +574,30 @@ def run_backtest(
                 fill_price = reference * (1.0 - slippage)
                 notional = quantity * fill_price
                 fees = _fees(notional, "SELL", costs)
-                allocated_basis = cost_basis_cny.get(symbol, 0.0) * quantity / current if current else 0.0
-                realized_pnl = notional - fees - allocated_basis
                 acquisition_date = holding_since.get(symbol, "")
-                cash += notional - fees
-                holdings[symbol] = current - quantity
-                cost_basis_cny[symbol] = max(0.0, cost_basis_cny.get(symbol, 0.0) - allocated_basis)
+                if execution_ledger is None:
+                    allocated_basis = cost_basis_cny.get(symbol, 0.0) * quantity / current if current else 0.0
+                    realized_pnl = notional - fees - allocated_basis
+                    cash += notional - fees
+                    holdings[symbol] = current - quantity
+                    cost_basis_cny[symbol] = max(0.0, cost_basis_cny.get(symbol, 0.0) - allocated_basis)
+                else:
+                    (entry,) = execution_ledger.apply_fill(TradeFill(
+                        fill_id=f"bt-{day_date}-{symbol}-SELL-{len(trades):08d}",
+                        trade_date=day_date,
+                        symbol=symbol,
+                        side="SELL",
+                        quantity=quantity,
+                        price_cny=Decimal(str(fill_price)),
+                        fees=(FeeItem("aggregate_fees", Decimal(str(fees))),),
+                    ))
+                    entry_details = dict(entry.details)
+                    allocated_basis = float(Decimal(entry_details["allocated_cost_basis_cny"]))
+                    realized_pnl = float(Decimal(entry_details["realized_pnl_cny"]))
+                    sync_projection_from_ledger()
                 total_turnover += notional
                 trades.append({"trade_date": day_date, "symbol": symbol, "side": "SELL", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": allocated_basis, "realized_pnl_cny": realized_pnl, "holding_since": acquisition_date, "reason": "目標排名/權重調整；次交易日開盤模擬"})
-                if holdings[symbol] <= 0:
+                if holdings.get(symbol, 0) <= 0:
                     holdings.pop(symbol, None)
                     cost_basis_cny.pop(symbol, None)
                     holding_since.pop(symbol, None)
@@ -582,7 +627,14 @@ def run_backtest(
                 while quantity >= minimum:
                     notional = quantity * fill_price
                     fees = _fees(notional, "BUY", costs)
-                    if notional + fees <= cash:
+                    if execution_ledger is None:
+                        cash_sufficient = notional + fees <= cash
+                    else:
+                        cash_sufficient = (
+                            Decimal(str(fill_price)) * quantity + Decimal(str(fees))
+                            <= execution_ledger.cash_cny
+                        )
+                    if cash_sufficient:
                         break
                     quantity -= step
                 if quantity < minimum:
@@ -590,10 +642,23 @@ def run_backtest(
                     continue
                 notional = quantity * fill_price
                 fees = _fees(notional, "BUY", costs)
-                cash -= notional + fees
-                holdings[symbol] = current + quantity
-                cost_basis_cny[symbol] = cost_basis_cny.get(symbol, 0.0) + notional + fees
-                holding_since.setdefault(symbol, day_date)
+                if execution_ledger is None:
+                    cash -= notional + fees
+                    holdings[symbol] = current + quantity
+                    cost_basis_cny[symbol] = cost_basis_cny.get(symbol, 0.0) + notional + fees
+                    holding_since.setdefault(symbol, day_date)
+                else:
+                    execution_ledger.apply_fill(TradeFill(
+                        fill_id=f"bt-{day_date}-{symbol}-BUY-{len(trades):08d}",
+                        trade_date=day_date,
+                        symbol=symbol,
+                        side="BUY",
+                        quantity=quantity,
+                        price_cny=Decimal(str(fill_price)),
+                        fees=(FeeItem("aggregate_fees", Decimal(str(fees))),),
+                        sellable_from=dates[index + 1],
+                    ))
+                    sync_projection_from_ledger()
                 total_turnover += notional
                 trades.append({"trade_date": day_date, "symbol": symbol, "side": "BUY", "quantity": quantity, "reference_price": reference, "estimated_fill_price": fill_price, "notional_cny": notional, "fees_cny": fees, "allocated_cost_basis_cny": 0.0, "realized_pnl_cny": pd.NA, "holding_since": holding_since[symbol], "reason": "收盤排名入選；次交易日開盤模擬"})
             pending_targets = None
@@ -602,7 +667,33 @@ def run_backtest(
             row = day.loc[symbol] if symbol in day.index else None
             if row is not None and pd.notna(row["close"]) and float(row["close"]) > 0:
                 last_prices[symbol] = float(row["close"])
-        equity = cash + sum(shares * last_prices.get(symbol, 0.0) for symbol, shares in holdings.items())
+                last_price_dates[symbol] = day_date
+                last_price_sources[symbol] = str(row.get("data_source", "normalized_input_bars"))
+        if execution_ledger is None:
+            equity = cash + sum(shares * last_prices.get(symbol, 0.0) for symbol, shares in holdings.items())
+        else:
+            prices: dict[str, PriceMark] = {}
+            for symbol in {lot.symbol for lot in execution_ledger.positions}:
+                if symbol not in last_prices or symbol not in last_price_dates:
+                    continue
+                quote_date = last_price_dates[symbol]
+                prices[symbol] = PriceMark(
+                    price_cny=Decimal(str(last_prices[symbol])),
+                    price_date=quote_date,
+                    source=last_price_sources.get(symbol, "normalized_input_bars"),
+                    age_sessions=max(0, index - date_session_index[quote_date]),
+                )
+            nav = execution_ledger.mark_to_market(
+                day_date,
+                prices,
+                max_stale_age_sessions=max_stale_price_age,
+            )
+            if nav.status != "VALUED" or nav.nav_cny is None:
+                raise ValueError(
+                    f"ledger_v2 在 {day_date} 无法计算可信 NAV：" + "；".join(nav.reasons)
+                )
+            equity = float(nav.nav_cny)
+            sync_projection_from_ledger()
         equity_rows.append({"trade_date": day_date, "equity_cny": equity, "cash_cny": cash, "holdings_count": len(holdings)})
 
         if index >= lookback and (index - lookback) % rebalance_sessions == 0 and index + 1 < len(dates):
@@ -828,4 +919,25 @@ def run_backtest(
         result["metrics"]["accounting_mode"] = "ledger_shadow"
         result["metrics"]["accounting_shadow_status"] = shadow["status"]
         result["metrics"]["accounting_shadow_result_type"] = shadow["result_type"]
+    elif accounting_mode == "ledger_v2":
+        assert execution_ledger is not None
+        execution_ledger.assert_invariants()
+        result["accounting_journal"] = pd.DataFrame([
+            {
+                "entry_id": entry.entry_id,
+                "operation_key": entry.operation_key,
+                "event_id": entry.event_id,
+                "phase": entry.phase,
+                "booking_date": entry.booking_date.isoformat(),
+                "entry_type": entry.entry_type,
+                "cash_delta_cny": entry.cash_delta_cny,
+                "position_deltas": entry.position_deltas,
+                "details": dict(entry.details),
+            }
+            for entry in execution_ledger.journal
+        ])
+        result["accounting_snapshot"] = execution_ledger.snapshot()
+        result["metrics"]["accounting_mode"] = "ledger_v2"
+        result["metrics"]["accounting_result_type"] = "ledger_state_source_research_diagnostic_not_formal"
+        result["metrics"]["valuation_max_stale_age_sessions"] = max_stale_price_age
     return result

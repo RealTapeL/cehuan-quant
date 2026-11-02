@@ -18,7 +18,9 @@
 
 来源模型只校验登记字段和 SHA-256 格式，不会打开公告 URL 或本地 PDF 验证内容，也没有事件 CSV 适配器。`ShareSwapMergerEvent` 可登记 2025 年 `SH601989 → SH600150` 事件所需的各日期和来源，但仓库里的真实 CSV 尚未通过适配器载入本账本；实际账户获配数量和可信每日权利估值仍须由账户/结算证据提供。`DelistingEvent` 的现金结算和未估值权利分支目前仅有合成测试。
 
-`run_backtest(accounting_mode="ledger_shadow")` 已提供一个**受限影子回放**：要求调用者显式提供空的身份事件表和公司行动表；先运行现有引擎，再把它产生的成交回放到新账本，逐日对照现金、持仓标的数和 NAV。它不替换旧引擎状态、不接受正式运行，并允许与旧引擎相同的窗口内旧收盘价延用，只用于算术对照。只有输出 `MATCHED` 才表示该次无公司行动回放在一分钱容差内对齐；这不验证策略、撮合或历史数据质量。
+`run_backtest(accounting_mode="ledger_shadow")` 提供**受限影子回放**：调用者需显式提供空的身份事件表和公司行动表；先运行现有引擎，再将成交回放到账本，逐日对照现金、持仓标的数和 NAV。它不替换旧引擎状态、不接受正式运行，并允许窗口内旧收盘价延用，只用于算术对照。输出 `MATCHED` 表示该次无公司行动回放在一分钱容差内对齐；这不验证策略、撮合或历史数据质量。
+
+`run_backtest(accounting_mode="ledger_v2")` 可在同样的“无身份变更、无公司行动”限制下，让账本作为研究成交后的现金、持仓批次与成本基础状态源；策略排序和订单约束仍沿用现有研究规则，日终估值必须满足 `backtest.max_stale_price_age_sessions`，默认值为 0。任一持仓在允许滞后范围内没有价格时运行会停止。此模式仍是研究诊断，费用仍作为一个合计项入账，不消费有效日期规则或历史费率，且不能设置 `formal=True`。
 
 公司行动账本操作仍未成为 `run_backtest()` 的主执行状态源，也未接入日历驱动调度器或正式 readiness 路径；持仓变化后公司行动追踪、真实事件输入覆盖、历史规则和费用接入仍未完成。当前 `baseline_ready` 不因此改变，不能据此发布新的回测绩效或声称正式基线已就绪。
 
@@ -26,7 +28,7 @@
 
 ```bash
 uv run pytest -q tests/test_accounting_ledger.py tests/test_accounting_actions.py
-uv run pytest -q tests/test_core_workflow.py -k ledger_shadow
+uv run pytest -q tests/test_core_workflow.py -k 'ledger_shadow or ledger_v2'
 ```
 
 ## 目标与口径
