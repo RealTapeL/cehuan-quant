@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from cehuan import __version__
+from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
 from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
@@ -249,6 +250,7 @@ def run_backtest(
     evaluation_start: str | None = None,
     evaluation_end: str | None = None,
     readiness_context: dict[str, str | Path] | None = None,
+    accounting_mode: str = "legacy",
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -257,6 +259,15 @@ def run_backtest(
     research fallbacks), fees, and conservative price-limit checks.
     """
     started = time.perf_counter()
+    accounting_mode = str(accounting_mode).strip().lower()
+    if accounting_mode not in {"legacy", "ledger_shadow"}:
+        raise ValueError("accounting_mode 只能是 legacy 或 ledger_shadow")
+    if formal and accounting_mode != "legacy":
+        raise ValueError("ledger_shadow 只是诊断旁路，不能用于 formal=True 的正式基线")
+    if accounting_mode == "ledger_shadow" and not isinstance(corporate_actions, pd.DataFrame):
+        raise ValueError("ledger_shadow 仅接受显式空 identity_events 与 corporate_actions 输入")
+    if accounting_mode == "ledger_shadow" and not isinstance(security_identity_events, pd.DataFrame):
+        raise ValueError("ledger_shadow 仅接受显式空 identity_events 与 corporate_actions 输入")
     if initial_cash_cny <= 0:
         raise ValueError("回测资金必须大于 0；请显式传入演示或研究资金")
     data = normalize_bar_frame(
@@ -367,6 +378,8 @@ def run_backtest(
     action_events = normalize_corporate_actions(
         read_corporate_actions() if corporate_actions is None else corporate_actions
     )
+    if accounting_mode == "ledger_shadow" and (not identity_events.empty or not action_events.empty):
+        raise ValueError("ledger_shadow 当前仅支持无身份变更、无公司行动区间")
     symbols_in_data = set(data["symbol"].astype(str).unique())
     if not identity_events.empty:
         identity_events = identity_events.loc[
@@ -780,7 +793,7 @@ def run_backtest(
         "quality_warnings": quality["warnings"],
         "limitations": limitations,
     })
-    return {
+    result = {
         "metrics": metrics,
         "equity_curve": curve,
         "trades": pd.DataFrame(trades, columns=["trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price", "notional_cny", "fees_cny", "allocated_cost_basis_cny", "realized_pnl_cny", "holding_since", "reason"]),
@@ -797,3 +810,22 @@ def run_backtest(
             for symbol, shares in sorted(holdings.items())
         ], columns=["symbol", "shares", "cost_basis_cny", "average_cost_cny", "holding_since"]),
     }
+    if accounting_mode == "ledger_shadow":
+        shadow = run_accounting_shadow(
+            initial_cash_cny=initial_cash_cny,
+            trades=result["trades"],
+            bars=data,
+            equity_curve=curve,
+            open_positions=result["open_positions"],
+        )
+        result["accounting_daily_comparison"] = shadow["daily_comparison"]
+        result["accounting_journal"] = shadow["journal"]
+        result["accounting_snapshot"] = shadow["snapshot"]
+        result["accounting_shadow"] = {
+            key: value for key, value in shadow.items()
+            if key not in {"daily_comparison", "journal", "snapshot"}
+        }
+        result["metrics"]["accounting_mode"] = "ledger_shadow"
+        result["metrics"]["accounting_shadow_status"] = shadow["status"]
+        result["metrics"]["accounting_shadow_result_type"] = shadow["result_type"]
+    return result

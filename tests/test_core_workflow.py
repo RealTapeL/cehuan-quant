@@ -80,6 +80,50 @@ def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
     assert (result["trades"].loc[result["trades"]["side"] == "BUY", "quantity"] % 100 == 0).all()
 
 
+def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars()
+    data["symbol"] = data["symbol"].replace({"SIM001": "SZ000001", "SIM002": "SZ000002"})
+    result = run_backtest(
+        data, 100_000, config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_shadow",
+    )
+
+    shadow = result["accounting_shadow"]
+    assert shadow["status"] == "MATCHED"
+    assert shadow["fills_replayed"] == result["metrics"]["trade_count"]
+    assert result["metrics"]["accounting_mode"] == "ledger_shadow"
+    assert set(result["accounting_daily_comparison"]["status"]) == {"MATCHED"}
+    assert result["accounting_daily_comparison"]["cash_delta_cny"].abs().max() <= 0.01
+    assert result["accounting_daily_comparison"]["equity_delta_cny"].abs().max() <= 0.01
+    assert len(result["accounting_journal"]) == shadow["fills_replayed"]
+
+
+def test_ledger_shadow_rejects_events_and_formal_mode():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    events = read_security_identity_events()
+
+    with pytest.raises(ValueError, match="无身份变更、无公司行动"):
+        run_backtest(
+            _code_change_bars(), 100_000, config,
+            security_identity_events=events,
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_shadow",
+        )
+    with pytest.raises(ValueError, match="不能用于 formal"):
+        run_backtest(
+            bars(), 100_000, config,
+            security_identity_events=pd.DataFrame(),
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_shadow",
+            formal=True,
+        )
+
+
 def test_backtest_reports_ordered_development_validation_test_periods() -> None:
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
