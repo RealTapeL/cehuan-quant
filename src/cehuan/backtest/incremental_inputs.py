@@ -89,6 +89,14 @@ def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, A
         raise ValueError(f"{label}.checkpoint.applied_increment_sha256s 必须是数组")
     for index, item in enumerate(increment_hashes):
         _sha(item, f"{label}.checkpoint.applied_increment_sha256s[{index}]")
+    input_hashes = checkpoint.get("input_hashes")
+    if input_hashes is not None:
+        if not isinstance(input_hashes, Mapping):
+            raise ValueError(f"{label}.checkpoint.input_hashes 必须是对象")
+        for field, item in input_hashes.items():
+            if item is None and field in {"market_rules_sha256", "fee_schedule_sha256"}:
+                continue
+            _sha(item, f"{label}.checkpoint.input_hashes.{field}")
     for field in ("strategy_config_sha256", "historical_bars_prefix_sha256"):
         _sha(inputs.get(field), f"{label}.inputs.{field}")
     events = _unique_rows(inputs.get("events"), "event_id", f"{label}.inputs.events")
@@ -117,8 +125,69 @@ def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, A
     return dict(checkpoint), dict(inputs)
 
 
+def validate_incremental_proof(proof: Any, label: str = "proof") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the proof schema without asserting that it binds real inputs."""
+    return _validate_proof(proof, label)
+
+
 def _row_fingerprint(row: Mapping[str, Any], field: str, label: str) -> str:
     return _sha(row.get(field), f"{label}.{field}")
+
+
+def _canonical_digest(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    encoded = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _event_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
+    try:
+        known_at: Any = _instant(row.get("known_at_utc"), f"{label}.known_at_utc").isoformat()
+    except ValueError:
+        known_at = f"UNVERIFIED:{row.get('known_at_utc')}"
+    try:
+        impact: Any = _day(row.get("first_impact_date"), f"{label}.first_impact_date").isoformat()
+    except ValueError:
+        impact = f"UNVERIFIED:{row.get('first_impact_date')}"
+    try:
+        source_sha: Any = _sha(row.get("source_sha256"), f"{label}.source_sha256")
+    except ValueError:
+        source_sha = f"UNVERIFIED:{row.get('source_sha256')}"
+    identity = tuple(
+        (field, str(row.get(field, "")).strip())
+        for field in ("event_type", "symbol", "old_symbol", "new_symbol", "security_identity")
+        if field in row
+    )
+    return known_at, impact, source_sha, identity
+
+
+def _schedule_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
+    try:
+        valid_from: Any = _day(row.get("valid_from"), f"{label}.valid_from").isoformat()
+    except ValueError:
+        valid_from = f"UNVERIFIED:{row.get('valid_from')}"
+    valid_to_raw = row.get("valid_to")
+    try:
+        valid_to: Any = None if valid_to_raw in {None, ""} else _day(valid_to_raw, f"{label}.valid_to").isoformat()
+    except ValueError:
+        valid_to = f"UNVERIFIED:{valid_to_raw}"
+    known_raw = row.get("known_at_utc")
+    try:
+        known_at: Any = None if known_raw in {None, ""} else _instant(known_raw, f"{label}.known_at_utc").isoformat()
+    except ValueError:
+        known_at = f"UNVERIFIED:{known_raw}"
+    source_raw = row.get("source_sha256")
+    try:
+        source_sha: Any = None if source_raw in {None, ""} else _sha(source_raw, f"{label}.source_sha256")
+    except ValueError:
+        source_sha = f"UNVERIFIED:{source_raw}"
+    identity = tuple(
+        (field, str(row.get(field, "")).strip())
+        for field in ("symbol", "market", "board")
+        if field in row
+    )
+    return valid_from, valid_to, known_at, source_sha, identity
 
 
 def _increment_digest(additions: Mapping[str, Any]) -> str:
@@ -127,7 +196,10 @@ def _increment_digest(additions: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof: Mapping[str, Any]) -> dict[str, Any]:
+def audit_incremental_inputs(
+    baseline_proof: Mapping[str, Any],
+    candidate_proof: Mapping[str, Any],
+) -> dict[str, Any]:
     """Compare two proofs without making an engine continuation executable.
 
     A clean report means only that the candidate input set satisfies this
@@ -142,6 +214,8 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
     ):
         if base_cp[field] != candidate_cp[field]:
             raise ValueError(f"baseline 与 candidate checkpoint.{field} 不一致")
+    if base_cp.get("input_hashes") != candidate_cp.get("input_hashes"):
+        raise ValueError("baseline 与 candidate checkpoint.input_hashes 不一致")
     as_of = _day(base_cp["as_of_date"], "checkpoint.as_of_date")
     cutoff = _instant(base_cp["decision_cutoff_utc"], "checkpoint.decision_cutoff_utc")
     blockers: list[dict[str, str]] = []
@@ -164,6 +238,86 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
     # Existing events are immutable. Only an event with a new ID can be a candidate append.
     base_events = _unique_rows(base["events"], "event_id", "baseline.events")
     current_events = _unique_rows(current["events"], "event_id", "candidate.events")
+    canonical_content_failed = False
+    canonical_content_unverified = False
+
+    def verify_canonical_row(row: Mapping[str, Any], label: str, family: str) -> str:
+        declared = _row_fingerprint(row, "content_sha256", label)
+        observed = _canonical_digest(row.get("canonical_content"))
+        if observed is None:
+            return "UNVERIFIED"
+        if observed != declared:
+            return "HASH_MISMATCH"
+        try:
+            if family == "event":
+                metadata = _event_metadata(row, label)
+                canonical = row["canonical_content"]
+                if canonical.get("event_id") != row.get("event_id"):
+                    return "METADATA_MISMATCH"
+                expected = (
+                    _instant(canonical.get("known_at_utc"), f"{label}.canonical_content.known_at_utc").isoformat(),
+                    _day(canonical.get("first_impact_date"), f"{label}.canonical_content.first_impact_date").isoformat(),
+                    _sha(canonical.get("source_sha256"), f"{label}.canonical_content.source_sha256"),
+                    tuple(
+                        (field, str(canonical.get(field, "")).strip())
+                        for field in ("event_type", "symbol", "old_symbol", "new_symbol", "security_identity")
+                        if field in canonical
+                    ),
+                )
+            else:
+                metadata = _schedule_metadata(row, label)
+                canonical = row["canonical_content"]
+                if canonical.get("row_id") != row.get("row_id"):
+                    return "METADATA_MISMATCH"
+                expected = (
+                    _day(canonical.get("valid_from"), f"{label}.canonical_content.valid_from").isoformat(),
+                    None if canonical.get("valid_to") in {None, ""} else _day(canonical["valid_to"], f"{label}.canonical_content.valid_to").isoformat(),
+                    None if canonical.get("known_at_utc") in {None, ""} else _instant(canonical["known_at_utc"], f"{label}.canonical_content.known_at_utc").isoformat(),
+                    None if canonical.get("source_sha256") in {None, ""} else _sha(canonical["source_sha256"], f"{label}.canonical_content.source_sha256"),
+                    tuple(
+                        (field, str(canonical.get(field, "")).strip())
+                        for field in ("symbol", "market", "board")
+                        if field in canonical
+                    ),
+                )
+        except (ValueError, KeyError, TypeError):
+            return "METADATA_MISMATCH"
+        if metadata != expected:
+            return "METADATA_MISMATCH"
+
+        # The canonical payload must also contain every semantic field exposed
+        # at the proof-row level. Otherwise callers could alter, for example, a
+        # fee rate while leaving both the canonical payload and its digest
+        # untouched. Paths and the hash envelope are proof metadata, not source
+        # content.
+        metadata_fields = (
+            {"known_at_utc", "first_impact_date", "source_sha256", "event_type", "symbol",
+             "old_symbol", "new_symbol", "security_identity"}
+            if family == "event"
+            else {"valid_from", "valid_to", "known_at_utc", "source_sha256", "symbol", "market", "board"}
+        )
+        proof_fields = {"content_sha256", "canonical_content", "source_path"}
+        for field, value in row.items():
+            if field in proof_fields or field in metadata_fields:
+                continue
+            if field not in canonical or canonical[field] != value:
+                return "METADATA_MISMATCH"
+        return "VERIFIED"
+
+    canonical_row_audit: list[dict[str, str]] = []
+    for label, rows, family in (
+        ("baseline.events", base_events, "event"), ("candidate.events", current_events, "event"),
+    ):
+        for row_id, row in rows.items():
+            status = verify_canonical_row(row, f"{label}[{row_id}]", family)
+            canonical_row_audit.append({"input": "event", "row_id": row_id, "side": label, "status": status})
+            if status != "VERIFIED":
+                canonical_content_failed |= status in {"HASH_MISMATCH", "METADATA_MISMATCH"}
+                canonical_content_unverified |= status == "UNVERIFIED"
+                block(
+                    "EVENT_CONTENT_HASH_UNVERIFIED" if status == "UNVERIFIED" else "EVENT_CONTENT_HASH_INVALID",
+                    f"{label}[{row_id}] 规范化事件内容校验状态={status}",
+                )
     for event_id, row in base_events.items():
         try:
             _instant(row.get("known_at_utc"), f"baseline.events[{event_id}].known_at_utc")
@@ -178,7 +332,9 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
         left, right = base_events[event_id], current_events[event_id]
         old_hash = _row_fingerprint(left, "content_sha256", f"baseline.events[{event_id}]")
         new_hash = _row_fingerprint(right, "content_sha256", f"candidate.events[{event_id}]")
-        if old_hash != new_hash:
+        old_metadata = _event_metadata(left, f"baseline.events[{event_id}]")
+        new_metadata = _event_metadata(right, f"candidate.events[{event_id}]")
+        if old_hash != new_hash or old_metadata != new_metadata:
             impact_values = [_day(left.get("first_impact_date"), f"baseline.events[{event_id}].first_impact_date"),
                              _day(right.get("first_impact_date"), f"candidate.events[{event_id}].first_impact_date")]
             earliest = min(impact_values)
@@ -215,7 +371,19 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
     base_calendar = calendar_map(base["calendar"], "baseline.calendar")
     current_calendar = calendar_map(current["calendar"], "candidate.calendar")
     expected = _day(base_cp["next_expected_session"], "checkpoint.next_expected_session")
+    candidate_next_open = min(
+        (day for day, is_open in current_calendar.items() if day > as_of and is_open),
+        default=None,
+    )
+    if candidate_next_open != expected:
+        block(
+            "NEXT_SESSION_CHANGED",
+            f"checkpoint 原下一开市日={expected}；候选日历下一开市日="
+            f"{candidate_next_open.isoformat() if candidate_next_open else 'NONE'}",
+            min(expected, candidate_next_open) if candidate_next_open else expected,
+        )
     if base_calendar.get(expected) is not True or current_calendar.get(expected) is not True:
+        # Keep a distinct diagnosis for an inconsistent baseline or a missing original session.
         block("NEXT_SESSION_NOT_PRESERVED", f"checkpoint 记录的下一开市日 {expected} 缺失或未标为开市", expected)
     for day, is_open in base_calendar.items():
         if day not in current_calendar:
@@ -236,6 +404,17 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
     for field, label in (("rules", "交易规则"), ("fees", "费率")):
         left_rows = _unique_rows(base[field], "row_id", f"baseline.{field}")
         right_rows = _unique_rows(current[field], "row_id", f"candidate.{field}")
+        for side, rows in ((f"baseline.{field}", left_rows), (f"candidate.{field}", right_rows)):
+            for row_id, row in rows.items():
+                status = verify_canonical_row(row, f"{side}[{row_id}]", "schedule")
+                canonical_row_audit.append({"input": field[:-1], "row_id": row_id, "side": side, "status": status})
+                if status != "VERIFIED":
+                    canonical_content_failed |= status in {"HASH_MISMATCH", "METADATA_MISMATCH"}
+                    canonical_content_unverified |= status == "UNVERIFIED"
+                    block(
+                        "SCHEDULE_CONTENT_HASH_UNVERIFIED" if status == "UNVERIFIED" else "SCHEDULE_CONTENT_HASH_INVALID",
+                        f"{side}[{row_id}] 规范化规则/费率行校验状态={status}",
+                    )
         for row_id in sorted(left_rows.keys() - right_rows.keys()):
             row = left_rows[row_id]
             valid_from = _day(row.get("valid_from"), f"baseline.{field}[{row_id}].valid_from")
@@ -244,7 +423,9 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
         for row_id in sorted(left_rows.keys() & right_rows.keys()):
             old_hash = _row_fingerprint(left_rows[row_id], "content_sha256", f"baseline.{field}[{row_id}]")
             new_hash = _row_fingerprint(right_rows[row_id], "content_sha256", f"candidate.{field}[{row_id}]")
-            if old_hash != new_hash:
+            old_metadata = _schedule_metadata(left_rows[row_id], f"baseline.{field}[{row_id}]")
+            new_metadata = _schedule_metadata(right_rows[row_id], f"candidate.{field}[{row_id}]")
+            if old_hash != new_hash or old_metadata != new_metadata:
                 valid_from = min(
                     _day(left_rows[row_id].get("valid_from"), f"baseline.{field}[{row_id}].valid_from"),
                     _day(right_rows[row_id].get("valid_from"), f"candidate.{field}[{row_id}].valid_from"),
@@ -279,21 +460,42 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
     if increment_sha in {_sha(item, "checkpoint.applied_increment_sha256s") for item in base_cp.get("applied_increment_sha256s", [])}:
         block("INCREMENT_ALREADY_APPLIED", f"内容摘要 {increment_sha} 已记录为应用过")
 
+    candidate_rules_compatible = not blockers
+    checkpoint_binding_status = "UNVERIFIED"
+    input_file_binding_status = "UNVERIFIED"
+    block("CHECKPOINT_BINDING_UNVERIFIED", "纯 proof 比较未核对真实 checkpoint 中保存的全部输入摘要")
+    block("INPUT_FILES_BINDING_UNVERIFIED", "尚未从实际输入文件重新生成规范化事件、日历、规则、费率及行情前缀")
+
     if not increment_id:
         increment_sha = None
     earliest = min(affected_dates).isoformat() if affected_dates else None
-    candidate_compatible = not blockers
+    candidate_compatible = False
     historical_blocker_codes = {
         "HISTORICAL_INPUT_CHANGED", "USED_EVENT_REMOVED", "USED_EVENT_CORRECTED",
         "LATE_EVENT_AFFECTS_HISTORY", "CALENDAR_ROW_REMOVED", "CALENDAR_HISTORY_CHANGED",
         "CALENDAR_HISTORICAL_ROW_ADDED", "USED_SCHEDULE_ROW_REMOVED",
         "HISTORICAL_SCHEDULE_ROW_CHANGED", "HISTORICAL_SCHEDULE_ROW_ADDED",
         "BASELINE_EVENT_PROVENANCE_MISSING", "EVENT_KNOWN_AT_UNPROVEN", "EVENT_NOT_PROVEN_NEW",
+        "EVENT_CONTENT_HASH_UNVERIFIED", "EVENT_CONTENT_HASH_INVALID",
+        "SCHEDULE_CONTENT_HASH_UNVERIFIED", "SCHEDULE_CONTENT_HASH_INVALID",
     }
     requires_recompute = any(item["code"] in historical_blocker_codes for item in blockers)
     return {
         "schema_version": 1,
         "report_type": "checkpoint_incremental_input_preflight_only",
+        "proof_schema_valid": "VERIFIED",
+        "checkpoint_binding_valid": checkpoint_binding_status,
+        "input_files_binding_valid": input_file_binding_status,
+        "canonical_payload_digest_valid": (
+            "FAILED" if canonical_content_failed else
+            "UNVERIFIED" if canonical_content_unverified else
+            "VERIFIED"
+        ),
+        "normalized_inputs_binding_valid": "UNVERIFIED",
+        "canonical_row_hash_audit": canonical_row_audit,
+        "source_artifact_binding_status": "UNVERIFIED",
+        "source_artifact_binding_note": "纯 proof 比较无法证明规范化行来自登记原件；CLI 必须核验文件散列，语义解析仍待适配器实现。",
+        "candidate_rules_compatible": candidate_rules_compatible,
         "candidate_append_compatible": candidate_compatible,
         "can_continue": False,
         "engine_resume_supported": False,
@@ -305,6 +507,10 @@ def audit_incremental_inputs(baseline_proof: Mapping[str, Any], candidate_proof:
             "decision_cutoff_utc": _instant(base_cp["decision_cutoff_utc"], "decision_cutoff_utc").isoformat(),
             "cutoff_source": str(base_cp["cutoff_source"]),
             "cutoff_source_sha256": str(base_cp["cutoff_source_sha256"]).lower(),
+        },
+        "calendar_comparison": {
+            "original_next_open": expected.isoformat(),
+            "candidate_next_open": candidate_next_open.isoformat() if candidate_next_open else None,
         },
         "increment_id": increment_id or None,
         "increment_sha256": increment_sha,
