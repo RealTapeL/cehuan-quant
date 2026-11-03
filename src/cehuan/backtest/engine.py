@@ -28,6 +28,14 @@ from cehuan.accounting import (
     TradeFill,
 )
 from cehuan.backtest.checkpoint import BacktestCheckpoint, CheckpointPrice, SignalHistoryBar
+from cehuan.backtest.input_hashes import (
+    accounting_events_digest,
+    chain_data_window_digest,
+    compact_config_digest,
+    normalized_bars_digest,
+    normalized_event_table_digest,
+    normalized_table_digest,
+)
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.backtest.event_scheduler import AccountingEventSchedule, SupportedAccountingEvent
 from cehuan.config import load_config
@@ -81,21 +89,13 @@ def _git_metadata() -> dict[str, Any]:
 
 
 def _normalized_event_table_digest(frame: pd.DataFrame) -> str:
-    """Hash a normalized event table independent of CSV formatting and dtypes."""
-    canonical = frame.copy()
-    for column in canonical.columns:
-        canonical[column] = canonical[column].astype("string").fillna("")
-    payload = canonical.to_csv(index=False, lineterminator="\n").encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    """Backwards-compatible alias for the shared checkpoint-v1 digest."""
+    return normalized_event_table_digest(frame)
 
 
 def _normalized_table_digest(frame: pd.DataFrame) -> str:
-    canonical = frame.copy()
-    canonical = canonical.sort_values(list(canonical.columns), kind="stable", na_position="first")
-    for column in canonical.columns:
-        canonical[column] = canonical[column].astype("string").fillna("")
-    payload = canonical.to_csv(index=False, lineterminator="\n").encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    """Backwards-compatible alias for the shared checkpoint-v1 digest."""
+    return normalized_table_digest(frame)
 
 
 def _sha256_path(path: str | Path) -> str:
@@ -374,9 +374,7 @@ def run_backtest(
         compact=mutate_input,
         assume_sorted=mutate_input,
     )
-    current_window_bars_sha256 = hashlib.sha256(
-        pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
-    ).hexdigest()
+    current_window_bars_sha256 = normalized_bars_digest(data)
     current_window_data_sha256 = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
     ).hexdigest()
@@ -519,27 +517,15 @@ def run_backtest(
             identity_events["old_symbol"].isin(symbols_in_data)
             | identity_events["new_symbol"].isin(symbols_in_data)
         ].reset_index(drop=True)
-    compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
-    config_sha256 = hashlib.sha256(
-        json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+    config_sha256 = compact_config_digest(config)
     identity_events_sha256 = _normalized_event_table_digest(identity_events)
     corporate_actions_sha256 = _normalized_event_table_digest(action_events)
-    accounting_events_sha256 = hashlib.sha256(json.dumps(
-        {
-            "events": [asdict(event) for event in sorted(accounting_events or (), key=lambda event: event.event_id)],
-            "dividend_tax_cny_by_event": {
-                event_id: None if amount is None else str(amount)
-                for event_id, amount in sorted((dividend_tax_cny_by_event or {}).items())
-            },
-            "dividend_tax_treatment_by_event": dict(sorted((dividend_tax_treatment_by_event or {}).items())),
-            "dividend_payment_withholding_per_share_cny_by_event": {
-                event_id: None if amount is None else str(amount)
-                for event_id, amount in sorted((dividend_payment_withholding_per_share_cny_by_event or {}).items())
-            },
-        },
-        ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+    accounting_events_sha256 = accounting_events_digest(
+        tuple(accounting_events or ()),
+        dividend_tax_cny_by_event,
+        dividend_tax_treatment_by_event,
+        dividend_payment_withholding_per_share_cny_by_event,
+    )
     normalized_calendar = normalize_trading_calendar(trading_calendar) if trading_calendar is not None else None
     normalized_calendar_sha256 = (
         _normalized_table_digest(normalized_calendar) if normalized_calendar is not None else None
@@ -723,24 +709,12 @@ def run_backtest(
         dividend_tax_treatment_by_event,
         dividend_payment_withholding_per_share_cny_by_event,
     )
-    accounting_events_sha256 = hashlib.sha256(json.dumps(
-        {
-            "events": [asdict(event) for event in sorted(accounting_event_list, key=lambda item: item.event_id)],
-            "dividend_tax_cny_by_event": {
-                event_id: None if amount is None else str(amount)
-                for event_id, amount in sorted(event_schedule.dividend_tax_cny.items())
-            },
-            "dividend_tax_treatment_by_event": dict(sorted(event_schedule.dividend_tax_treatment.items())),
-            "dividend_payment_withholding_per_share_cny_by_event": {
-                event_id: None if amount is None else str(amount)
-                for event_id, amount in sorted(event_schedule.dividend_payment_withholding_per_share_cny.items())
-            },
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        default=str,
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+    accounting_events_sha256 = accounting_events_digest(
+        accounting_event_list,
+        event_schedule.dividend_tax_cny,
+        event_schedule.dividend_tax_treatment,
+        event_schedule.dividend_payment_withholding_per_share_cny,
+    )
     if backtest_checkpoint is not None and backtest_checkpoint.accounting_events_sha256 != accounting_events_sha256:
         raise ValueError("checkpoint 绑定的公司行动事件或分红税务处理已变化；请从受影响日期重新计算")
 
@@ -1575,8 +1549,6 @@ def run_backtest(
         if backtest_checkpoint is not None else curve["equity_cny"]
     )
 
-    compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
-    config_json = json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str)
     data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
     ).hexdigest()
@@ -1761,13 +1733,12 @@ def run_backtest(
             normalized_calendar["trade_date"] <= last_date
         ].copy()
         chain_previous = backtest_checkpoint.data_chain_sha256 if backtest_checkpoint is not None else ""
-        current_chain_part = (
-            f"{current_window_data_sha256}:{current_window_bars_sha256}:"
-            f"{benchmark_data_digest or 'peer_from_input'}"
+        data_chain_sha256 = chain_data_window_digest(
+            chain_previous,
+            current_window_data_sha256,
+            current_window_bars_sha256,
+            benchmark_data_digest,
         )
-        data_chain_sha256 = hashlib.sha256(
-            f"{chain_previous}:{current_chain_part}".encode("utf-8")
-        ).hexdigest()
         strategy_checkpoint = BacktestCheckpoint(
             schema_version=1,
             strategy_id=str(strategy["name"]),
@@ -1849,7 +1820,7 @@ def run_backtest(
     metrics.update({
         "experiment_id": f"chq-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}",
         "strategy_id": str(strategy["name"]),
-        "config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
+        "config_sha256": config_sha256,
         "data_version_sha256": data_digest,
         "normalized_window_bars_sha256": current_window_bars_sha256,
         "security_identity_events_sha256": identity_event_data_sha256,

@@ -13,6 +13,8 @@ import json
 import re
 from typing import Any, Mapping
 
+from cehuan.backtest.input_hashes import canonical_payload_digest
+
 
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -64,8 +66,16 @@ def _unique_rows(value: Any, key: str, label: str) -> dict[str, dict[str, Any]]:
 
 
 def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not isinstance(proof, Mapping) or proof.get("schema_version") != 1:
-        raise ValueError(f"{label} 必须是 schema_version=1 的对象")
+    if not isinstance(proof, Mapping) or proof.get("schema_version") not in {1, 2}:
+        raise ValueError(f"{label} 必须是 schema_version=1 或 2 的对象")
+    schema_version = int(proof["schema_version"])
+    if schema_version == 2:
+        declared_digest = _sha(proof.get("canonical_payload_sha256"), f"{label}.canonical_payload_sha256")
+        unsigned_proof = dict(proof)
+        unsigned_proof.pop("canonical_payload_sha256", None)
+        observed_digest = canonical_payload_digest(unsigned_proof)
+        if declared_digest != observed_digest:
+            raise ValueError(f"{label}.canonical_payload_sha256 与规范 proof 内容不匹配")
     checkpoint = proof.get("checkpoint")
     inputs = proof.get("inputs")
     if not isinstance(checkpoint, Mapping) or not isinstance(inputs, Mapping):
@@ -75,10 +85,17 @@ def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, A
     next_session = _day(checkpoint.get("next_expected_session"), f"{label}.checkpoint.next_expected_session")
     if next_session <= as_of:
         raise ValueError(f"{label}.checkpoint.next_expected_session 必须晚于 as_of_date")
-    _instant(checkpoint.get("decision_cutoff_utc"), f"{label}.checkpoint.decision_cutoff_utc")
-    if not str(checkpoint.get("cutoff_source", "")).strip():
-        raise ValueError(f"{label}.checkpoint.cutoff_source 不能为空")
-    _sha(checkpoint.get("cutoff_source_sha256"), f"{label}.checkpoint.cutoff_source_sha256")
+    cutoff_status = checkpoint.get("decision_cutoff_status", "VERIFIED" if schema_version == 1 else "UNVERIFIED")
+    if cutoff_status == "VERIFIED":
+        _instant(checkpoint.get("decision_cutoff_utc"), f"{label}.checkpoint.decision_cutoff_utc")
+        if not str(checkpoint.get("cutoff_source", "")).strip():
+            raise ValueError(f"{label}.checkpoint.cutoff_source 不能为空")
+        _sha(checkpoint.get("cutoff_source_sha256"), f"{label}.checkpoint.cutoff_source_sha256")
+    elif schema_version == 2 and cutoff_status == "UNVERIFIED":
+        if checkpoint.get("decision_cutoff_utc") not in (None, ""):
+            raise ValueError(f"{label}.checkpoint 未验证截止时点时，decision_cutoff_utc 必须留空")
+    else:
+        raise ValueError(f"{label}.checkpoint.decision_cutoff_status 必须是 VERIFIED/UNVERIFIED")
     if "applied_increment_ids" not in checkpoint or "applied_increment_sha256s" not in checkpoint:
         raise ValueError(f"{label}.checkpoint 必须记录已应用增量 ID 与内容摘要")
     increment_ids = checkpoint["applied_increment_ids"]
@@ -94,11 +111,16 @@ def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, A
         if not isinstance(input_hashes, Mapping):
             raise ValueError(f"{label}.checkpoint.input_hashes 必须是对象")
         for field, item in input_hashes.items():
-            if item is None and field in {"market_rules_sha256", "fee_schedule_sha256"}:
+            if item is None and (
+                schema_version == 2 or field in {"market_rules_sha256", "fee_schedule_sha256"}
+            ):
                 continue
             _sha(item, f"{label}.checkpoint.input_hashes.{field}")
     for field in ("strategy_config_sha256", "historical_bars_prefix_sha256"):
-        _sha(inputs.get(field), f"{label}.inputs.{field}")
+        value = inputs.get(field)
+        if schema_version == 2 and value in (None, ""):
+            continue
+        _sha(value, f"{label}.inputs.{field}")
     events = _unique_rows(inputs.get("events"), "event_id", f"{label}.inputs.events")
     for event_id, row in events.items():
         _day(row.get("first_impact_date"), f"{label}.inputs.events[{event_id}].first_impact_date")
@@ -130,6 +152,12 @@ def validate_incremental_proof(proof: Any, label: str = "proof") -> tuple[dict[s
     return _validate_proof(proof, label)
 
 
+def _proof_evidence_status(proof: Mapping[str, Any], key: str) -> str:
+    evidence = proof.get("evidence_status")
+    status = evidence.get(key) if isinstance(evidence, Mapping) else None
+    return status if status in {"VERIFIED", "UNVERIFIED", "FAILED"} else "UNVERIFIED"
+
+
 def _row_fingerprint(row: Mapping[str, Any], field: str, label: str) -> str:
     return _sha(row.get(field), f"{label}.{field}")
 
@@ -137,8 +165,7 @@ def _row_fingerprint(row: Mapping[str, Any], field: str, label: str) -> str:
 def _canonical_digest(value: Any) -> str | None:
     if not isinstance(value, Mapping):
         return None
-    encoded = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return canonical_payload_digest(value)
 
 
 def _event_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
@@ -209,15 +236,20 @@ def audit_incremental_inputs(
     base_cp, base = _validate_proof(baseline_proof, "baseline")
     candidate_cp, current = _validate_proof(candidate_proof, "candidate")
     for field in (
-        "state_sha256", "as_of_date", "next_expected_session", "decision_cutoff_utc",
-        "cutoff_source", "cutoff_source_sha256", "applied_increment_ids", "applied_increment_sha256s",
+        "state_sha256", "as_of_date", "next_expected_session",
+        "decision_cutoff_status", "decision_cutoff_utc", "cutoff_source", "cutoff_source_sha256",
+        "applied_increment_ids", "applied_increment_sha256s",
     ):
-        if base_cp[field] != candidate_cp[field]:
+        if base_cp.get(field) != candidate_cp.get(field):
             raise ValueError(f"baseline 与 candidate checkpoint.{field} 不一致")
     if base_cp.get("input_hashes") != candidate_cp.get("input_hashes"):
         raise ValueError("baseline 与 candidate checkpoint.input_hashes 不一致")
     as_of = _day(base_cp["as_of_date"], "checkpoint.as_of_date")
-    cutoff = _instant(base_cp["decision_cutoff_utc"], "checkpoint.decision_cutoff_utc")
+    cutoff_status = base_cp.get("decision_cutoff_status", "VERIFIED")
+    cutoff = (
+        _instant(base_cp.get("decision_cutoff_utc"), "checkpoint.decision_cutoff_utc")
+        if cutoff_status == "VERIFIED" else None
+    )
     blockers: list[dict[str, str]] = []
     changes: list[dict[str, str]] = []
     additions: dict[str, list[str]] = {"events": [], "calendar": [], "rules": [], "fees": []}
@@ -234,6 +266,10 @@ def audit_incremental_inputs(
     for field, label in (("strategy_config_sha256", "策略配置"), ("historical_bars_prefix_sha256", "已使用行情前缀")):
         if base[field] != current[field]:
             block("HISTORICAL_INPUT_CHANGED", f"{label}摘要发生变化")
+        elif base[field] in (None, ""):
+            block("HISTORICAL_INPUT_UNVERIFIED", f"{label}的实际历史摘要尚未重建")
+    if cutoff is None:
+        block("CUTOFF_EVIDENCE_UNVERIFIED", "checkpoint 没有与状态哈希绑定的可靠决策截止时点")
 
     # Existing events are immutable. Only an event with a new ID can be a candidate append.
     base_events = _unique_rows(base["events"], "event_id", "baseline.events")
@@ -355,7 +391,9 @@ def audit_incremental_inputs(
         except ValueError as exc:
             block("EVENT_EVIDENCE_INVALID", f"事件 {event_id}: {exc}", impact)
             continue
-        if known_at <= cutoff:
+        if cutoff is None:
+            block("EVENT_CUTOFF_UNVERIFIED", f"事件 {event_id} 缺少可核验的 checkpoint 决策截止时点")
+        elif known_at <= cutoff:
             known_day = known_at.astimezone(timezone(timedelta(hours=8))).date()
             block("EVENT_NOT_PROVEN_NEW", f"事件 {event_id} 的可得时点不晚于决策截止时点", known_day)
         elif impact <= as_of:
@@ -445,7 +483,9 @@ def audit_incremental_inputs(
             except ValueError as exc:
                 block("SCHEDULE_APPEND_EVIDENCE_MISSING", f"新增{label}行 {row_id} 缺少可得时间或来源证据: {exc}", valid_from)
                 continue
-            if known_at <= cutoff:
+            if cutoff is None:
+                block("SCHEDULE_CUTOFF_UNVERIFIED", f"新增{label}行 {row_id} 缺少可核验的 checkpoint 决策截止时点", valid_from)
+            elif known_at <= cutoff:
                 block("SCHEDULE_APPEND_NOT_PROVEN_NEW", f"新增{label}行 {row_id} 的可得时点不晚于决策截止时点", valid_from)
             else:
                 additions[field].append(row_id)
@@ -504,10 +544,20 @@ def audit_incremental_inputs(
             "state_sha256": str(base_cp["state_sha256"]).lower(),
             "as_of_date": as_of.isoformat(),
             "next_expected_session": expected.isoformat(),
-            "decision_cutoff_utc": _instant(base_cp["decision_cutoff_utc"], "decision_cutoff_utc").isoformat(),
-            "cutoff_source": str(base_cp["cutoff_source"]),
-            "cutoff_source_sha256": str(base_cp["cutoff_source_sha256"]).lower(),
+            "decision_cutoff_status": cutoff_status,
+            "decision_cutoff_utc": cutoff.isoformat() if cutoff is not None else None,
+            "cutoff_source": str(base_cp.get("cutoff_source", "")) or None,
+            "cutoff_source_sha256": (
+                str(base_cp["cutoff_source_sha256"]).lower()
+                if base_cp.get("cutoff_source_sha256") else None
+            ),
         },
+        "known_at_evidence_status": _proof_evidence_status(
+            baseline_proof, "known_at_evidence_status"
+        ),
+        "source_content_review_status": _proof_evidence_status(
+            baseline_proof, "source_content_review_status"
+        ),
         "calendar_comparison": {
             "original_next_open": expected.isoformat(),
             "candidate_next_open": candidate_next_open.isoformat() if candidate_next_open else None,

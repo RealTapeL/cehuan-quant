@@ -21,6 +21,10 @@ CHECKPOINT_HASH_FIELDS = tuple(
 INPUT_ARTIFACT_ROLES = (
     "strategy_config", "historical_bars_prefix", "events", "calendar", "rules", "fees",
 )
+SCHEMA_V2_ARTIFACT_ROLES = (
+    "last_window_bars", "identity_events", "corporate_actions", "history_manifest",
+    "provenance_registry", "cutoff_evidence_record",
+)
 
 
 def _path(value: str) -> Path:
@@ -92,10 +96,33 @@ def _audit_declared_artifacts(proofs: list[tuple[str, dict[str, Any]]]) -> tuple
         if not isinstance(artifacts, dict):
             rows.append({"role": f"{side}:inputs.artifacts", "status": "FAILED", "detail": "必须是对象"})
             continue
-        for role in INPUT_ARTIFACT_ROLES:
+        schema_roles = SCHEMA_V2_ARTIFACT_ROLES if proof.get("schema_version") == 2 else ()
+        roles = tuple(dict.fromkeys((*INPUT_ARTIFACT_ROLES, *schema_roles, *artifacts.keys())))
+        for role in roles:
             item = artifacts.get(role)
             if not isinstance(item, dict):
                 rows.append({"role": f"{side}:{role}", "status": "UNVERIFIED", "detail": "proof 未登记实际输入文件"})
+                continue
+            if item.get("not_applicable") is True:
+                checkpoint_hashes = checkpoint.get("input_hashes", {}) if isinstance(checkpoint, dict) else {}
+                if role == "rules":
+                    valid_na = isinstance(checkpoint_hashes, dict) and checkpoint_hashes.get("market_rules_sha256") is None
+                elif role == "fees":
+                    valid_na = isinstance(checkpoint_hashes, dict) and checkpoint_hashes.get("fee_schedule_sha256") is None
+                elif role == "events":
+                    valid_na = (
+                        isinstance(checkpoint_hashes, dict)
+                        and bool(checkpoint_hashes.get("accounting_events_sha256"))
+                        and isinstance(inputs.get("events"), list)
+                        and not inputs["events"]
+                    )
+                else:
+                    valid_na = False
+                rows.append({
+                    "role": f"{side}:{role}",
+                    "status": "VERIFIED" if valid_na else "FAILED",
+                    "detail": item.get("detail", "not_applicable") if valid_na else "not_applicable 与 checkpoint/证明内容冲突",
+                })
                 continue
             item_audit = _verify_artifact(item.get("path"), item.get("sha256"), f"{side}:{role}")
             rows.append(item_audit)
@@ -155,12 +182,16 @@ def main() -> int:
     parser.add_argument("--checkpoint", required=True, help="已经封存并校验的 checkpoint v1 JSON")
     parser.add_argument("--baseline-proof", required=True, help="保存 checkpoint 历史输入前缀及截止时点证据的 JSON")
     parser.add_argument("--candidate-proof", required=True, help="候选新增输入及其来源证明 JSON")
+    parser.add_argument("--baseline-rebuild-report", help="可选：与 baseline proof 同次生成的规范化重建报告")
+    parser.add_argument("--candidate-rebuild-report", help="可选：与 candidate proof 同次生成的规范化重建报告")
     parser.add_argument("--output", required=True, help="报告 JSON 输出路径")
     args = parser.parse_args()
 
     checkpoint_path = _path(args.checkpoint)
     baseline_path = _path(args.baseline_proof)
     candidate_path = _path(args.candidate_proof)
+    baseline_rebuild_path = _path(args.baseline_rebuild_report) if args.baseline_rebuild_report else None
+    candidate_rebuild_path = _path(args.candidate_rebuild_report) if args.candidate_rebuild_report else None
     output_path = _path(args.output)
     checkpoint = read_backtest_checkpoint(checkpoint_path)
     baseline = _read_json(baseline_path)
@@ -212,12 +243,83 @@ def main() -> int:
     )
     report["input_file_hash_audit"] = artifact_audit
     report["input_files_binding_valid"] = artifact_status
-    report["normalized_inputs_binding_valid"] = "UNVERIFIED"
+    rebuild_reports: list[dict[str, Any]] = []
+    for side, rebuild_path, proof_path in (
+        ("baseline", baseline_rebuild_path, baseline_path),
+        ("candidate", candidate_rebuild_path, candidate_path),
+    ):
+        if rebuild_path is None:
+            rebuild_reports.append({
+                "proof": side, "normalized_status": "UNVERIFIED", "file_hash_status": "UNVERIFIED",
+                "canonical_status": "NOT_PROVIDED", "differences": ["未提供规范化重建报告"],
+            })
+            continue
+        try:
+            rebuilt = _read_json(rebuild_path)
+            if not isinstance(rebuilt, dict):
+                raise ValueError("报告顶层必须是对象")
+            differences = []
+            expected_proof_sha = rebuilt.get("baseline_proof_file_sha256")
+            observed_proof_sha = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+            if expected_proof_sha != observed_proof_sha:
+                differences.append("重建报告未绑定当前 proof 文件散列")
+            if rebuilt.get("checkpoint_file_sha256") != hashlib.sha256(checkpoint_path.read_bytes()).hexdigest():
+                differences.append("重建报告未绑定当前 checkpoint 文件散列")
+            if rebuilt.get("checkpoint_state_sha256") != checkpoint.state_sha256:
+                differences.append("重建报告 checkpoint state SHA-256 不匹配")
+            rebuild_reports.append({
+                "proof": side,
+                "normalized_status": "FAILED" if differences else rebuilt.get("normalized_inputs_binding_valid", "UNVERIFIED"),
+                "file_hash_status": rebuilt.get("input_file_hashes_valid", "UNVERIFIED"),
+                "canonical_status": rebuilt.get("canonical_payload_digest_valid", "UNVERIFIED"),
+                "differences": differences,
+            })
+        except (OSError, ValueError, TypeError) as exc:
+            rebuild_reports.append({
+                "proof": side, "normalized_status": "FAILED", "file_hash_status": "UNVERIFIED",
+                "canonical_status": "NOT_PROVIDED", "differences": [f"无法验证规范化重建报告: {exc}"],
+            })
+    normalized_values = [item["normalized_status"] for item in rebuild_reports]
+    rebuild_file_values = [item["file_hash_status"] for item in rebuild_reports]
+    rebuild_canonical_values = [
+        item["canonical_status"] for item in rebuild_reports
+        if item["canonical_status"] in {"VERIFIED", "UNVERIFIED", "FAILED"}
+    ]
+    report["normalized_inputs_binding_valid"] = (
+        "FAILED" if "FAILED" in normalized_values else
+        "VERIFIED" if normalized_values and all(value == "VERIFIED" for value in normalized_values) else
+        "UNVERIFIED"
+    )
+    report["normalized_input_rebuild_reports"] = rebuild_reports
+    rebuild_file_status = (
+        "FAILED" if "FAILED" in rebuild_file_values else
+        "VERIFIED" if rebuild_file_values and all(value == "VERIFIED" for value in rebuild_file_values) else
+        "UNVERIFIED"
+    )
+    prior_file_status = report["input_file_hashes_valid"]
+    report["input_file_hashes_valid"] = (
+        "FAILED" if "FAILED" in (prior_file_status, rebuild_file_status) else
+        "VERIFIED" if prior_file_status == rebuild_file_status == "VERIFIED" else
+        "UNVERIFIED"
+    )
+    prior_canonical_status = report.get("canonical_payload_digest_valid", "UNVERIFIED")
+    rebuild_canonical_status = (
+        "FAILED" if "FAILED" in rebuild_canonical_values else
+        "VERIFIED" if rebuild_canonical_values and all(value == "VERIFIED" for value in rebuild_canonical_values) else
+        "UNVERIFIED" if rebuild_canonical_values else prior_canonical_status
+    )
+    report["canonical_payload_digest_valid"] = (
+        "FAILED" if "FAILED" in (prior_canonical_status, rebuild_canonical_status) else
+        "VERIFIED" if prior_canonical_status == rebuild_canonical_status == "VERIFIED" else
+        "UNVERIFIED"
+    )
     report["candidate_append_compatible"] = (
         report["candidate_rules_compatible"]
         and combined_checkpoint_status == "VERIFIED"
         and artifact_status == "VERIFIED"
         and report["normalized_inputs_binding_valid"] == "VERIFIED"
+        and report["input_file_hashes_valid"] == "VERIFIED"
+        and report["canonical_payload_digest_valid"] == "VERIFIED"
     )
     report["blockers"] = [
         item for item in report["blockers"]
@@ -232,6 +334,16 @@ def main() -> int:
         report["blockers"].append({
             "code": "INPUT_FILES_BINDING_" + artifact_status,
             "detail": "proof 登记的实际输入文件字节散列未全部核实",
+        })
+    if report["input_file_hashes_valid"] != "VERIFIED":
+        report["blockers"].append({
+            "code": "INPUT_FILE_HASHES_" + report["input_file_hashes_valid"],
+            "detail": "规范化重建报告或证明中登记的文件 SHA-256 未全部核实",
+        })
+    if report["canonical_payload_digest_valid"] != "VERIFIED":
+        report["blockers"].append({
+            "code": "CANONICAL_PAYLOAD_DIGEST_" + report["canonical_payload_digest_valid"],
+            "detail": "proof 规范内容摘要未全部核实",
         })
     if report["normalized_inputs_binding_valid"] != "VERIFIED":
         report["blockers"].append({
