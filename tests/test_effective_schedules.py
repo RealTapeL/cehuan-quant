@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from cehuan.backtest.engine import run_backtest
+from cehuan.backtest.engine import _require_code_change_open_eligibility
 from cehuan.accounting import ActionSource, CashDividendEvent, CodeChangeEvent
 from cehuan.config import load_config
 from cehuan.data.fee_schedule import calculate_scheduled_fees, map_fee_schedule_to_sessions, normalize_fee_schedule
@@ -350,6 +351,23 @@ def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type()
     )
     with pytest.raises(TypeError, match="只接受 CashDividendEvent/CodeChangeEvent"):
         AccountingEventSchedule.build([distribution], [date(2025, 1, 1)])
+
+
+def test_code_change_open_decision_uses_open_and_point_in_time_status_only():
+    row = pd.Series({
+        "open": 10.0,
+        "high": float("nan"),
+        "low": float("nan"),
+        "close": float("nan"),
+        "is_listed": True,
+        "is_suspended": False,
+    })
+
+    _require_code_change_open_eligibility(row, "2025-01-02", "SZ000003")
+
+    row["is_suspended"] = pd.NA
+    with pytest.raises(ValueError, match="停牌状态未知"):
+        _require_code_change_open_eligibility(row, "2025-01-02", "SZ000003")
 
 
 def test_ledger_v2_execution_consumes_reviewed_rule_and_fee_schedule():

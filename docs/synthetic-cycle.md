@@ -1,34 +1,74 @@
-# 纯合成研究到复盘闭环
+# 研究到复盘闭环示例
 
-此示例用虚构的 `SZ000001` / `SZ000002` 价格先运行技术基线，再生成待审核计划，写入一条**虚构的部分成交**和虚构持仓快照，复用真实项目 CSV 读取与复盘函数，并生成结构化的下一轮研究假设。它不包含真实行情、不读取账户、不连接华泰、不发送委托，也不验证策略效果。
+此示例用虚构的 `SZ000001` / `SZ000002` 价格运行技术基线，生成待审核计划，再用合成成交/状态/持仓输入验证复盘流程。它不包含真实行情、不读取账户、不连接华泰、不发送委托，也不验证策略效果。
 
 ```bash
-uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle
+uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle --scenario partial_fill
 ```
 
-每次运行都会在输出根目录中创建唯一子目录，拒绝覆盖已有产物，内容包括：
+每次运行都会在输出根目录下创建唯一子目录并拒绝覆盖。可用场景：
 
-- `plan.csv`、`plan.md`：独立待审核计划，醒目标注 `SYNTHETIC ONLY`；现金金额是演示输入。
-- `synthetic_bars.csv`、`baseline_metrics.json`、`baseline_equity_curve.csv`、`baseline_trades.csv`：冻结输入及基线产物；指标被标为合成闭环演示。
-- `fictitious_fills.csv`、`fictitious_positions.csv`：虚构成交和持仓输入，不是华泰导出。
-- `reconciliation.csv`、`position_reconciliation.csv`、`review.md`：调用策环的 CSV 导入和计划对账流程。
-- `next_hypothesis.json`：包含证据、置信边界和下一次验证建议；不自动修改策略参数。
-- `manifest.json`：产物索引和合成结果类型。
+- `partial_fill`：部分成交，未成交原因未知。
+- `no_fill`：没有匹配成交行，订单状态为 `UNKNOWN`，不会推断撤单。
+- `duplicate_import`：同一成交文件散列只登记一次，第二次导入会被拒绝。
+- `partial_fill_cancelled`：部分成交后有单独的撤单状态证据和来源原件 SHA-256。
+- `modified_plan`：保存原计划、修改后计划及字段差异。
+- `missing_positions`：不生成持仓快照，明确报告仓位未知。
 
-同一 `cycle_run_id` 写入计划、假成交、复盘表、基线元数据、假设和 manifest；manifest 同时保存行情 CSV 的 SHA-256。
+例如：
 
-## 一次实测输出
+```bash
+uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle --scenario no_fill
+uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle --scenario partial_fill_cancelled
+uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle --scenario modified_plan
+uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle --scenario missing_positions
+```
 
-2026-11-03 在项目环境运行后，合成基线累计收益为约 6.87%，共 5 笔模拟交易；随后生成一个 `BUY` 计划和虚构部分成交：计划 1,300 股，演示成交 600 股，未成交 700 股，成交价相对参考价约高 0.132%，CSV 费用为 ¥2.00。复盘状态为 `PARTIAL_FILL`。
+产物因场景而异，常见文件包括：
 
-这些数字只检查计划字段、CSV 映射、数量/VWAP/费用算术及假设 JSON 的串接。示例同时说明：仅凭成交差异无法解释未成交原因，因此下一假设要求积累委托回报、报价与人工记录；本次结果不支持任何参数调整。
+- `plan.csv`、`plan.md`：待审核计划，醒目标注 `SYNTHETIC ONLY`。
+- `synthetic_bars.csv`、`baseline_metrics.json`、`baseline_equity_curve.csv`、`baseline_trades.csv`：合成行情、基线和回测产物。
+- `fictitious_fills.csv`：虚构成交输入；无成交场景只有带表头的空 CSV。
+- `fictitious_order_statuses.csv`、`synthetic_order_status_evidence.txt`：撤单场景的状态与来源证据。
+- `plan_original.csv`、`plan_changes.csv`：计划修改场景的原始版本与逐字段差异。
+- `fill_import_registry.json`、`duplicate_import_attempt.json`：重复导入场景的幂等登记证据。
+- `fictitious_positions.csv`、`position_reconciliation.csv`：仅在提供快照的场景出现。
+- `reconciliation.csv`、`review.md`、`next_hypothesis.json`：对账复盘和下一轮研究假设。
+- `manifest.json`：唯一运行编号、场景、产物索引、合成类型和行情 SHA-256。
 
-## 账务事件研究诊断
+一次本机运行曾生成 6.87% 的合成基线收益、5 笔模拟交易，以及计划 1,300 股、虚构成交 600 股的部分成交案例。这些数字只检查程序串接与算术，不是 A 股回测或账户收益，也不支持调整策略参数。
 
-`run_backtest(accounting_mode="ledger_v2")` 的 Python API 可选接收类型化 `CashDividendEvent` 与 `CodeChangeEvent`：
+## 人工 CSV 复盘
 
-- 现金分红的登记日、除息日、派息日都必须存在于回测交易日中。权利快照在该日模拟开盘成交后、收盘估值前记录；除息日产生应收，派息日转现金。分红税额需明确传入；未知时应收不能可靠估值，回测停止。
-- 1:1 代码变更在新代码生效日验证有效行情、上市和非停牌状态，再迁移账本持仓。事件本身不产生普通成交、现金变化或费用；批次数量、成本和取得日由账本保留。信号不跨代码拼接，新代码重新积累动量窗口。
-- 事件日期若未包含在输入交易日、ID 重复、类型不受支持或新代码行情缺失，运行会拒绝继续。事件字段和分红税额会写入实验数据哈希。
+`review` 可接收明确的委托状态证据、用户修改计划的原版文件和可选成交导入登记簿。程序为每次运行创建唯一输出目录，并在 `manifest.json` 记录计划、成交、映射、快照与状态证据文件散列。账户原始 CSV 不会复制进产物目录。
 
-该入口仅用于带明确标签的研究诊断。当前事件是 Python 类型化输入，不是现实证券事件的 CSV 适配器；调度范围不包含送转、配股、非 1:1 合并、退市和事件覆盖审计。因此它不满足正式多年基线门槛，`baseline_ready` 仍为 `NOT_READY`。完整的边界见[公司行动账务契约](corporate-action-accounting-contract.md)和[正式基线就绪审计](baseline-readiness.md)。
+```bash
+uv run cehuan review \
+  --plan data/private/review/plan.csv \
+  --original-plan data/private/review/plan-issued.csv \
+  --fills data/private/review/fills.csv \
+  --order-statuses data/private/review/order-statuses.csv \
+  --positions data/private/review/positions.csv \
+  --import-registry data/private/review/fill-import-registry.json
+```
+
+`--order-statuses` 的字段见 `examples/order_statuses_template.csv`，需要订单 ID、计划 ID、证券、方向、状态、带时区的报告时间、本地原件路径及原件 SHA-256。适配器会重新计算本地原件散列；这只验证字节一致，不验证原件内容的解释。没有委托状态证据时，`NO_FILL` 只说明成交 CSV 中没有匹配成交；它不等于撤单、拒绝或过期。没有持仓快照时，持仓和可卖数量未知，不视作零。
+
+`--original-plan` 与 `--plan` 的行键及动作、数量、目标股数、参考价格差异会另存。系统无法独立认证修改人身份。导入登记簿只拒绝字节完全相同的成交导出；不同版本文件可能有重叠记录，仍需人工避免重复计数。
+
+## 公司行动事件 CSV 研究输入
+
+`examples/accounting_events_template.csv` 提供 `CASH_DIVIDEND` 和 `CODE_CHANGE_1_TO_1` 的列结构。CLI 只允许这样接入研究账务引擎：
+
+```bash
+uv run cehuan backtest \
+  --data data/private/diagnostic/bars.csv \
+  --cash 100000 \
+  --diagnostic \
+  --accounting-mode ledger_v2 \
+  --accounting-events data/private/diagnostic/accounting-events.csv
+```
+
+每个事件行必须绑定本地归档原件、HTTPS 来源、SHA-256 和人工复核字段。适配器校验事件键、事件字段、点时日期、来源字段及归档原件字节散列，并把事件 CSV 散列和逐事件来源审计写入实验产物。它不会打开公告 URL、判断公告解释是否正确，也不证明事件覆盖完整。不得把合成示例或部分事件输入用于正式基线；`baseline_ready` 仍为 `NOT_READY`。
+
+`ledger_v2` 当前调度现金分红与 1:1 代码变更。分红税费未知或事件日期不在输入交易日时会阻断；1:1 代码变更在模拟开盘只读取开盘价及当时可用的上市/停牌状态，完整 OHLC 仍由独立数据质量检查负责。送转、配股、非 1:1 合并、退市和完整逐证券事件覆盖审计尚未接入执行调度。详见[公司行动账务契约](corporate-action-accounting-contract.md)和[正式基线就绪审计](baseline-readiness.md)。

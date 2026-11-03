@@ -134,6 +134,17 @@ def _price_limit_block(
     return None
 
 
+def _require_code_change_open_eligibility(row: pd.Series, day_date: str, symbol: str) -> None:
+    """Check only facts needed at the simulated open; full OHLC is audited separately."""
+    open_value = row.get("open")
+    if pd.isna(open_value) or not math.isfinite(float(open_value)) or float(open_value) <= 0:
+        raise ValueError(f"{day_date} {symbol} 生效日开盘价无效，不能迁移持仓")
+    if pd.isna(row.get("is_suspended")) or bool(row["is_suspended"]):
+        raise ValueError(f"{day_date} {symbol} 生效日停牌状态未知或为停牌，不能迁移持仓")
+    if pd.isna(row.get("is_listed")) or not bool(row["is_listed"]):
+        raise ValueError(f"{day_date} {symbol} 生效日上市状态未知或未上市，不能迁移持仓")
+
+
 def _metrics(equity: pd.Series, returns: pd.Series, turnover: float, benchmark: pd.Series) -> dict[str, Any]:
     if equity.empty:
         return {}
@@ -516,17 +527,7 @@ def run_backtest(
                 raise ValueError(f"{day_date} {new_symbol} 的日线不唯一，不能执行身份迁移")
             if new_row is None:
                 raise ValueError(f"{day_date} {new_symbol} 缺少代码变更生效日行情，不能验证身份迁移")
-            if any(
-                pd.isna(new_row.get(column))
-                or not math.isfinite(float(new_row[column]))
-                or float(new_row[column]) <= 0
-                for column in ("open", "high", "low", "close")
-            ):
-                raise ValueError(f"{day_date} {new_symbol} 生效日 OHLC 无效，不能迁移持仓")
-            if pd.isna(new_row.get("is_suspended")) or bool(new_row["is_suspended"]):
-                raise ValueError(f"{day_date} {new_symbol} 生效日停牌状态未知或为停牌，不能迁移持仓")
-            if pd.isna(new_row.get("is_listed")) or not bool(new_row["is_listed"]):
-                raise ValueError(f"{day_date} {new_symbol} 生效日上市状态未知或未上市，不能迁移持仓")
+            _require_code_change_open_eligibility(new_row, day_date, new_symbol)
             if old_symbol in day.index:
                 raise ValueError(f"{day_date} 旧代码 {old_symbol} 与新代码行情同时存在，身份事件需人工核验")
             cash_before = cash
@@ -591,17 +592,7 @@ def run_backtest(
                 raise ValueError(f"{day_date} {new_symbol} 的日线不唯一，不能执行身份迁移")
             if new_row is None:
                 raise ValueError(f"{day_date} {new_symbol} 缺少代码变更生效日行情，不能验证身份迁移")
-            if any(
-                pd.isna(new_row.get(column))
-                or not math.isfinite(float(new_row[column]))
-                or float(new_row[column]) <= 0
-                for column in ("open", "high", "low", "close")
-            ):
-                raise ValueError(f"{day_date} {new_symbol} 生效日 OHLC 无效，不能迁移持仓")
-            if pd.isna(new_row.get("is_suspended")) or bool(new_row["is_suspended"]):
-                raise ValueError(f"{day_date} {new_symbol} 生效日停牌状态未知或为停牌，不能迁移持仓")
-            if pd.isna(new_row.get("is_listed")) or not bool(new_row["is_listed"]):
-                raise ValueError(f"{day_date} {new_symbol} 生效日上市状态未知或未上市，不能迁移持仓")
+            _require_code_change_open_eligibility(new_row, day_date, new_symbol)
             if old_symbol in day.index:
                 raise ValueError(f"{day_date} 旧代码 {old_symbol} 与新代码行情同时存在，身份事件需人工核验")
 

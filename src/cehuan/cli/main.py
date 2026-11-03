@@ -7,6 +7,7 @@ import json
 import shutil
 import shlex
 import sys
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,6 +18,7 @@ from cehuan.config import load_config
 from cehuan.data.akshare_adapter import make_akshare_provider
 from cehuan.data.baostock_adapter import BaoStockSession, create_baostock_snapshot
 from cehuan.data.canonical import read_bars, write_bars
+from cehuan.data.accounting_event_csv import read_accounting_event_csv
 from cehuan.data.corporate_actions import DEFAULT_CORPORATE_ACTIONS, read_corporate_actions
 from cehuan.data.quality import check_data_quality
 from cehuan.data.security_identity import read_security_identity_events, sha256_file
@@ -35,12 +37,15 @@ from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loade
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.baseline_readiness import build_baseline_readiness, readiness_input_hashes
 from cehuan.review.reconcile import (
+    compare_plan_revisions,
     compare_plan_and_fills,
     compare_positions_to_plan,
     read_fills,
+    read_order_statuses,
     read_positions,
     review_markdown,
 )
+from cehuan.review.import_registry import register_fill_import
 from cehuan.signals.plan import generate_plan, plan_markdown
 
 
@@ -182,6 +187,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--readiness-universe", help="正式模式下绑定 readiness 的点时股票池快照目录")
     backtest.add_argument("--readiness-quality", help="正式模式下绑定 readiness 的点时质量 JSON")
     backtest.add_argument("--corporate-actions", help="正式模式下使用的公司行动表")
+    backtest.add_argument("--accounting-events", help="带来源原件与人工复核字段的事件 CSV；仅限 ledger_v2 研究诊断")
     backtest.add_argument("--corporate-action-coverage", help="逐证券公司行动覆盖与来源复核表")
     backtest.add_argument("--market-rules", help="有效日期交易规则 CSV")
     backtest.add_argument("--fees", help="有效日期历史费率 CSV")
@@ -239,8 +245,12 @@ def _parser() -> argparse.ArgumentParser:
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
+    review.add_argument("--original-plan", help="用户改动计划时，提供发出时原计划以生成逐字段修订差异")
     review.add_argument("--fills", required=True)
     review.add_argument("--positions", help="可选的成交后持仓快照 CSV")
+    review.add_argument("--order-statuses", help="可选的带来源散列与时间戳的委托状态证据 CSV")
+    review.add_argument("--import-registry", help="可选的本地成交导入登记簿；重复导入同一文件会拒绝")
+    review.add_argument("--output-dir", help="复盘产物目录；必须不存在，默认创建唯一私有目录")
     review.add_argument("--mapping")
 
     qlib = subs.add_parser("qlib-check", help="将规范数据交给 Qlib StaticDataLoader 读取")
@@ -625,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("点时股票池/预验证行情必须显式选择 --formal 或 --diagnostic")
             if args.accounting_mode != "legacy" and not args.diagnostic:
                 raise ValueError("ledger 账务模式仅供非正式研究，请显式附加 --diagnostic")
+            if args.accounting_events and (args.formal or not args.diagnostic or args.accounting_mode != "ledger_v2"):
+                raise ValueError("--accounting-events 仅支持 --diagnostic --accounting-mode ledger_v2，不能用于正式基线")
             if not args.formal and (bool(args.market_rules) != bool(args.fees)):
                 raise ValueError("研究诊断的 --market-rules 与 --fees 必须成对提供")
             if not args.formal and (args.market_rules or args.fees) and not args.diagnostic:
@@ -639,6 +651,14 @@ def main(argv: list[str] | None = None) -> int:
             if not corporate_actions_path.is_absolute():
                 corporate_actions_path = REPO_ROOT / corporate_actions_path
             corporate_actions = read_corporate_actions(corporate_actions_path)
+            accounting_event_bundle = None
+            accounting_event_path = None
+            if args.accounting_events:
+                accounting_event_path = Path(args.accounting_events).expanduser()
+                if not accounting_event_path.is_absolute():
+                    accounting_event_path = REPO_ROOT / accounting_event_path
+                accounting_event_path = accounting_event_path.resolve()
+                accounting_event_bundle = read_accounting_event_csv(accounting_event_path)
             readiness_report = None
             expected_readiness_hashes = None
             readiness_context = None
@@ -817,7 +837,19 @@ def main(argv: list[str] | None = None) -> int:
                 accounting_mode=args.accounting_mode,
                 market_rule_schedule=research_market_rules,
                 fee_schedule=research_fee_schedule,
+                accounting_events=accounting_event_bundle.events if accounting_event_bundle else None,
+                dividend_tax_cny_by_event=(
+                    accounting_event_bundle.dividend_tax_cny_by_event if accounting_event_bundle else None
+                ),
             )
+            if accounting_event_bundle is not None:
+                if sha256_file(accounting_event_path) != accounting_event_bundle.source_csv_sha256:
+                    raise ValueError("回测期间公司行动事件 CSV 发生变化；本次实验结果不予保存")
+                for _, source in accounting_event_bundle.source_audit.iterrows():
+                    if sha256_file(source["source_archive_file"]) != source["observed_sha256"]:
+                        raise ValueError(f"回测期间来源原件发生变化：{source['source_id']}；本次实验结果不予保存")
+                result["metrics"]["accounting_event_csv_sha256"] = accounting_event_bundle.source_csv_sha256
+                result["metrics"]["accounting_event_count"] = len(accounting_event_bundle.events)
             if universe_summary is not None:
                 result["metrics"]["point_in_time_universe_audit"] = universe_summary
             if research_market_rules_path is not None and research_fee_schedule_path is not None:
@@ -830,6 +862,9 @@ def main(argv: list[str] | None = None) -> int:
             experiment = str(result["metrics"]["experiment_id"])
             folder = REPO_ROOT / "outputs" / "experiments" / experiment
             folder.mkdir(parents=True, exist_ok=True)
+            if accounting_event_bundle is not None and accounting_event_path is not None:
+                shutil.copyfile(accounting_event_path, folder / "accounting_events.csv")
+                accounting_event_bundle.source_audit.to_csv(folder / "accounting_event_source_audit.csv", index=False)
             if research_market_rules_path is not None and research_fee_schedule_path is not None:
                 shutil.copyfile(research_market_rules_path, folder / "market_rule_schedule.csv")
                 shutil.copyfile(research_fee_schedule_path, folder / "fee_schedule.csv")
@@ -881,24 +916,105 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "review":
-            plan_frame = pd.read_csv(args.plan)
-            fills = read_fills(args.fills, args.mapping)
-            report = compare_plan_and_fills(plan_frame, fills)
+            def input_path(value: str) -> Path:
+                path = Path(value).expanduser()
+                return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+            plan_path = input_path(args.plan)
+            fills_path = input_path(args.fills)
+            original_plan_path = input_path(args.original_plan) if args.original_plan else None
+            positions_path = input_path(args.positions) if args.positions else None
+            statuses_path = input_path(args.order_statuses) if args.order_statuses else None
+            mapping_path = input_path(args.mapping) if args.mapping else REPO_ROOT / "configs" / "huatai_columns.toml"
+            tracked_inputs = {
+                "plan": plan_path,
+                "fills": fills_path,
+                "mapping": mapping_path,
+            }
+            if original_plan_path:
+                tracked_inputs["original_plan"] = original_plan_path
+            if positions_path:
+                tracked_inputs["positions"] = positions_path
+            if statuses_path:
+                tracked_inputs["order_statuses"] = statuses_path
+            input_hashes_before = {name: sha256_file(path) for name, path in tracked_inputs.items()}
+
+            plan_frame = pd.read_csv(plan_path)
+            fills = read_fills(fills_path, mapping_path)
+            order_statuses = read_order_statuses(statuses_path) if statuses_path else None
+            if order_statuses is not None:
+                for _, status_row in order_statuses.iterrows():
+                    evidence_key = f"order_status_evidence:{status_row['order_id']}"
+                    evidence_path = Path(status_row["evidence_file"]).resolve()
+                    evidence_hash = sha256_file(evidence_path)
+                    if evidence_hash != status_row["evidence_sha256"]:
+                        raise ValueError(f"委托状态来源原件在解析后发生变化：{status_row['order_id']}")
+                    tracked_inputs[evidence_key] = evidence_path
+                    input_hashes_before[evidence_key] = evidence_hash
+            report = compare_plan_and_fills(plan_frame, fills, order_statuses=order_statuses)
             position_report = None
-            if args.positions:
-                positions = read_positions(args.positions, args.mapping)
+            if positions_path:
+                positions = read_positions(positions_path, mapping_path)
                 position_report = compare_positions_to_plan(plan_frame, positions)
-            root = REPO_ROOT / "outputs"
-            root.mkdir(parents=True, exist_ok=True)
+            plan_revision_report = None
+            if original_plan_path:
+                original_plan_frame = pd.read_csv(original_plan_path)
+                plan_revision_report = compare_plan_revisions(original_plan_frame, plan_frame)
+                if not plan_revision_report.empty:
+                    plan_revision_report.insert(0, "change_source", "reviewer_supplied_revision_file")
+                    plan_revision_report.insert(0, "evidence", "field-level diff; user identity is not independently verified")
+            input_hashes_after = {name: sha256_file(path) for name, path in tracked_inputs.items()}
+            if input_hashes_before != input_hashes_after:
+                raise ValueError("复盘期间输入文件发生变化；拒绝保存不一致结果")
+
+            run_id = f"review-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
+            root = Path(args.output_dir).expanduser() if args.output_dir else REPO_ROOT / "outputs" / "reviews" / run_id
+            if not root.is_absolute():
+                root = REPO_ROOT / root
+            root = root.resolve()
+            if root.exists():
+                raise FileExistsError(f"复盘输出目录已经存在，拒绝覆盖：{root}")
+            import_receipt = None
+            if args.import_registry:
+                plan_ids = plan_frame["plan_id"].dropna().astype(str).unique().tolist() if "plan_id" in plan_frame else []
+                import_receipt = register_fill_import(
+                    fills_path,
+                    input_path(args.import_registry),
+                    row_count=len(fills),
+                    cycle_run_id=plan_ids[0] if len(plan_ids) == 1 else None,
+                )
+            root.mkdir(parents=True, exist_ok=False)
             report.to_csv(root / "review.csv", index=False)
             if position_report is not None:
                 position_report.to_csv(root / "review_positions.csv", index=False)
+            if order_statuses is not None:
+                order_statuses.to_csv(root / "review_order_statuses.csv", index=False)
+            if plan_revision_report is not None:
+                plan_revision_report.to_csv(root / "plan_revision_diff.csv", index=False)
             markdown = review_markdown(report, position_report)
+            if plan_revision_report is not None:
+                markdown += "\n## 计划修订留痕\n\n"
+                markdown += f"修改字段的计划行数：{len(plan_revision_report)}。证据类型：用户提供的原计划与修改后计划 CSV 差异；系统不独立验证修改人身份。\n"
+                if plan_revision_report.empty:
+                    markdown += "两份计划字段相同。\n"
             (root / "review.md").write_text(markdown, encoding="utf-8")
+            if import_receipt is not None:
+                _write_json(import_receipt, root / "fill_import_receipt.json")
+            manifest = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "result_type": "manual_account_reconciliation_csv_not_broker_connected",
+                "input_sha256": input_hashes_before,
+                "input_paths": {name: str(path) for name, path in tracked_inputs.items()},
+                "position_snapshot_status": "PROVIDED_CSV" if positions_path else "NOT_PROVIDED",
+                "order_status_evidence_status": "PROVIDED" if statuses_path else "NOT_PROVIDED",
+                "plan_revision_diff_status": "PROVIDED" if original_plan_path else "NOT_PROVIDED",
+                "fill_import_receipt": import_receipt,
+                "broker_connection_or_order": False,
+            }
+            _write_json(manifest, root / "manifest.json")
             print(markdown)
-            print(f"复盘文件：{root / 'review.md'}")
-            if position_report is not None:
-                print(f"持仓对照：{root / 'review_positions.csv'}")
+            print(f"复盘文件：{root / 'review.md'}\n运行清单：{root / 'manifest.json'}")
             return 0
 
         if args.command == "qlib-check":
