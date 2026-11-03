@@ -20,6 +20,8 @@ from cehuan.data.security_identity import (
 from cehuan.data.unknown_types import audit_unknown_security_types
 from cehuan.cli.main import main
 from cehuan.research.baseline_readiness import (
+    _audit_fee_schedule,
+    _audit_market_rules,
     build_baseline_readiness,
     readiness_input_hashes,
     require_report_matches_recomputed,
@@ -205,7 +207,6 @@ def test_forged_healthy_quality_alone_never_marks_baseline_ready(tmp_path):
     assert "EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER" in report["blockers"]
     with pytest.raises(ValueError, match="正式基线未就绪"):
         require_baseline_ready(report, hashes, "2025-01-02", "2025-01-03")
-
     forged = copy.deepcopy(report)
     forged["ready"] = True
     forged["decision"] = "READY"
@@ -213,6 +214,36 @@ def test_forged_healthy_quality_alone_never_marks_baseline_ready(tmp_path):
     forged["checks"]["execution_engine"]["complete"] = True
     with pytest.raises(ValueError, match="重新审计结果不一致"):
         require_report_matches_recomputed(forged, report)
+
+
+def test_readiness_rule_audit_rejects_infinite_limit_and_fee_values(tmp_path):
+    bars = pd.read_csv(_write_inputs(tmp_path / "finite-audit")['data'])
+    rules = pd.DataFrame([{
+        "symbol": "SH600000", "board": "MAIN", "valid_from": "2025-01-01", "valid_to": "2025-01-31",
+        "is_listed": "true", "is_suspended": "false", "is_st": "false", "has_price_limit": "true",
+        "price_limit_pct": "inf", "buy_min_shares": "100", "buy_step_shares": "100",
+        "sell_min_shares": "100", "sell_step_shares": "100", "source": "fixture",
+        "source_sha256": "a" * 64, "review_status": "REVIEWED", "reviewed_by": "fixture",
+        "reviewed_at": "2026-11-03",
+    }])
+    rules_path = tmp_path / "rules-inf.csv"
+    rules.to_csv(rules_path, index=False)
+    rule_audit = _audit_market_rules(bars, rules_path, "2025-01-02", "2025-01-03")
+    assert rule_audit["complete"] is False
+    assert rule_audit["complete_rows"] == 0
+
+    fees = pd.DataFrame([{
+        "valid_from": "2025-01-01", "valid_to": "2025-01-31", "market": "A_SHARE",
+        "commission_rate": "inf", "minimum_commission_cny": "0",
+        "stamp_duty_sell_rate": "0", "transfer_fee_rate": "0", "source": "fixture",
+        "source_sha256": "b" * 64, "review_status": "REVIEWED", "reviewed_by": "fixture",
+        "reviewed_at": "2026-11-03",
+    }])
+    fees_path = tmp_path / "fees-inf.csv"
+    fees.to_csv(fees_path, index=False)
+    fee_audit = _audit_fee_schedule(fees_path, bars, "2025-01-02", "2025-01-03")
+    assert fee_audit["complete"] is False
+    assert "非有限值" in fee_audit["errors"][0]
 
 
 def test_formal_backtest_recomputes_complete_readiness_and_reports_blockers(tmp_path):

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from cehuan.backtest.engine import run_backtest
+from cehuan.accounting import ActionSource, CashDividendEvent, CodeChangeEvent
 from cehuan.config import load_config
-from cehuan.data.fee_schedule import calculate_scheduled_fees, map_fee_schedule_to_sessions
+from cehuan.data.fee_schedule import calculate_scheduled_fees, map_fee_schedule_to_sessions, normalize_fee_schedule
 from cehuan.data.market_rules import attach_market_rule_schedule, normalize_market_rule_schedule
 
 
@@ -149,6 +151,205 @@ def test_fee_schedule_uses_inclusive_effective_dates_and_directional_stamp_duty(
     assert sell - buy == pytest.approx(5.0)
     with pytest.raises(ValueError, match="没有唯一有效"):
         map_fee_schedule_to_sessions(_fees(), ["2025-01-17"])
+
+
+@pytest.mark.parametrize("bad_value", [None, float("inf"), float("-inf")])
+def test_market_rule_schedule_rejects_missing_or_infinite_required_values(bad_value):
+    rules = pd.DataFrame([_rule_row("SZ000001", "2025-01-01", "2025-01-16")])
+    if bad_value is None:
+        rules.loc[0, "source"] = bad_value
+        with pytest.raises(ValueError, match="来源 SHA-256"):
+            normalize_market_rule_schedule(rules)
+
+    rules = pd.DataFrame([_rule_row("SZ000001", "2025-01-01", "2025-01-16")])
+    rules.loc[0, "price_limit_pct"] = bad_value
+    with pytest.raises(ValueError):
+        normalize_market_rule_schedule(rules)
+
+
+@pytest.mark.parametrize("column", ["source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"])
+def test_market_rule_schedule_rejects_none_evidence_and_review_fields(column):
+    rules = pd.DataFrame([_rule_row("SZ000001", "2025-01-01", "2025-01-16")])
+    rules.loc[0, column] = None
+    with pytest.raises(ValueError, match="来源 SHA-256 或人工复核字段"):
+        normalize_market_rule_schedule(rules)
+
+
+@pytest.mark.parametrize("bad_value", [None, float("inf"), float("-inf")])
+def test_fee_schedule_rejects_missing_or_infinite_values(bad_value):
+    fees = _fees()
+    fees.loc[0, "commission_rate"] = bad_value
+    with pytest.raises(ValueError, match="非有限值"):
+        normalize_fee_schedule(fees)
+
+
+@pytest.mark.parametrize("column", ["source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"])
+def test_fee_schedule_rejects_none_evidence_and_review_fields(column):
+    fees = _fees()
+    fees.loc[0, column] = None
+    with pytest.raises(ValueError, match="来源 SHA-256 或人工复核字段"):
+        normalize_fee_schedule(fees)
+
+
+def test_fee_schedule_requires_parseable_review_date():
+    fees = _fees()
+    fees.loc[0, "reviewed_at"] = "not-a-date"
+    with pytest.raises(ValueError, match="人工复核字段"):
+        normalize_fee_schedule(fees)
+
+
+def _action_source() -> ActionSource:
+    return ActionSource(
+        source_id="synthetic-fixture",
+        url="https://example.invalid/synthetic-fixture",
+        sha256="c" * 64,
+        title="synthetic test evidence; not a real corporate action",
+        page_reference="fixture",
+        reviewed_by="test-fixture",
+        reviewed_at="2026-11-03",
+    )
+
+
+def test_ledger_v2_schedules_cash_dividend_and_1_to_1_code_change():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=16)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    record_date, ex_date, payable_date = dates[6], dates[7], dates[9]
+    effective_date = dates[10]
+    rename_mask = (data["symbol"] == "SZ000001") & (data["trade_date"] >= effective_date)
+    data.loc[rename_mask, "symbol"] = "SZ000003"
+    data.loc[rename_mask, "name"] = "SZ000003"
+    dividend = CashDividendEvent(
+        event_id="synthetic-dividend-1",
+        symbol="SZ000001",
+        record_date=record_date,
+        ex_date=ex_date,
+        payable_date=payable_date,
+        gross_per_share_cny=Decimal("0.10"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    code_change = CodeChangeEvent(
+        event_id="synthetic-code-change-1",
+        old_symbol="SZ000001",
+        new_symbol="SZ000003",
+        effective_date=effective_date,
+        security_identity="SYNTHETIC-ISSUER-1",
+        share_ratio=Decimal("1"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    result = run_backtest(
+        data,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(dividend, code_change),
+        dividend_tax_cny_by_event={dividend.event_id: Decimal("0")},
+    )
+
+    events = result["accounting_journal"]
+    action_rows = events.loc[events["event_id"].isin([dividend.event_id, code_change.event_id])]
+    assert set(action_rows["entry_type"]) == {
+        "ENTITLEMENT_SNAPSHOT", "CASH_DIVIDEND_RECEIVABLE", "CASH_RECEIVABLE_SETTLED", "CODE_CHANGE_1_TO_1",
+    }
+    migration = result["security_events"].loc[
+        result["security_events"]["event_id"] == code_change.event_id
+    ].iloc[0]
+    assert migration["old_shares"] > 0
+    assert migration["new_shares"] == migration["old_shares"]
+    assert migration["cost_basis_before_cny"] == migration["cost_basis_after_cny"]
+    assert migration["cash_before_cny"] == migration["cash_after_cny"]
+    assert migration["trade_count_before"] == migration["trade_count_after"]
+    assert "SZ000001" not in set(result["open_positions"]["symbol"])
+    assert result["metrics"]["accounting_event_ids"] == [dividend.event_id, code_change.event_id]
+    assert result["metrics"]["accounting_event_scheduler_status"] == "supported_subset_applied"
+
+    accrual = action_rows.loc[action_rows["entry_type"] == "CASH_DIVIDEND_RECEIVABLE"].iloc[0]
+    settlement = action_rows.loc[action_rows["entry_type"] == "CASH_RECEIVABLE_SETTLED"].iloc[0]
+    assert float(accrual["cash_delta_cny"]) == 0.0
+    assert float(settlement["cash_delta_cny"]) > 0.0
+    assert all(receivable.status == "SETTLED" for receivable in result["accounting_snapshot"].receivables)
+
+    with pytest.raises(ValueError, match="无法计算可信 NAV"):
+        run_backtest(
+            data,
+            100_000,
+            config,
+            security_identity_events=pd.DataFrame(),
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_v2",
+            accounting_events=(dividend,),
+        )
+
+
+def test_code_change_without_pending_rebalance_does_not_liquidate_other_holdings():
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=16)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    effective_date = dates[5]
+    rename_mask = (data["symbol"] == "SZ000001") & (data["trade_date"] >= effective_date)
+    data.loc[rename_mask, "symbol"] = "SZ000003"
+    data.loc[rename_mask, "name"] = "SZ000003"
+    event = CodeChangeEvent(
+        event_id="synthetic-code-change-no-pending-target",
+        old_symbol="SZ000001",
+        new_symbol="SZ000003",
+        effective_date=effective_date,
+        security_identity="SYNTHETIC-ISSUER-1",
+        share_ratio=Decimal("1"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    result = run_backtest(
+        data,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(event,),
+    )
+    migration = result["security_events"].loc[
+        result["security_events"]["event_id"] == event.event_id
+    ].iloc[0]
+    assert migration["old_shares"] > 0
+    assert migration["trade_count_before"] == migration["trade_count_after"]
+    assert migration["cash_before_cny"] == migration["cash_after_cny"]
+    assert not result["trades"]["trade_date"].eq(effective_date).any()
+
+
+def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type():
+    from cehuan.backtest.event_scheduler import AccountingEventSchedule
+    from cehuan.accounting import ShareDistributionEvent
+
+    with pytest.raises(ValueError, match="除息日不在输入交易日"):
+        dividend = CashDividendEvent(
+            event_id="off-calendar-dividend", symbol="SZ000001",
+            record_date="2025-01-01", ex_date="2025-01-02", payable_date="2025-01-03",
+            gross_per_share_cny=Decimal("0.1"), known_at_utc="2024-12-01T00:00:00+00:00",
+            source=_action_source(),
+        )
+        AccountingEventSchedule.build([dividend], [date(2025, 1, 1), date(2025, 1, 3)])
+
+    distribution = ShareDistributionEvent(
+        event_id="unsupported-distribution", symbol="SZ000001", record_date="2025-01-01",
+        effective_date="2025-01-02", tradable_date="2025-01-03",
+        shares_per_old_share=Decimal("0.1"), known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    with pytest.raises(TypeError, match="只接受 CashDividendEvent/CodeChangeEvent"):
+        AccountingEventSchedule.build([distribution], [date(2025, 1, 1)])
 
 
 def test_ledger_v2_execution_consumes_reviewed_rule_and_fee_schedule():

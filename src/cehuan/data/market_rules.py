@@ -27,6 +27,10 @@ def _required_columns(frame: pd.DataFrame, required: list[str], label: str) -> N
         raise ValueError(f"{label} 缺少字段：" + ", ".join(missing))
 
 
+def _clean_text(values: pd.Series) -> pd.Series:
+    return values.map(lambda value: "" if pd.isna(value) else str(value).strip())
+
+
 def _parse_bool(value: Any) -> bool | None:
     if pd.isna(value):
         return None
@@ -55,16 +59,17 @@ def _parse_date_columns(frame: pd.DataFrame, label: str) -> pd.DataFrame:
 
 
 def _validate_source_review(frame: pd.DataFrame, label: str) -> None:
-    source_hash = frame["source_sha256"].astype(str).str.strip()
+    source_hash = _clean_text(frame["source_sha256"])
     hash_ok = source_hash.map(
         lambda value: len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
     )
+    reviewed_at = pd.to_datetime(_clean_text(frame["reviewed_at"]), errors="coerce", format="mixed")
     complete = (
-        frame["source"].astype(str).str.strip().ne("")
+        _clean_text(frame["source"]).ne("")
         & hash_ok
-        & frame["review_status"].astype(str).str.strip().eq("REVIEWED")
-        & frame["reviewed_by"].astype(str).str.strip().ne("")
-        & frame["reviewed_at"].astype(str).str.strip().ne("")
+        & _clean_text(frame["review_status"]).eq("REVIEWED")
+        & _clean_text(frame["reviewed_by"]).ne("")
+        & reviewed_at.notna()
     )
     if not complete.all():
         raise ValueError(f"{label} 存在缺少来源 SHA-256 或人工复核字段的记录")
@@ -88,10 +93,10 @@ def normalize_market_rule_schedule(frame: pd.DataFrame) -> pd.DataFrame:
     """Validate the reviewed, effective-dated per-security trading-rule contract."""
     _required_columns(frame, MARKET_RULE_COLUMNS, "有效日期交易规则")
     rules = frame[MARKET_RULE_COLUMNS].copy()
-    rules["symbol"] = rules["symbol"].astype(str).str.strip().str.upper()
-    rules["board"] = rules["board"].astype(str).str.strip()
+    rules["symbol"] = _clean_text(rules["symbol"]).str.upper()
+    rules["board"] = _clean_text(rules["board"])
     for column in ("source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"):
-        rules[column] = rules[column].astype(str).str.strip()
+        rules[column] = _clean_text(rules[column])
     if rules.empty or rules["symbol"].eq("").any() or rules["board"].eq("").any():
         raise ValueError("有效日期交易规则不能为空，证券代码和板块也不能为空")
     rules = _parse_date_columns(rules, "有效日期交易规则")
@@ -103,6 +108,13 @@ def normalize_market_rule_schedule(frame: pd.DataFrame) -> pd.DataFrame:
     numeric_columns = ["price_limit_pct", *_INTEGER_COLUMNS]
     for column in numeric_columns:
         rules[column] = pd.to_numeric(rules[column].replace("", pd.NA), errors="coerce")
+    integer_values = rules[list(_INTEGER_COLUMNS)].to_numpy(dtype=float, na_value=np.nan)
+    limit_values = rules["price_limit_pct"].to_numpy(dtype=float, na_value=np.nan)
+    invalid_limit_number = np.isinf(limit_values) | (
+        rules["has_price_limit"].to_numpy(dtype=bool) & ~np.isfinite(limit_values)
+    )
+    if not np.isfinite(integer_values).all() or invalid_limit_number.any():
+        raise ValueError("有效日期交易规则数值字段必须有限；交易单位和适用的涨跌幅阈值不能为 NaN/inf")
     if rules[list(_INTEGER_COLUMNS)].isna().any().any():
         raise ValueError("有效日期交易规则交易单位不能缺失")
     for column in _INTEGER_COLUMNS:

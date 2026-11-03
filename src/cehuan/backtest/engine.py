@@ -6,10 +6,11 @@ import math
 import subprocess
 import uuid
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,6 +19,7 @@ import pandas as pd
 from cehuan import __version__
 from cehuan.accounting import FeeItem, PortfolioLedger, PriceMark, TradeFill
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
+from cehuan.backtest.event_scheduler import AccountingEventSchedule, SupportedAccountingEvent
 from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
 from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
@@ -280,6 +282,8 @@ def run_backtest(
     accounting_mode: str = "legacy",
     market_rule_schedule: pd.DataFrame | None = None,
     fee_schedule: pd.DataFrame | None = None,
+    accounting_events: Sequence[SupportedAccountingEvent] | None = None,
+    dividend_tax_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -297,6 +301,8 @@ def run_backtest(
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(security_identity_events, pd.DataFrame):
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
+    if accounting_mode != "ledger_v2" and (accounting_events or dividend_tax_cny_by_event):
+        raise ValueError("显式账务事件与分红税费仅支持 ledger_v2 的非正式研究诊断")
     if (market_rule_schedule is None) != (fee_schedule is None):
         raise ValueError("有效日期规则和历史费率必须成对提供")
     use_effective_schedules = market_rule_schedule is not None
@@ -448,6 +454,13 @@ def run_backtest(
     if len(dates) <= lookback + 1:
         raise ValueError(f"至少需要 {lookback + 2} 个交易日，当前只有 {len(dates)} 天")
 
+    accounting_event_list = tuple(accounting_events or ())
+    event_schedule = AccountingEventSchedule.build(
+        accounting_event_list,
+        (pd.Timestamp(value).date() for value in dates),
+        dividend_tax_cny_by_event,
+    )
+
     cash = float(initial_cash_cny)
     holdings: dict[str, int] = {}
     cost_basis_cny: dict[str, float] = {}
@@ -491,6 +504,71 @@ def run_backtest(
     for index, (date, start, end) in enumerate(zip(dates, day_starts, day_ends)):
         day = data.iloc[start:end].set_index("symbol", drop=False)
         day_date = pd.Timestamp(date).strftime("%Y-%m-%d")
+
+        # Typed 1:1 code changes run at the new code's first effective
+        # session. They are ledger events, never fills or charged orders.
+        for event in event_schedule.code_changes.get(pd.Timestamp(date).date(), ()):
+            if execution_ledger is None:
+                raise ValueError("代码变更账务事件仅支持 ledger_v2")
+            old_symbol, new_symbol = event.old_symbol, event.new_symbol
+            new_row = day.loc[new_symbol] if new_symbol in day.index else None
+            if isinstance(new_row, pd.DataFrame):
+                raise ValueError(f"{day_date} {new_symbol} 的日线不唯一，不能执行身份迁移")
+            if new_row is None:
+                raise ValueError(f"{day_date} {new_symbol} 缺少代码变更生效日行情，不能验证身份迁移")
+            if any(
+                pd.isna(new_row.get(column))
+                or not math.isfinite(float(new_row[column]))
+                or float(new_row[column]) <= 0
+                for column in ("open", "high", "low", "close")
+            ):
+                raise ValueError(f"{day_date} {new_symbol} 生效日 OHLC 无效，不能迁移持仓")
+            if pd.isna(new_row.get("is_suspended")) or bool(new_row["is_suspended"]):
+                raise ValueError(f"{day_date} {new_symbol} 生效日停牌状态未知或为停牌，不能迁移持仓")
+            if pd.isna(new_row.get("is_listed")) or not bool(new_row["is_listed"]):
+                raise ValueError(f"{day_date} {new_symbol} 生效日上市状态未知或未上市，不能迁移持仓")
+            if old_symbol in day.index:
+                raise ValueError(f"{day_date} 旧代码 {old_symbol} 与新代码行情同时存在，身份事件需人工核验")
+            cash_before = cash
+            shares_before = holdings.get(old_symbol, 0)
+            basis_before = cost_basis_cny.get(old_symbol, 0.0)
+            trade_count_before = len(trades)
+            execution_ledger.apply_code_change(event, as_of=event.effective_date)
+            sync_projection_from_ledger()
+            if pending_targets is not None:
+                pending_targets.pop(old_symbol, None)
+                pending_targets.pop(new_symbol, None)
+            if shares_before:
+                transition_signal_ready_index[new_symbol] = index + lookback
+            last_prices.pop(old_symbol, None)
+            last_price_dates.pop(old_symbol, None)
+            last_price_sources.pop(old_symbol, None)
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "MIGRATE_POSITION" if shares_before else "NO_POSITION",
+                "old_symbol": old_symbol,
+                "new_symbol": new_symbol,
+                "share_ratio": "1:1",
+                "old_shares": shares_before,
+                "new_shares": shares_before,
+                "cost_basis_before_cny": basis_before,
+                "cost_basis_after_cny": basis_before,
+                "cash_before_cny": cash_before,
+                "cash_after_cny": cash,
+                "trade_count_before": trade_count_before,
+                "trade_count_after": len(trades),
+                "signal_policy": f"new code starts a fresh {lookback}-session momentum window",
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        # Older receivables are settled before the day's simulated orders.
+        for event in event_schedule.dividend_payments.get(pd.Timestamp(date).date(), ()):
+            receivable_id = f"dividend:{event.event_id}"
+            if execution_ledger is not None and event.payable_date != event.ex_date:
+                if any(item.receivable_id == receivable_id for item in execution_ledger.snapshot().receivables):
+                    execution_ledger.settle_receivable(receivable_id, settled_on=event.payable_date)
+                    sync_projection_from_ledger()
 
         for action in action_events.to_dict(orient="records"):
             old_symbol = str(action["old_symbol"])
@@ -772,6 +850,27 @@ def run_backtest(
                     })
             pending_targets = None
 
+        # Company-action accounting is applied after the simulated open fills:
+        # record-date entitlement reflects end-of-session holdings, accrual is
+        # recognized on ex-date, and payable cash is settled on its scheduled
+        # date. An unknown dividend tax leaves NAV unvalued and stops the run.
+        if execution_ledger is not None:
+            action_day = pd.Timestamp(date).date()
+            for event in event_schedule.dividend_records.get(action_day, ()):
+                execution_ledger.record_cash_dividend(event, as_of=event.record_date)
+            for event in event_schedule.dividend_accruals.get(action_day, ()):
+                execution_ledger.accrue_cash_dividend(
+                    event,
+                    as_of=event.ex_date,
+                    tax_cny=event_schedule.dividend_tax_cny.get(event.event_id),
+                )
+            for event in event_schedule.dividend_payments.get(action_day, ()):
+                if event.payable_date == event.ex_date:
+                    execution_ledger.settle_receivable(
+                        f"dividend:{event.event_id}", settled_on=event.payable_date,
+                    )
+            sync_projection_from_ledger()
+
         for symbol in holdings:
             row = day.loc[symbol] if symbol in day.index else None
             if row is not None and pd.notna(row["close"]) and float(row["close"]) > 0:
@@ -904,6 +1003,25 @@ def run_backtest(
         data_digest = hashlib.sha256(
             f"{data_digest}:{corporate_action_data_sha256}".encode("utf-8")
         ).hexdigest()
+    accounting_event_data_sha256 = None
+    if accounting_event_list:
+        event_payload = json.dumps(
+            {
+                "events": [asdict(event) for event in sorted(accounting_event_list, key=lambda item: item.event_id)],
+                "dividend_tax_cny_by_event": {
+                    event_id: None if amount is None else str(amount)
+                    for event_id, amount in sorted(event_schedule.dividend_tax_cny.items())
+                },
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        accounting_event_data_sha256 = hashlib.sha256(event_payload).hexdigest()
+        data_digest = hashlib.sha256(
+            f"{data_digest}:{accounting_event_data_sha256}".encode("utf-8")
+        ).hexdigest()
     benchmark_data_digest = None
     if benchmark_data is not None:
         benchmark_data_digest = hashlib.sha256(
@@ -948,7 +1066,7 @@ def run_backtest(
     limitations = [
         "基线以收盘 t 的信号在下一交易日开盘模拟；不代表可成交价格。",
         "日线 OHLC 无法重建开盘队列、盘口流动性、真实停牌日与部分涨跌停成交。",
-        "使用原始价结算，没有现金分红、送转、配股、退市与历史成分股处理；结果仅为技术验证。",
+        "账务事件只覆盖本次显式登记并支持的类型；未登记或未实现的送转、配股、退市、其他合并及历史成分股处理仍可能影响结果。",
     ]
     if normalized_fee_schedule is None:
         limitations.append("配置中的费用费率统一应用于整段历史，不代表历史逐年费率或个人账户实际佣金。")
@@ -971,6 +1089,13 @@ def run_backtest(
         "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
         "corporate_actions_sha256": corporate_action_data_sha256,
         "corporate_action_event_ids": action_events["event_id"].astype(str).tolist() if not action_events.empty else [],
+        "accounting_events_sha256": accounting_event_data_sha256,
+        "accounting_event_ids": [event.event_id for event in accounting_event_list],
+        "accounting_event_types": [type(event).__name__ for event in accounting_event_list],
+        "dividend_tax_known_event_ids": sorted(
+            event_id for event_id, amount in event_schedule.dividend_tax_cny.items() if amount is not None
+        ),
+        "accounting_event_scheduler_status": "supported_subset_applied" if accounting_event_list else "no_typed_events",
         "market_rule_schedule_sha256": market_rule_schedule_digest,
         "market_rule_schedule_rows": int(len(normalized_market_rules)) if normalized_market_rules is not None else 0,
         "fee_schedule_sha256": fee_schedule_digest,

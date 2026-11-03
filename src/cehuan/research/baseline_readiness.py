@@ -205,7 +205,7 @@ def _audit_market_rules(bars: pd.DataFrame, rules_path: str | Path, start: str, 
                 and all(ch in "0123456789abcdefABCDEF" for ch in rule["source_sha256"])
                 and rule["review_status"] == "REVIEWED"
                 and bool(rule["reviewed_by"])
-                and bool(rule["reviewed_at"])
+                and pd.notna(pd.to_datetime(rule["reviewed_at"], errors="coerce", format="mixed"))
                 and pd.notna(rule["is_listed"])
                 and pd.notna(rule["is_suspended"])
                 and pd.notna(rule["is_st"])
@@ -220,11 +220,15 @@ def _audit_market_rules(bars: pd.DataFrame, rules_path: str | Path, start: str, 
                 and all(float(rule[column]) > 0 for column in (
                     "buy_min_shares", "buy_step_shares", "sell_min_shares", "sell_step_shares",
                 ))
+                and all(math.isfinite(float(rule[column])) for column in (
+                    "buy_min_shares", "buy_step_shares", "sell_min_shares", "sell_step_shares",
+                ))
                 and (
                     (not bool(rule["has_price_limit"]) and pd.isna(rule["price_limit_pct"]))
                     or (
                         bool(rule["has_price_limit"])
                         and pd.notna(rule["price_limit_pct"])
+                        and math.isfinite(float(rule["price_limit_pct"]))
                         and 0 < float(rule["price_limit_pct"]) <= 1
                     )
                 )
@@ -336,9 +340,14 @@ def _audit_fee_schedule(fees_path: str | Path, bars: pd.DataFrame, start: str, e
     for column in ("commission_rate", "minimum_commission_cny", "stamp_duty_sell_rate", "transfer_fee_rate"):
         fees[column] = pd.to_numeric(fees[column], errors="coerce")
     numeric_columns = ["commission_rate", "minimum_commission_cny", "stamp_duty_sell_rate", "transfer_fee_rate"]
-    invalid_rate = fees[numeric_columns].isna().any(axis=1) | fees[numeric_columns].lt(0).any(axis=1)
+    fee_values = fees[numeric_columns].to_numpy(dtype=float, na_value=np.nan)
+    invalid_rate = (
+        fees[numeric_columns].isna().any(axis=1)
+        | fees[numeric_columns].lt(0).any(axis=1)
+        | ~pd.Series(np.isfinite(fee_values).all(axis=1), index=fees.index)
+    )
     if invalid_rate.any():
-        return {"complete": False, "errors": ["历史费率包含缺失或负数费率"]}
+        return {"complete": False, "errors": ["历史费率包含缺失、非有限值或负数费率"]}
     dates = pd.to_datetime(bars.loc[
         pd.to_datetime(bars["trade_date"]).between(pd.Timestamp(start), pd.Timestamp(end), inclusive="both"),
         "trade_date",
@@ -366,7 +375,8 @@ def _audit_fee_schedule(fees_path: str | Path, bars: pd.DataFrame, start: str, e
         lambda value: len(str(value)) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in str(value))
     )
     review_ok &= fees["review_status"].eq("REVIEWED")
-    review_ok &= fees["reviewed_by"].str.strip().ne("") & fees["reviewed_at"].str.strip().ne("")
+    review_ok &= fees["reviewed_by"].str.strip().ne("")
+    review_ok &= pd.to_datetime(fees["reviewed_at"], errors="coerce", format="mixed").notna()
     if not review_ok.all():
         errors.append("历史费率缺少来源散列或人工复核元数据")
     return {"complete": not errors, "evaluation_session_count": int(len(dates)), "errors": errors}
@@ -572,9 +582,11 @@ def build_baseline_readiness(
     if not benchmark_complete:
         blockers.append("BENCHMARK_COVERAGE_INCOMPLETE")
 
-    # Current simulation code still uses fallback/configured costs and rules,
-    # and does not post complete corporate actions to the portfolio ledger.
+    # Keep formal capability blocked until all audited inputs and the complete
+    # event coverage are consumed by this execution path. Research-only rule,
+    # fee and limited typed-event support is not equivalent to that contract.
     checks["execution_engine"] = {
+        "scope": "formal_baseline",
         "effective_dated_market_rules_consumed": False,
         "historical_fee_schedule_consumed": False,
         "corporate_action_ledger_complete": False,

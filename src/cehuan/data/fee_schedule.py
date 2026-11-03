@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 
@@ -15,13 +16,17 @@ FEE_RATE_COLUMNS = (
 )
 
 
+def _clean_text(values: pd.Series) -> pd.Series:
+    return values.map(lambda value: "" if pd.isna(value) else str(value).strip())
+
+
 def normalize_fee_schedule(frame: pd.DataFrame) -> pd.DataFrame:
     """Validate a reviewed, effective-dated A-share fee assumption table."""
     missing = sorted(set(FEE_SCHEDULE_COLUMNS).difference(frame.columns))
     if missing:
         raise ValueError("历史费率缺少字段：" + ", ".join(missing))
     fees = frame[FEE_SCHEDULE_COLUMNS].copy()
-    fees["market"] = fees["market"].astype(str).str.strip().str.upper()
+    fees["market"] = _clean_text(fees["market"]).str.upper()
     if fees.empty or not fees["market"].eq("A_SHARE").all():
         raise ValueError("历史费率当前仅接受非空的 A_SHARE 费率表")
     fees["valid_from"] = pd.to_datetime(fees["valid_from"], errors="coerce").dt.normalize()
@@ -33,16 +38,18 @@ def normalize_fee_schedule(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("历史费率 valid_to 早于 valid_from")
     for column in FEE_RATE_COLUMNS:
         fees[column] = pd.to_numeric(fees[column].replace("", pd.NA), errors="coerce")
-    if fees[list(FEE_RATE_COLUMNS)].isna().any().any() or fees[list(FEE_RATE_COLUMNS)].lt(0).any().any():
-        raise ValueError("历史费率包含缺失或负费率")
+    fee_values = fees[list(FEE_RATE_COLUMNS)].to_numpy(dtype=float, na_value=np.nan)
+    if not np.isfinite(fee_values).all() or (fee_values < 0).any():
+        raise ValueError("历史费率包含缺失、非有限值或负费率")
     for column in ("source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"):
-        fees[column] = fees[column].astype(str).str.strip()
+        fees[column] = _clean_text(fees[column])
     digest_ok = fees["source_sha256"].map(
         lambda value: len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
     )
+    reviewed_at = pd.to_datetime(fees["reviewed_at"], errors="coerce", format="mixed")
     reviewed = (
         fees["source"].ne("") & digest_ok & fees["review_status"].eq("REVIEWED")
-        & fees["reviewed_by"].ne("") & fees["reviewed_at"].ne("")
+        & fees["reviewed_by"].ne("") & reviewed_at.notna()
     )
     if not reviewed.all():
         raise ValueError("历史费率存在缺少来源 SHA-256 或人工复核字段的记录")
