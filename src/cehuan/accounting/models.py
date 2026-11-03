@@ -206,6 +206,7 @@ class NoncashClaim:
     cost_basis_cny: Decimal = Decimal("0")
     acquired_on: date | None = None
     valuation_as_of: date | None = None
+    lot_allocations: tuple[tuple[str, int, Decimal, date], ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.claim_id).strip() or not str(self.event_id).strip():
@@ -221,6 +222,24 @@ class NoncashClaim:
         )
         valuation_as_of = calendar_date(self.valuation_as_of, "valuation_as_of", optional=True)
         basis = decimal_value(self.cost_basis_cny, "cost_basis_cny", nonnegative=True)
+        lot_allocations: list[tuple[str, int, Decimal, date]] = []
+        for allocation in self.lot_allocations:
+            if not isinstance(allocation, tuple) or len(allocation) != 4:
+                raise ValueError("lot_allocations 每项必须是 (lot_id, shares, cost_basis_cny, acquired_on)")
+            lot_id, shares, lot_basis, acquired = allocation
+            lot_id = str(lot_id).strip()
+            if not lot_id:
+                raise ValueError("lot_allocations 的 lot_id 不能为空")
+            shares = share_count(shares, "lot_allocations.shares", allow_zero=True)
+            lot_basis = decimal_value(lot_basis, "lot_allocations.cost_basis_cny", nonnegative=True)
+            acquired = calendar_date(acquired, "lot_allocations.acquired_on")
+            lot_allocations.append((lot_id, shares, lot_basis, acquired))
+        if len({item[0] for item in lot_allocations}) != len(lot_allocations):
+            raise ValueError("lot_allocations 的 lot_id 不能重复")
+        if lot_allocations and sum(item[1] for item in lot_allocations) != (allocated or 0):
+            raise ValueError("lot_allocations 股数与 final_allocated_shares 不一致")
+        if lot_allocations and sum((item[2] for item in lot_allocations), start=Decimal("0")) != basis:
+            raise ValueError("lot_allocations 成本与 claim 成本不一致")
         if valuation is not None and not str(self.valuation_source or "").strip():
             raise ValueError("有估值的权利必须登记 valuation_source")
         if valuation is not None and valuation_as_of is None:
@@ -239,6 +258,7 @@ class NoncashClaim:
         object.__setattr__(self, "cost_basis_cny", basis)
         object.__setattr__(self, "acquired_on", calendar_date(self.acquired_on, "acquired_on", optional=True))
         object.__setattr__(self, "valuation_as_of", valuation_as_of)
+        object.__setattr__(self, "lot_allocations", tuple(lot_allocations))
         status = str(self.status).strip()
         if not status:
             raise ValueError("权利状态不能为空")

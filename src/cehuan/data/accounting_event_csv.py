@@ -10,18 +10,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from cehuan.accounting.events import ActionSource, CashDividendEvent, CodeChangeEvent
+from cehuan.accounting.events import ActionSource, CashDividendEvent, CodeChangeEvent, ShareDistributionEvent
 from cehuan.accounting.models import decimal_value
 
 
 ACCOUNTING_EVENT_CSV_COLUMNS = [
     "event_id", "event_type", "known_at_utc", "symbol", "record_date", "ex_date",
     "payable_date", "gross_per_share_cny", "old_symbol", "new_symbol", "effective_date",
-    "security_identity", "share_ratio", "tax_cny", "source_id", "source_url",
+    "registration_date", "tradable_date", "security_identity", "share_ratio",
+    "fractional_share_method", "tax_cny", "source_id", "source_url",
     "source_sha256", "source_title", "source_page_reference", "source_archive_file",
     "review_status", "reviewed_by", "reviewed_at",
 ]
-ACCOUNTING_EVENT_TYPES = {"CASH_DIVIDEND", "CODE_CHANGE_1_TO_1"}
+ACCOUNTING_EVENT_TYPES = {"CASH_DIVIDEND", "CODE_CHANGE_1_TO_1", "SHARE_DISTRIBUTION"}
 SOURCE_REVIEW_COLUMNS = (
     "source_id", "source_url", "source_sha256", "source_title", "source_page_reference",
     "source_archive_file", "review_status", "reviewed_by", "reviewed_at",
@@ -30,7 +31,7 @@ SOURCE_REVIEW_COLUMNS = (
 
 @dataclass(frozen=True)
 class AccountingEventBundle:
-    events: tuple[CashDividendEvent | CodeChangeEvent, ...]
+    events: tuple[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent, ...]
     dividend_tax_cny_by_event: dict[str, Decimal | None]
     source_audit: pd.DataFrame
     source_csv_sha256: str
@@ -41,7 +42,7 @@ def _text(value: object) -> str:
 
 
 def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
-    """Read reviewed dividend/1:1 code-change rows and verify each archived source.
+    """Read reviewed supported event rows and verify each archived source.
 
     This checks event-key uniqueness, event-to-source row association, HTTPS
     metadata, reviewer fields, and the archived file's byte hash. It does not
@@ -70,9 +71,12 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
         raise ValueError("公司行动事件 event_id 必须唯一：" + ", ".join(duplicate_ids))
     unknown_types = sorted(set(frame["event_type"]).difference(ACCOUNTING_EVENT_TYPES))
     if unknown_types:
-        raise ValueError("当前 CSV 适配器只支持 CASH_DIVIDEND/CODE_CHANGE_1_TO_1：" + ", ".join(unknown_types))
+        raise ValueError(
+            "当前 CSV 适配器只支持 CASH_DIVIDEND/CODE_CHANGE_1_TO_1/SHARE_DISTRIBUTION："
+            + ", ".join(unknown_types)
+        )
 
-    events: list[CashDividendEvent | CodeChangeEvent] = []
+    events: list[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent] = []
     taxes: dict[str, Decimal | None] = {}
     audits: list[dict[str, object]] = []
     for row in frame.to_dict(orient="records"):
@@ -107,7 +111,8 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
         )
         if row["event_type"] == "CASH_DIVIDEND":
             if any(row[column] for column in (
-                "old_symbol", "new_symbol", "effective_date", "security_identity", "share_ratio",
+                "old_symbol", "new_symbol", "effective_date", "registration_date", "tradable_date",
+                "security_identity", "share_ratio", "fractional_share_method",
             )):
                 raise ValueError(f"{event_id} 分红行包含代码变更专属字段")
             for column in ("symbol", "record_date", "ex_date", "payable_date", "gross_per_share_cny"):
@@ -127,7 +132,7 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
                 None if not row["tax_cny"]
                 else decimal_value(row["tax_cny"], f"{event_id}.tax_cny", nonnegative=True)
             )
-        else:
+        elif row["event_type"] == "CODE_CHANGE_1_TO_1":
             if any(row[column] for column in (
                 "symbol", "record_date", "ex_date", "payable_date", "gross_per_share_cny", "tax_cny",
             )):
@@ -135,6 +140,8 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
             for column in ("old_symbol", "new_symbol", "effective_date", "security_identity", "share_ratio"):
                 if not row[column]:
                     raise ValueError(f"{event_id} 代码变更行缺少 {column}")
+            if any(row[column] for column in ("registration_date", "tradable_date", "fractional_share_method")):
+                raise ValueError(f"{event_id} 代码变更行包含送转专属字段")
             event = CodeChangeEvent(
                 event_id=event_id,
                 old_symbol=row["old_symbol"],
@@ -142,6 +149,30 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
                 effective_date=row["effective_date"],
                 security_identity=row["security_identity"],
                 share_ratio=Decimal(row["share_ratio"]),
+                known_at_utc=row["known_at_utc"],
+                source=action_source,
+            )
+        else:
+            if any(row[column] for column in (
+                "ex_date", "payable_date", "gross_per_share_cny", "old_symbol", "new_symbol",
+                "security_identity", "tax_cny",
+            )):
+                raise ValueError(f"{event_id} 送转行包含分红或代码变更专属字段")
+            for column in (
+                "symbol", "record_date", "effective_date", "registration_date", "tradable_date",
+                "share_ratio", "fractional_share_method",
+            ):
+                if not row[column]:
+                    raise ValueError(f"{event_id} 送转行缺少 {column}")
+            event = ShareDistributionEvent(
+                event_id=event_id,
+                symbol=row["symbol"],
+                record_date=row["record_date"],
+                effective_date=row["effective_date"],
+                registration_date=row["registration_date"],
+                tradable_date=row["tradable_date"],
+                shares_per_old_share=Decimal(row["share_ratio"]),
+                fractional_share_method=row["fractional_share_method"],
                 known_at_utc=row["known_at_utc"],
                 source=action_source,
             )

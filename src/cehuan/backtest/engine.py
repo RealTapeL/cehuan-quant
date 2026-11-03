@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from cehuan import __version__
-from cehuan.accounting import FeeItem, PortfolioLedger, PriceMark, TradeFill
+from cehuan.accounting import FeeItem, PortfolioLedger, PriceMark, ShareDistributionEvent, TradeFill
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.backtest.event_scheduler import AccountingEventSchedule, SupportedAccountingEvent
 from cehuan.config import load_config
@@ -484,6 +484,31 @@ def run_backtest(
         if accounting_mode == "ledger_v2" else None
     )
 
+    def mark_distribution_claim_at_close(
+        event: ShareDistributionEvent,
+        action_day: date,
+        day_frame: pd.DataFrame,
+    ) -> None:
+        if execution_ledger is None:
+            raise ValueError("送转权利估值仅支持 ledger_v2")
+        row = day_frame.loc[event.symbol] if event.symbol in day_frame.index else None
+        if row is None or pd.isna(row.get("close")) or float(row["close"]) <= 0:
+            raise ValueError(
+                f"送转权利 {event.event_id} 在 {action_day} 缺少有效底层收盘价，不能估值待登记权利"
+            )
+        suspended = row.get("is_suspended")
+        if pd.isna(suspended) or bool(suspended):
+            raise ValueError(
+                f"送转权利 {event.event_id} 在 {action_day} 的停牌状态未知或已停牌，"
+                "不能用陈旧价格生成 NAV"
+            )
+        execution_ledger.mark_share_distribution_claim(
+            event,
+            as_of=action_day,
+            underlying_close_cny=Decimal(str(float(row["close"]))),
+            price_source=str(row.get("data_source", "normalized_input_bars")),
+        )
+
     def sync_projection_from_ledger() -> None:
         nonlocal cash
         if execution_ledger is None:
@@ -560,6 +585,45 @@ def run_backtest(
                 "trade_count_before": trade_count_before,
                 "trade_count_after": len(trades),
                 "signal_policy": f"new code starts a fresh {lookback}-session momentum window",
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        for event in event_schedule.distribution_effective.get(pd.Timestamp(date).date(), ()):
+            if execution_ledger is None:
+                raise ValueError("送转账务事件仅支持 ledger_v2")
+            execution_ledger.apply_share_distribution(event, as_of=event.effective_date)
+            sync_projection_from_ledger()
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "SHARE_DISTRIBUTION_EFFECTIVE",
+                "symbol": event.symbol,
+                "registration_date": event.registration_date.isoformat(),
+                "tradable_date": event.tradable_date.isoformat(),
+                "cash_delta_cny": 0,
+                "trade_or_commission_created": False,
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        for event in event_schedule.distribution_registrations.get(pd.Timestamp(date).date(), ()):
+            if event.registration_date == event.effective_date:
+                continue
+            if execution_ledger is None:
+                raise ValueError("送转账务事件仅支持 ledger_v2")
+            claim = next((item for item in execution_ledger.claims if item.claim_id == f"distribution:{event.event_id}"), None)
+            if claim is None or claim.status == "CANCELLED":
+                continue
+            execution_ledger.register_share_distribution(event, as_of=event.registration_date)
+            sync_projection_from_ledger()
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "SHARE_DISTRIBUTION_REGISTRATION",
+                "symbol": event.symbol,
+                "registration_date": event.registration_date.isoformat(),
+                "tradable_date": event.tradable_date.isoformat(),
+                "cash_delta_cny": 0,
+                "trade_or_commission_created": False,
                 "accounting_source": "typed_accounting_event_ledger_v2",
             })
 
@@ -663,6 +727,23 @@ def run_backtest(
                 current = holdings.get(symbol, 0)
                 desired = target_shares.get(symbol, 0)
                 quantity = max(0, current - desired)
+                if quantity and execution_ledger is not None:
+                    trade_day = pd.Timestamp(date).date()
+                    available = sum(
+                        lot.sellable_on(trade_day)
+                        for lot in execution_ledger.positions
+                        if lot.symbol == symbol
+                    )
+                    unavailable = max(0, quantity - available)
+                    if unavailable:
+                        blocked_orders.append({
+                            "trade_date": day_date,
+                            "symbol": symbol,
+                            "side": "SELL",
+                            "quantity": unavailable,
+                            "reason": "送转或新买入股份尚未到可卖日期；按 T+1/可流通日约束保留持仓",
+                        })
+                    quantity = min(quantity, available)
                 row = day.loc[symbol] if symbol in day.index else None
                 if row is None:
                     if quantity:
@@ -847,8 +928,25 @@ def run_backtest(
         # date. An unknown dividend tax leaves NAV unvalued and stops the run.
         if execution_ledger is not None:
             action_day = pd.Timestamp(date).date()
+            for event in event_schedule.distribution_records.get(action_day, ()):
+                execution_ledger.record_share_distribution(event, as_of=event.record_date)
             for event in event_schedule.dividend_records.get(action_day, ()):
                 execution_ledger.record_cash_dividend(event, as_of=event.record_date)
+            for event in event_schedule.distribution_effective.get(action_day, ()):
+                if event.registration_date == event.effective_date:
+                    continue
+                claim = next((item for item in execution_ledger.claims if item.claim_id == f"distribution:{event.event_id}"), None)
+                if claim is None or claim.status != "DISTRIBUTION_PENDING_REGISTRATION":
+                    continue
+                mark_distribution_claim_at_close(event, action_day, day)
+            for event in event_schedule.distribution_effective.values():
+                for pending_event in event:
+                    if not pending_event.effective_date < action_day < pending_event.registration_date:
+                        continue
+                    claim = next((item for item in execution_ledger.claims if item.claim_id == f"distribution:{pending_event.event_id}"), None)
+                    if claim is None or claim.status != "DISTRIBUTION_PENDING_REGISTRATION":
+                        continue
+                    mark_distribution_claim_at_close(pending_event, action_day, day)
             for event in event_schedule.dividend_accruals.get(action_day, ()):
                 execution_ledger.accrue_cash_dividend(
                     event,

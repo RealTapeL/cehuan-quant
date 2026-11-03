@@ -47,6 +47,7 @@ from cehuan.review.reconcile import (
     review_markdown,
 )
 from cehuan.review.import_registry import find_fill_import_record, register_fill_import
+from cehuan.review.fill_dedup import audit_cross_file_fills
 from cehuan.signals.plan import generate_plan, plan_markdown
 
 
@@ -253,6 +254,16 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--import-registry", help="可选的本地成交导入登记簿；重复导入同一文件会拒绝")
     review.add_argument("--output-dir", help="复盘产物目录；必须不存在，默认创建唯一私有目录")
     review.add_argument("--mapping")
+
+    fills_dedup = subs.add_parser(
+        "fills-dedup", help="对规范成交 CSV 做保守的跨文件重叠分类；不会合并或删除记录",
+    )
+    fills_dedup.add_argument("--prior", action="append", required=True, help="先前成交 CSV；可重复指定")
+    fills_dedup.add_argument("--current", required=True, help="本次待检查 CSV")
+    fills_dedup.add_argument("--output", required=True, help="分类结果 CSV")
+    fills_dedup.add_argument("--execution-id-column", help="经核实后显式指定的稳定成交标识列；默认不假设有此字段")
+    fills_dedup.add_argument("--correction-link-column", help="显式指向原成交标识的更正/冲正关联列")
+    fills_dedup.add_argument("--status-column", help="可选记录状态列，仅作来源字段保留，不单独推断冲正")
 
     qlib = subs.add_parser("qlib-check", help="将规范数据交给 Qlib StaticDataLoader 读取")
     qlib.add_argument("--data", required=True)
@@ -1072,6 +1083,37 @@ def main(argv: list[str] | None = None) -> int:
             print(f"复盘文件：{root / 'review.md'}\n运行清单：{root / 'manifest.json'}")
             if import_receipt is not None:
                 print(f"成交导入登记：{registry_path} ({import_receipt['import_id']})")
+            return 0
+
+        if args.command == "fills-dedup":
+            def input_path(value: str) -> Path:
+                path = Path(value).expanduser()
+                return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+            report = audit_cross_file_fills(
+                [input_path(value) for value in args.prior],
+                input_path(args.current),
+                execution_id_column=args.execution_id_column,
+                correction_link_column=args.correction_link_column,
+                status_column=args.status_column,
+            )
+            output = Path(args.output).expanduser()
+            if not output.is_absolute():
+                output = REPO_ROOT / output
+            output = output.resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("x", encoding="utf-8", newline="") as handle:
+                report.to_csv(handle, index=False)
+            counts = report["classification"].value_counts().to_dict() if not report.empty else {}
+            summary = {
+                "result_type": "synthetic_or_user_normalized_fill_overlap_audit_not_broker_validated",
+                "rows": len(report),
+                "classification_counts": counts,
+                "execution_id_column_assumed": args.execution_id_column,
+                "automatic_rows_removed": 0,
+                "output": str(output),
+            }
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
 
         if args.command == "qlib-check":

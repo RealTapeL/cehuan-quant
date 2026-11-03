@@ -62,3 +62,42 @@ def test_accounting_event_csv_rejects_unreviewed_source(tmp_path):
 
     with pytest.raises(ValueError, match="必须为 REVIEWED"):
         read_accounting_event_csv(event_csv)
+
+
+def test_accounting_event_csv_reads_share_distribution_and_requires_all_event_dates(tmp_path):
+    archive = tmp_path / "distribution-notice.pdf"
+    archive.write_bytes(b"synthetic distribution source bytes")
+    row = _event_row(archive)
+    row.update({
+        "event_id": "dist-001",
+        "event_type": "SHARE_DISTRIBUTION",
+        "symbol": "SH600000",
+        "record_date": "2025-01-02",
+        "effective_date": "2025-01-03",
+        "registration_date": "2025-01-06",
+        "tradable_date": "2025-01-07",
+        "share_ratio": "0.3",
+        "fractional_share_method": "ACCOUNT_RESULT_REQUIRED",
+        "ex_date": "",
+        "payable_date": "",
+        "gross_per_share_cny": "",
+        "old_symbol": "",
+        "new_symbol": "",
+        "security_identity": "",
+        "tax_cny": "",
+    })
+    event_csv = tmp_path / "events.csv"
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+
+    bundle = read_accounting_event_csv(event_csv)
+
+    event = bundle.events[0]
+    assert event.event_id == "dist-001"
+    assert event.registration_date.isoformat() == "2025-01-06"
+    assert event.tradable_date.isoformat() == "2025-01-07"
+    assert event.shares_per_old_share == Decimal("0.3")
+
+    row["registration_date"] = ""
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+    with pytest.raises(ValueError, match="缺少 registration_date"):
+        read_accounting_event_csv(event_csv)

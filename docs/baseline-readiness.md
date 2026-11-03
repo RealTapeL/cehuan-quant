@@ -54,7 +54,7 @@ uv run cehuan backtest \
 
 ## 目前为什么仍会阻断
 
-正式 readiness 仍会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。研究模式的 `ledger_v2` 已实际消费有效日期规则、逐日费率，并通过类型化 Python API 调度现金分红和 1:1 代码变更；但当前没有真实公司行动 CSV 适配、逐证券事件覆盖核验、完整送转/配股/换股/退市处理，也没有将所有正式审计输入绑定到该执行路径。不得手工删除阻断项。详见[账务契约与实现边界](corporate-action-accounting-contract.md)。
+正式 readiness 仍会包括 `EXECUTION_ENGINE_DOES_NOT_YET_CONSUME_AUDITED_RULES_FEES_AND_ACTION_LEDGER`，即使输入 CSV 列齐全也不会通过。研究模式的 `ledger_v2` 已实际消费有效日期规则、逐日费率，并通过来源校验事件 CSV 调度现金分红、1:1 代码变更和受限送转；但尚无真实公司行动全集覆盖核验、完整配股/换股/退市处理，也没有将所有正式审计输入绑定到该执行路径。不得手工删除阻断项。详见[账务契约与实现边界](corporate-action-accounting-contract.md)。
 
 正式回测唯一支持的行情输入是同一次 `universe-audit` 生成的 `--data <point_in_time_bars.csv>` 与 `--prevalidated-quality <point_in_time_quality.json>`。`--formal --universe` 会被拒绝，避免把原始快照与过滤后内存数据混用。`--readiness-universe` 仍指向原始股票池快照目录，用于重新核验成员、manifest 和证据；它不是行情过滤参数。若同时提供 `--readiness-quality`，其文件内容必须与 `--prevalidated-quality` 相同。
 

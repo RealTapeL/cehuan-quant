@@ -105,6 +105,8 @@ class ShareDistributionEvent:
     shares_per_old_share: Decimal
     known_at_utc: datetime | str
     source: ActionSource
+    registration_date: date | str | None = None
+    fractional_share_method: str = "ACCOUNT_RESULT_REQUIRED"
 
     def __post_init__(self) -> None:
         event_id = str(self.event_id).strip()
@@ -112,9 +114,17 @@ class ShareDistributionEvent:
             raise ValueError("送转 event_id 不能为空")
         record = calendar_date(self.record_date, "record_date")
         effective = calendar_date(self.effective_date, "effective_date")
+        registration = calendar_date(
+            self.registration_date if self.registration_date is not None else effective,
+            "registration_date",
+        )
         tradable = calendar_date(self.tradable_date, "tradable_date")
-        if not record <= effective <= tradable:
-            raise ValueError("送转日期必须满足 record_date <= effective_date <= tradable_date")
+        if not record < effective <= registration <= tradable:
+            raise ValueError(
+                "送转日期必须满足 record_date < effective_date <= registration_date <= tradable_date"
+            )
+        if self.fractional_share_method != "ACCOUNT_RESULT_REQUIRED":
+            raise ValueError("当前仅支持 ACCOUNT_RESULT_REQUIRED；不得由程序猜测零股处理")
         known_at = _aware_instant(self.known_at_utc, "known_at_utc")
         _require_known_by(known_at, record, time(15, 0), "送转方案")
         if not isinstance(self.source, ActionSource):
@@ -126,8 +136,10 @@ class ShareDistributionEvent:
         object.__setattr__(self, "symbol", security_symbol(self.symbol, "symbol"))
         object.__setattr__(self, "record_date", record)
         object.__setattr__(self, "effective_date", effective)
+        object.__setattr__(self, "registration_date", registration)
         object.__setattr__(self, "tradable_date", tradable)
         object.__setattr__(self, "shares_per_old_share", ratio)
+        object.__setattr__(self, "fractional_share_method", self.fractional_share_method)
         object.__setattr__(self, "known_at_utc", known_at)
 
 

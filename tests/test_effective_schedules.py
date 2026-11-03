@@ -345,12 +345,112 @@ def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type()
 
     distribution = ShareDistributionEvent(
         event_id="unsupported-distribution", symbol="SZ000001", record_date="2025-01-01",
-        effective_date="2025-01-02", tradable_date="2025-01-03",
+        effective_date="2025-01-02", registration_date="2025-01-03", tradable_date="2025-01-03",
         shares_per_old_share=Decimal("0.1"), known_at_utc="2024-12-01T00:00:00+00:00",
         source=_action_source(),
     )
-    with pytest.raises(TypeError, match="只接受 CashDividendEvent/CodeChangeEvent"):
+    with pytest.raises(ValueError, match="生效日不在输入交易日"):
         AccountingEventSchedule.build([distribution], [date(2025, 1, 1)])
+
+
+def test_ledger_v2_schedules_share_distribution_record_effective_registration_and_tradability():
+    from cehuan.accounting import ShareDistributionEvent
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=16)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    event = ShareDistributionEvent(
+        event_id="synthetic-share-distribution-1",
+        symbol="SZ000001",
+        record_date=dates[4],
+        effective_date=dates[5],
+        registration_date=dates[6],
+        tradable_date=dates[7],
+        shares_per_old_share=Decimal("0.3"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+
+    result = run_backtest(
+        data,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(event,),
+    )
+
+    journal = result["accounting_journal"].loc[
+        result["accounting_journal"]["event_id"] == event.event_id
+    ]
+    assert set(journal["entry_type"]) == {
+        "SHARE_DISTRIBUTION_ENTITLEMENT_SNAPSHOT",
+        "SHARE_DISTRIBUTION_RIGHT_CONFIRMED",
+        "SHARE_DISTRIBUTION_RIGHT_MARK",
+        "SHARE_DISTRIBUTION_REGISTERED",
+    }
+    record = journal.loc[journal["entry_type"] == "SHARE_DISTRIBUTION_ENTITLEMENT_SNAPSHOT"].iloc[0]
+    assert int(record["cash_delta_cny"]) == 0
+    assert "eligible_old_shares" in str(record["details"])
+    assert not result["trades"].loc[
+        (result["trades"]["trade_date"] < dates[7])
+        & (result["trades"]["symbol"] == event.symbol)
+        & (result["trades"]["side"] == "SELL")
+    ].shape[0]
+    snapshot = result["accounting_snapshot"]
+    claim = next(item for item in snapshot.claims if item.event_id == event.event_id)
+    assert claim.status == "SETTLED"
+    registration_entry = next(
+        entry for entry in snapshot.journal
+        if entry.event_id == event.event_id and entry.entry_type == "SHARE_DISTRIBUTION_REGISTERED"
+    )
+    assert registration_entry.position_deltas[0][0] == event.symbol
+    assert registration_entry.position_deltas[0][1] > 0
+    sells = result["trades"].loc[result["trades"]["side"] == "SELL"]
+    assert sells.empty or (sells["trade_date"] >= event.tradable_date.isoformat()).all()
+
+
+def test_unpriced_or_suspended_interim_distribution_claim_blocks_diagnostic_nav():
+    from cehuan.accounting import ShareDistributionEvent
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=16)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    event = ShareDistributionEvent(
+        event_id="synthetic-share-distribution-suspended",
+        symbol="SZ000001",
+        record_date=dates[4],
+        effective_date=dates[5],
+        registration_date=dates[7],
+        tradable_date=dates[8],
+        shares_per_old_share=Decimal("0.3"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    data.loc[
+        (data["symbol"] == event.symbol) & (data["trade_date"] == dates[6]),
+        "is_suspended",
+    ] = True
+
+    with pytest.raises(ValueError, match="停牌状态未知或已停牌"):
+        run_backtest(
+            data,
+            100_000,
+            config,
+            security_identity_events=pd.DataFrame(),
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_v2",
+            accounting_events=(event,),
+        )
 
 
 def test_code_change_open_decision_uses_open_and_point_in_time_status_only():

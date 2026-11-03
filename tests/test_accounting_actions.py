@@ -59,13 +59,17 @@ def _dividend() -> CashDividendEvent:
     )
 
 
-def _distribution(*, ratio: str = "0.3") -> ShareDistributionEvent:
+def _distribution(
+    *, ratio: str = "0.3", effective_date: str = "2026-10-30",
+    registration_date: str | None = None, tradable_date: str = "2026-11-05",
+) -> ShareDistributionEvent:
     return ShareDistributionEvent(
         event_id="dist-1",
         symbol="SH600000",
         record_date="2026-10-29",
-        effective_date="2026-10-30",
-        tradable_date="2026-11-05",
+        effective_date=effective_date,
+        registration_date=registration_date,
+        tradable_date=tradable_date,
         shares_per_old_share=Decimal(ratio),
         known_at_utc="2026-10-20T08:00:00Z",
         source=_source(),
@@ -196,27 +200,105 @@ def test_share_distribution_preserves_separate_existing_lots_and_total_basis():
     assert sum((lot.cost_basis_cny for lot in ledger.positions), Decimal("0")) == Decimal("1000")
 
 
+def test_distribution_record_date_snapshot_uses_close_holdings_after_same_day_sale():
+    ledger = PortfolioLedger(Decimal("0"), positions=(_lot(shares=200, basis="2000"),))
+    event = _distribution()
+    ledger.apply_fill(TradeFill(
+        fill_id="record-date-sale",
+        trade_date=event.record_date,
+        symbol=event.symbol,
+        side="SELL",
+        quantity=100,
+        price_cny=Decimal("10"),
+    ))
+
+    ledger.record_share_distribution(event, as_of=event.record_date)
+
+    snapshot = next(item for item in ledger.snapshot().entitlements if item.event_id == event.event_id)
+    claim = next(item for item in ledger.claims if item.event_id == event.event_id)
+    assert snapshot.total_shares == 100
+    assert claim.final_allocated_shares == 30
+    assert ledger.cash_cny == Decimal("1000")
+
+
+def test_distribution_without_record_date_holding_creates_no_trade_or_phantom_position():
+    ledger = PortfolioLedger(Decimal("500"))
+    event = _distribution()
+
+    ledger.record_share_distribution(event, as_of=event.record_date)
+    (entry,) = ledger.apply_share_distribution(event, as_of=event.effective_date)
+
+    assert entry.entry_type == "SHARE_DISTRIBUTION_NO_ELIGIBLE_HOLDING"
+    assert ledger.cash_cny == Decimal("500")
+    assert ledger.positions == ()
+    assert next(item for item in ledger.claims if item.event_id == event.event_id).status == "CANCELLED"
+
+
 def test_fractional_share_distribution_requires_account_result_and_evidence():
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _distribution(ratio="0.1339")
-    ledger.record_share_distribution(event, as_of=event.record_date)
-
     with pytest.raises(ValueError, match="账户层最终获配股数"):
-        ledger.apply_share_distribution(event, as_of=event.effective_date)
-    with pytest.raises(ValueError, match="分配依据"):
-        ledger.apply_share_distribution(
-            event, as_of=event.effective_date, allocated_new_shares=13
-        )
+        ledger.record_share_distribution(event, as_of=event.record_date)
     with pytest.raises(ValueError, match="整数边界"):
-        ledger.apply_share_distribution(
-            event, as_of=event.effective_date, allocated_new_shares=12,
+        ledger.record_share_distribution(
+            event, as_of=event.record_date, allocated_new_shares=12,
             allocation_evidence="synthetic final allocation",
         )
-    ledger.apply_share_distribution(
-        event, as_of=event.effective_date, allocated_new_shares=13,
+    with pytest.raises(ValueError, match="分配依据"):
+        ledger.record_share_distribution(event, as_of=event.record_date, allocated_new_shares=13)
+    ledger.record_share_distribution(
+        event, as_of=event.record_date, allocated_new_shares=13,
         allocation_evidence="synthetic account allocation record",
     )
+    ledger.apply_share_distribution(event, as_of=event.effective_date)
     assert sum(lot.total_shares for lot in ledger.positions) == 113
+
+
+def test_distribution_claim_survives_record_date_sale_and_settles_on_registration():
+    ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
+    event = _distribution(
+        effective_date="2026-11-02", registration_date="2026-11-03", tradable_date="2026-11-04",
+    )
+    ledger.record_share_distribution(event, as_of=event.record_date)
+    basis_after_record = sum((lot.cost_basis_cny for lot in ledger.positions), Decimal("0"))
+    record_claim = next(item for item in ledger.claims if item.claim_id == "distribution:dist-1")
+    assert basis_after_record + record_claim.cost_basis_cny == Decimal("1000")
+
+    ledger.apply_fill(TradeFill(
+        fill_id="sell-after-record",
+        trade_date="2026-10-30",
+        symbol="SH600000",
+        side="SELL",
+        quantity=100,
+        price_cny=Decimal("9"),
+    ))
+    ledger.apply_share_distribution(event, as_of=event.effective_date)
+    claim = next(item for item in ledger.claims if item.claim_id == "distribution:dist-1")
+    assert claim.status == "DISTRIBUTION_PENDING_REGISTRATION"
+    assert claim.final_allocated_shares == 30
+    assert sum(lot.total_shares for lot in ledger.positions) == 0
+
+    ledger.mark_share_distribution_claim(
+        event,
+        as_of=event.effective_date,
+        underlying_close_cny=Decimal("7.7"),
+        price_source="synthetic_underlying_close",
+    )
+    valued = ledger.mark_to_market(
+        event.effective_date,
+        {},
+    )
+    assert valued.status == "VALUED"
+    assert valued.claims_value_cny == Decimal("231.0")
+
+    ledger.register_share_distribution(event, as_of=event.registration_date)
+    ledger.register_share_distribution(event, as_of=event.registration_date)
+    new_lot = next(lot for lot in ledger.positions if lot.source_event_id == event.event_id)
+    assert new_lot.total_shares == 30
+    assert new_lot.sellable_on(date(2026, 11, 3)) == 0
+    assert new_lot.sellable_on(date(2026, 11, 4)) == 30
+    assert sum((lot.cost_basis_cny for lot in ledger.positions), Decimal("0")) == Decimal("230.7692307692307692307692308")
+    assert ledger.cash_cny == Decimal("1400")
 
 
 def test_rights_must_be_explicitly_subscribed_or_declined():
