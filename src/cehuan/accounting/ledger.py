@@ -20,6 +20,7 @@ from cehuan.accounting.events import (
 )
 from cehuan.accounting.models import (
     CashReceivable,
+    DividendTaxLotRecord,
     EntitledLot,
     EntitlementSnapshot,
     LedgerEntry,
@@ -31,6 +32,7 @@ from cehuan.accounting.models import (
     TradeFill,
     calendar_date,
     decimal_value,
+    share_count,
     security_symbol,
 )
 
@@ -38,9 +40,9 @@ from cehuan.accounting.models import (
 class PortfolioLedger:
     """Pure-Python research ledger with atomic, idempotent state transitions.
 
-    The methods are synthetic accounting primitives; this class is not yet
-    connected to the production backtest path. Monetary values use Decimal,
-    and unknown valuations never silently become zero.
+    The ledger is consumed by the explicitly non-formal ledger_v2 diagnostic
+    path. Monetary values use Decimal, and unknown valuations never silently
+    become zero.
     """
 
     def __init__(
@@ -51,6 +53,7 @@ class PortfolioLedger:
         positions: Iterable[PositionLot] = (),
         receivables: Iterable[CashReceivable] = (),
         claims: Iterable[NoncashClaim] = (),
+        dividend_tax_records: Iterable[DividendTaxLotRecord] = (),
     ) -> None:
         self.portfolio_id = str(portfolio_id).strip()
         if not self.portfolio_id:
@@ -61,6 +64,9 @@ class PortfolioLedger:
         self._initial_position_shares = self._position_totals(self._positions.values())
         self._receivables = self._index_unique(receivables, "receivable_id", "应收款")
         self._claims = self._index_unique(claims, "claim_id", "非现金权利")
+        self._dividend_tax_records = self._index_unique(
+            dividend_tax_records, "record_id", "分红税务批次记录"
+        )
         self._action_entitlements: dict[str, EntitlementSnapshot] = {}
         self._journal: list[LedgerEntry] = []
         self._operations: dict[str, tuple[str, tuple[LedgerEntry, ...]]] = {}
@@ -83,6 +89,9 @@ class PortfolioLedger:
         ledger._positions = cls._index_unique(snapshot.positions, "lot_id", "持仓批次")
         ledger._receivables = cls._index_unique(snapshot.receivables, "receivable_id", "应收款")
         ledger._claims = cls._index_unique(snapshot.claims, "claim_id", "非现金权利")
+        ledger._dividend_tax_records = cls._index_unique(
+            snapshot.dividend_tax_records, "record_id", "分红税务批次记录"
+        )
         ledger._action_entitlements = cls._index_unique(
             snapshot.entitlements, "event_id", "公司行动持仓快照"
         )
@@ -158,6 +167,7 @@ class PortfolioLedger:
         candidate._positions = self._positions.copy()
         candidate._receivables = self._receivables.copy()
         candidate._claims = self._claims.copy()
+        candidate._dividend_tax_records = self._dividend_tax_records.copy()
         candidate._action_entitlements = self._action_entitlements.copy()
         candidate._journal = self._journal.copy()
         candidate._operations = self._operations.copy()
@@ -169,6 +179,7 @@ class PortfolioLedger:
         self._positions = candidate._positions
         self._receivables = candidate._receivables
         self._claims = candidate._claims
+        self._dividend_tax_records = candidate._dividend_tax_records
         self._action_entitlements = candidate._action_entitlements
         self._journal = candidate._journal
         self._operations = candidate._operations
@@ -273,6 +284,10 @@ class PortfolioLedger:
         return tuple(sorted(self._claims.values(), key=lambda item: item.claim_id))
 
     @property
+    def dividend_tax_records(self) -> tuple[DividendTaxLotRecord, ...]:
+        return tuple(sorted(self._dividend_tax_records.values(), key=lambda item: item.record_id))
+
+    @property
     def journal(self) -> tuple[LedgerEntry, ...]:
         return tuple(self._journal)
 
@@ -294,6 +309,7 @@ class PortfolioLedger:
             entitlements=tuple(
                 self._action_entitlements[key] for key in sorted(self._action_entitlements)
             ),
+            dividend_tax_records=self.dividend_tax_records,
             as_of_date=calendar_date(as_of_date, "snapshot.as_of_date", optional=True),
         )
 
@@ -315,6 +331,24 @@ class PortfolioLedger:
         for key, claim in self._claims.items():
             if key != claim.claim_id:
                 raise ValueError("非现金权利索引键不一致")
+        for key, record in self._dividend_tax_records.items():
+            if key != record.record_id:
+                raise ValueError("分红税务批次记录索引键不一致")
+            entitlement = self._action_entitlements.get(record.event_id)
+            entitled_lot = next(
+                (lot for lot in entitlement.lots if lot.lot_id == record.lot_id), None
+            ) if entitlement is not None else None
+            if (
+                entitlement is None
+                or entitled_lot is None
+                or entitled_lot.quantity != record.entitled_shares
+                or entitled_lot.acquired_on != record.acquired_on
+            ):
+                raise ValueError(f"{record.record_id}: 缺少匹配的分红登记日持仓快照")
+            entitled_lots = {lot.lot_id: lot for lot in entitlement.lots}
+            entitled_lot = entitled_lots.get(record.lot_id)
+            if entitled_lot is None or entitled_lot.quantity != record.entitled_shares:
+                raise ValueError(f"{record.record_id}: 税务批次数量与登记日权益快照不一致")
 
         journal_cash_delta = sum(
             (entry.cash_delta_cny for entry in self._journal), start=Decimal("0")
@@ -366,6 +400,7 @@ class PortfolioLedger:
         payload: Mapping[str, object],
         source: ActionSource,
         source_details_extra: Mapping[str, object] | None = None,
+        dividend_gross_per_share_cny: Decimal | None = None,
     ) -> tuple[LedgerEntry, ...]:
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
             if event_id in candidate._action_entitlements:
@@ -386,6 +421,24 @@ class PortfolioLedger:
             ))
             entitlement = EntitlementSnapshot(event_id, symbol, record_date, lots)
             candidate._action_entitlements[event_id] = entitlement
+            if dividend_gross_per_share_cny is not None:
+                for lot in lots:
+                    record_id = f"dividend-tax:{event_id}:{lot.lot_id}"
+                    if record_id in candidate._dividend_tax_records:
+                        raise ValueError(f"分红税务批次记录已存在：{record_id}")
+                    candidate._dividend_tax_records[record_id] = DividendTaxLotRecord(
+                        record_id=record_id,
+                        event_id=event_id,
+                        symbol=symbol,
+                        lot_id=lot.lot_id,
+                        acquired_on=lot.acquired_on,
+                        entitled_shares=lot.quantity,
+                        remaining_shares=lot.quantity,
+                        sold_shares=0,
+                        gross_dividend_cny=self._cent(dividend_gross_per_share_cny * lot.quantity),
+                        policy_source_id=source.source_id,
+                        policy_source_sha256=source.sha256,
+                    )
             return (candidate._entry(
                 operation_key, event_id, phase, record_date, "ENTITLEMENT_SNAPSHOT",
                 Decimal("0"), (), {
@@ -446,6 +499,7 @@ class PortfolioLedger:
             phase="DIVIDEND_RECORD",
             payload=payload,
             source=event.source,
+            dividend_gross_per_share_cny=event.gross_per_share_cny,
         )
 
     def record_share_distribution(
@@ -672,6 +726,8 @@ class PortfolioLedger:
         *,
         as_of: date | str,
         tax_cny: Decimal | int | str | None,
+        tax_treatment: str | None = None,
+        payment_withholding_per_share_cny: Decimal | int | str | None = None,
     ) -> tuple[LedgerEntry, ...]:
         if not isinstance(event, CashDividendEvent):
             raise TypeError("accrue_cash_dividend 只接受 CashDividendEvent")
@@ -683,6 +739,28 @@ class PortfolioLedger:
         tax = None if tax_cny is None else self._cent(decimal_value(tax_cny, "tax_cny", nonnegative=True))
         if gross == 0:
             tax = Decimal("0")
+        treatment = tax_treatment or (
+            "FINAL_TAX_KNOWN" if tax is not None else "ACCOUNT_EVIDENCE_REQUIRED"
+        )
+        if treatment not in {"FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD", "ACCOUNT_EVIDENCE_REQUIRED"}:
+            raise ValueError("tax_treatment 必须是 FINAL_TAX_KNOWN/DEFERRED_BY_HOLDING_PERIOD/ACCOUNT_EVIDENCE_REQUIRED")
+        withholding_per_share = (
+            None if payment_withholding_per_share_cny is None
+            else decimal_value(payment_withholding_per_share_cny, "payment_withholding_per_share_cny", nonnegative=True)
+        )
+        if gross == 0:
+            # No registered holders means no receivable and no future tax lot.
+            # Treat the zero event as settled for valuation, regardless of the
+            # event-level policy configured for eligible holders.
+            treatment = "FINAL_TAX_KNOWN"
+            tax = Decimal("0")
+            withholding_per_share = None
+        if treatment == "FINAL_TAX_KNOWN" and tax is None:
+            raise ValueError("FINAL_TAX_KNOWN 必须提供税额")
+        if treatment == "DEFERRED_BY_HOLDING_PERIOD" and (tax is not None or withholding_per_share is None):
+            raise ValueError("DEFERRED_BY_HOLDING_PERIOD 需要留空最终税额，并提供发放日每股预扣规则")
+        if treatment != "DEFERRED_BY_HOLDING_PERIOD" and withholding_per_share is not None:
+            raise ValueError("每股发放日预扣规则只允许用于 DEFERRED_BY_HOLDING_PERIOD")
         if tax is not None and tax > gross:
             raise ValueError("分红税费不能大于应收税前金额")
         receivable_id = f"dividend:{event.event_id}"
@@ -692,6 +770,10 @@ class PortfolioLedger:
             "ex_date": event.ex_date.isoformat(),
             "gross_cny": str(gross),
             "tax_cny": None if tax is None else str(tax),
+            "tax_treatment": treatment,
+            "payment_withholding_per_share_cny": (
+                None if withholding_per_share is None else str(withholding_per_share)
+            ),
             "eligible_shares": entitlement.total_shares,
             **self._event_source_payload(event.source),
         }
@@ -708,8 +790,40 @@ class PortfolioLedger:
                 tax_cny=tax,
                 recognized_on=event.ex_date,
                 payable_on=event.payable_date,
+                tax_treatment=treatment,
+                eligible_shares=entitlement.total_shares,
+                payment_withholding_per_share_cny=withholding_per_share,
             )
             candidate._receivables[receivable_id] = receivable
+            tax_records = sorted(
+                (
+                    record for record in candidate._dividend_tax_records.values()
+                    if record.event_id == event.event_id
+                ),
+                key=lambda record: (record.lot_id, record.record_id),
+            )
+            if sum(record.entitled_shares for record in tax_records) != entitlement.total_shares:
+                raise ValueError(f"{event.event_id}: 分红税务批次股数与登记日持仓快照不一致")
+            remaining_tax = tax or Decimal("0")
+            for index, record in enumerate(tax_records):
+                if treatment == "FINAL_TAX_KNOWN":
+                    allocated_tax = (
+                        remaining_tax if index == len(tax_records) - 1
+                        else self._cent(tax * Decimal(record.entitled_shares) / max(entitlement.total_shares, 1))
+                    )
+                    allocated_tax = min(allocated_tax, remaining_tax)
+                    remaining_tax -= allocated_tax
+                    status = "FINAL_TAX_MODELED"
+                else:
+                    allocated_tax = record.final_tax_cny
+                    status = "ACCRUED"
+                candidate._dividend_tax_records[record.record_id] = replace(
+                    record,
+                    gross_dividend_cny=self._cent(event.gross_per_share_cny * record.entitled_shares),
+                    tax_treatment=treatment,
+                    final_tax_cny=allocated_tax,
+                    tax_status=status,
+                )
             return (candidate._entry(
                 operation_key, event.event_id, "DIVIDEND_ACCRUAL", event.ex_date,
                 "CASH_DIVIDEND_RECEIVABLE", Decimal("0"), (), {
@@ -717,6 +831,11 @@ class PortfolioLedger:
                     "eligible_shares": entitlement.total_shares,
                     "gross_cny": gross,
                     "tax_cny": "UNKNOWN" if tax is None else tax,
+                    "tax_treatment": treatment,
+                    "payment_withholding_per_share_cny": (
+                        "UNKNOWN" if withholding_per_share is None else withholding_per_share
+                    ),
+                    "future_tax_finalized": treatment == "FINAL_TAX_KNOWN",
                     **self._source_details(event.source),
                 },
             ),)
@@ -724,7 +843,13 @@ class PortfolioLedger:
         return self._apply_once(event.event_id, "DIVIDEND_ACCRUAL", payload, mutate)
 
     def settle_receivable(
-        self, receivable_id: str, *, settled_on: date | str
+        self,
+        receivable_id: str,
+        *,
+        settled_on: date | str,
+        actual_withheld_tax_cny: Decimal | int | str | None = None,
+        payment_evidence_id: str | None = None,
+        payment_evidence_sha256: str | None = None,
     ) -> tuple[LedgerEntry, ...]:
         identifier = str(receivable_id).strip()
         if not identifier:
@@ -733,37 +858,228 @@ class PortfolioLedger:
         receivable = self._receivables.get(identifier)
         if receivable is None:
             raise ValueError(f"应收款不存在：{identifier}")
+        actual_withheld = (
+            None if actual_withheld_tax_cny is None
+            else self._cent(decimal_value(actual_withheld_tax_cny, "actual_withheld_tax_cny", nonnegative=True))
+        )
+        evidence_id = str(payment_evidence_id).strip() if payment_evidence_id else None
+        evidence_sha = str(payment_evidence_sha256).strip().lower() if payment_evidence_sha256 else None
+        if evidence_sha is not None and not re.fullmatch(r"[0-9a-f]{64}", evidence_sha):
+            raise ValueError("payment_evidence_sha256 必须是 SHA-256")
+        if actual_withheld is not None and (not evidence_id or evidence_sha is None):
+            raise ValueError("账户实际预扣税必须提供 payment_evidence_id 与 SHA-256")
         payload = {
             "receivable_id": identifier,
             "event_id": receivable.event_id,
             "settled_on": day.isoformat(),
             "gross_cny": str(receivable.gross_cny),
             "tax_cny": None if receivable.tax_cny is None else str(receivable.tax_cny),
+            "actual_withheld_tax_cny": None if actual_withheld is None else str(actual_withheld),
+            "payment_evidence_id": evidence_id,
+            "payment_evidence_sha256": evidence_sha,
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
             current = candidate._receivables[identifier]
             if current.status != "PENDING":
                 raise ValueError(f"应收款 {identifier} 当前状态不是 PENDING")
-            if current.tax_cny is None:
-                raise ValueError(f"应收款 {identifier} 税费未知，不能确认到账净额")
             if current.payable_on is None or day < current.payable_on:
                 raise ValueError(f"应收款 {identifier} 尚未到可确认到账日")
-            net = current.gross_cny - current.tax_cny
+            if actual_withheld is not None:
+                withholding = actual_withheld
+                withholding_basis = "ACCOUNT_EVIDENCE"
+                account_evidence = True
+            elif current.tax_treatment == "FINAL_TAX_KNOWN" and current.tax_cny is not None:
+                withholding = current.tax_cny
+                withholding_basis = "FINAL_TAX_MODELED"
+                account_evidence = False
+            elif current.tax_treatment == "DEFERRED_BY_HOLDING_PERIOD":
+                assert current.payment_withholding_per_share_cny is not None
+                assert current.eligible_shares is not None
+                withholding = self._cent(current.payment_withholding_per_share_cny * current.eligible_shares)
+                withholding_basis = "DEFERRED_POLICY_AT_PAYMENT"
+                account_evidence = False
+            else:
+                raise ValueError(
+                    f"应收款 {identifier} 税费未知：需要已知的发放日预扣金额或账户证据；"
+                    "未来税额不能代替到账金额"
+                )
+            if withholding > current.gross_cny:
+                raise ValueError("实际/模拟发放日预扣税不能大于税前分红")
+            policy_estimate = None
+            if (
+                current.payment_withholding_per_share_cny is not None
+                and current.eligible_shares is not None
+            ):
+                policy_estimate = self._cent(
+                    current.payment_withholding_per_share_cny * current.eligible_shares
+                )
+            net = current.gross_cny - withholding
             candidate._cash_cny += net
-            candidate._receivables[identifier] = replace(current, status="SETTLED")
+            candidate._receivables[identifier] = replace(
+                current,
+                status="SETTLED",
+                payment_withheld_tax_cny=withholding,
+                payment_withholding_is_account_evidence=account_evidence,
+                payment_evidence_id=evidence_id,
+                payment_evidence_sha256=evidence_sha,
+            )
+            event_records = sorted(
+                (
+                    record for record in candidate._dividend_tax_records.values()
+                    if record.event_id == current.event_id
+                ),
+                key=lambda record: (record.lot_id, record.record_id),
+            )
+            allocated_withholding = Decimal("0")
+            remaining_withholding = withholding
+            for index, record in enumerate(event_records):
+                if index == len(event_records) - 1:
+                    portion = remaining_withholding
+                elif current.eligible_shares:
+                    portion = self._cent(withholding * Decimal(record.entitled_shares) / current.eligible_shares)
+                    portion = min(portion, remaining_withholding)
+                else:
+                    portion = Decimal("0")
+                remaining_withholding -= portion
+                allocated_withholding += portion
+                if record.tax_status == "FINAL_TAX_MODELED":
+                    status = "FINAL_TAX_MODELED"
+                elif record.sold_shares >= record.entitled_shares and record.sold_shares > record.tax_reconciled_shares:
+                    status = "SOLD_TAX_PENDING_REVIEW"
+                elif record.sold_shares:
+                    status = "PARTIALLY_SOLD_TAX_PENDING"
+                else:
+                    status = "RECEIVED_TAX_PENDING"
+                candidate._dividend_tax_records[record.record_id] = replace(
+                    record,
+                    payment_withheld_tax_cny=portion,
+                    payment_withholding_is_account_evidence=account_evidence,
+                    tax_status=status,
+                    account_evidence_id=evidence_id if account_evidence else record.account_evidence_id,
+                    account_evidence_sha256=evidence_sha if account_evidence else record.account_evidence_sha256,
+                )
+            if event_records and allocated_withholding != withholding:
+                raise ValueError("分红批次发放日预扣税分配与总额不一致")
             return (candidate._entry(
                 operation_key, current.event_id, "RECEIVABLE_SETTLEMENT", day,
                 "CASH_RECEIVABLE_SETTLED", net, (), {
                     "receivable_id": identifier,
                     "gross_cny": current.gross_cny,
-                    "tax_cny": current.tax_cny,
+                    "future_tax_cny": current.tax_cny,
+                    "payment_withheld_tax_cny": withholding,
+                    "payment_withholding_basis": withholding_basis,
+                    "payment_withholding_is_account_evidence": account_evidence,
+                    "payment_withholding_policy_estimate_cny": policy_estimate,
+                    "payment_withholding_actual_vs_policy_delta_cny": (
+                        None if actual_withheld is None or policy_estimate is None
+                        else actual_withheld - policy_estimate
+                    ),
+                    "payment_evidence_id": evidence_id,
+                    "payment_evidence_sha256": evidence_sha,
                     "net_cash_cny": net,
                 },
             ),)
 
         return self._apply_once(
             receivable.event_id, f"RECEIVABLE_PAYMENT:{identifier}", payload, mutate
+        )
+
+    def reconcile_dividend_tax(
+        self,
+        record_id: str,
+        *,
+        reconciled_sold_shares: int,
+        tax_cny: Decimal | int | str,
+        settled_on: date | str,
+        account_evidence_id: str,
+        account_evidence_sha256: str,
+    ) -> tuple[LedgerEntry, ...]:
+        """Book account-confirmed later tax for sold dividend-entitled shares.
+
+        The ledger never derives a tax rate from holding duration. The caller
+        must supply the amount and a hashed account statement or settlement
+        record. Cash is reduced once, on the evidence date.
+        """
+        identifier = str(record_id).strip()
+        if not identifier:
+            raise ValueError("分红税务 record_id 不能为空")
+        record = self._dividend_tax_records.get(identifier)
+        if record is None:
+            raise ValueError(f"分红税务批次记录不存在：{identifier}")
+        if record.tax_treatment == "FINAL_TAX_KNOWN":
+            raise ValueError(
+                f"{identifier}: FINAL_TAX_KNOWN 是研究税额输入，不能再作为递延账户税款重复过账"
+            )
+        shares = share_count(reconciled_sold_shares, "reconciled_sold_shares")
+        amount = self._cent(decimal_value(tax_cny, "tax_cny", nonnegative=True))
+        day = calendar_date(settled_on, "settled_on")
+        evidence_id = str(account_evidence_id).strip()
+        evidence_sha = str(account_evidence_sha256).strip().lower()
+        if not evidence_id or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha):
+            raise ValueError("分红税务核对需要 account_evidence_id 和有效 SHA-256")
+        payload = {
+            "record_id": identifier,
+            "event_id": record.event_id,
+            "reconciled_sold_shares": shares,
+            "tax_cny": str(amount),
+            "settled_on": day.isoformat(),
+            "account_evidence_id": evidence_id,
+            "account_evidence_sha256": evidence_sha,
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            current = candidate._dividend_tax_records[identifier]
+            if shares > current.sold_shares - current.tax_reconciled_shares:
+                raise ValueError(
+                    f"{identifier}: 可核实税款的未结算已卖股数不足，"
+                    f"sold={current.sold_shares}, reconciled={current.tax_reconciled_shares}, requested={shares}"
+                )
+            if amount > current.gross_dividend_cny - (current.final_tax_cny or Decimal("0")):
+                raise ValueError("核实税款大于该批次尚未核实的税前分红金额")
+            if candidate._cash_cny < amount:
+                raise ValueError("分红税款实际扣缴金额超过账本可用现金")
+            candidate._cash_cny -= amount
+            reconciled_total = current.tax_reconciled_shares + shares
+            final_tax_total = (current.final_tax_cny or Decimal("0")) + amount
+            fully_reconciled = (
+                reconciled_total == current.sold_shares
+                and current.remaining_shares == 0
+            )
+            new_status = "RECONCILED" if fully_reconciled else (
+                "SOLD_TAX_PENDING_REVIEW" if reconciled_total < current.sold_shares
+                else "PARTIALLY_SOLD_TAX_PENDING"
+            )
+            candidate._dividend_tax_records[identifier] = replace(
+                current,
+                tax_reconciled_shares=reconciled_total,
+                final_tax_cny=final_tax_total,
+                tax_status=new_status,
+                account_evidence_id=evidence_id,
+                account_evidence_sha256=evidence_sha,
+            )
+            return (candidate._entry(
+                operation_key, current.event_id, f"DIVIDEND_TAX_RECONCILIATION:{identifier}", day,
+                "DIVIDEND_TAX_SETTLED_FROM_ACCOUNT_EVIDENCE", -amount, (), {
+                    "record_id": identifier,
+                    "symbol": current.symbol,
+                    "lot_id": current.lot_id,
+                    "reconciled_sold_shares": shares,
+                    "tax_cny": amount,
+                    "cash_delta_cny": -amount,
+                    "account_evidence_id": evidence_id,
+                    "account_evidence_sha256": evidence_sha,
+                    "tax_rule_inferred_by_program": False,
+                    "remaining_shares": current.remaining_shares,
+                    "tax_status": new_status,
+                },
+            ),)
+
+        return self._apply_once(
+            record.event_id,
+            f"DIVIDEND_TAX_RECONCILIATION:{identifier}:{evidence_id}",
+            payload,
+            mutate,
         )
 
     def apply_share_distribution(
@@ -1808,6 +2124,11 @@ class PortfolioLedger:
             for lot in old_lots:
                 candidate._positions[lot.lot_id] = replace(lot, symbol=event.new_symbol)
                 migrated_shares += lot.total_shares
+            for record_id, record in tuple(candidate._dividend_tax_records.items()):
+                if record.symbol == event.old_symbol:
+                    candidate._dividend_tax_records[record_id] = replace(
+                        record, symbol=event.new_symbol
+                    )
             return (candidate._entry(
                 operation_key, event.event_id, "IDENTITY_MIGRATION", event.effective_date,
                 "CODE_CHANGE_1_TO_1", Decimal("0"), (
@@ -1887,6 +2208,7 @@ class PortfolioLedger:
             remaining = fill.quantity
             allocated_basis = Decimal("0")
             affected_lots: list[str] = []
+            affected_lot_quantities: list[tuple[str, int]] = []
             for lot in sellable_lots:
                 if remaining == 0:
                     break
@@ -1901,6 +2223,7 @@ class PortfolioLedger:
                 new_sellable = sellable_now - quantity
                 allocated_basis += basis
                 affected_lots.append(lot.lot_id)
+                affected_lot_quantities.append((lot.lot_id, quantity))
                 remaining -= quantity
                 if new_total == 0:
                     candidate._positions.pop(lot.lot_id)
@@ -1916,6 +2239,29 @@ class PortfolioLedger:
                         source_event_id=lot.source_event_id,
                     )
 
+            sold_by_lot = dict(affected_lot_quantities)
+            for record_id, record in tuple(candidate._dividend_tax_records.items()):
+                sold = sold_by_lot.get(record.lot_id, 0)
+                if sold <= 0 or record.tax_status == "FINAL_TAX_MODELED":
+                    continue
+                allocated_entitlement_sale = min(sold, record.remaining_shares)
+                if allocated_entitlement_sale <= 0:
+                    continue
+                remaining_entitled = record.remaining_shares - allocated_entitlement_sale
+                total_sold = record.sold_shares + allocated_entitlement_sale
+                if total_sold <= record.tax_reconciled_shares:
+                    tax_status = "RECONCILED" if remaining_entitled == 0 else "RECEIVED_TAX_PENDING"
+                elif remaining_entitled == 0:
+                    tax_status = "SOLD_TAX_PENDING_REVIEW"
+                else:
+                    tax_status = "PARTIALLY_SOLD_TAX_PENDING"
+                candidate._dividend_tax_records[record_id] = replace(
+                    record,
+                    remaining_shares=remaining_entitled,
+                    sold_shares=total_sold,
+                    tax_status=tax_status,
+                )
+
             cash_in = notional - total_fees
             candidate._cash_cny += cash_in
             details = {
@@ -1925,6 +2271,7 @@ class PortfolioLedger:
                 "realized_pnl_cny": cash_in - allocated_basis,
                 "cash_after_cny": candidate._cash_cny,
                 "lot_ids_fifo": ",".join(affected_lots),
+                "lot_quantities_fifo": ",".join(f"{lot_id}:{quantity}" for lot_id, quantity in affected_lot_quantities),
                 **fee_details,
             }
             return (candidate._entry(
@@ -1980,14 +2327,38 @@ class PortfolioLedger:
 
         receivable_value = Decimal("0")
         receivables_valid = True
+        unresolved_dividend_tax_event_ids: set[str] = set()
         for receivable in self._receivables.values():
             if receivable.status != "PENDING":
                 continue
-            if receivable.tax_cny is None:
+            if receivable.tax_treatment == "FINAL_TAX_KNOWN" and receivable.tax_cny is not None:
+                receivable_value += receivable.gross_cny - receivable.tax_cny
+            elif receivable.tax_treatment == "DEFERRED_BY_HOLDING_PERIOD":
+                if receivable.payment_withholding_per_share_cny is None or receivable.eligible_shares is None:
+                    reasons.append(f"{receivable.receivable_id}: 发放日预扣规则或权益股数未知")
+                    receivables_valid = False
+                else:
+                    payment_withholding = self._cent(
+                        receivable.payment_withholding_per_share_cny * receivable.eligible_shares
+                    )
+                    if payment_withholding > receivable.gross_cny:
+                        reasons.append(f"{receivable.receivable_id}: 发放日预扣税大于税前分红")
+                        receivables_valid = False
+                    else:
+                        receivable_value += receivable.gross_cny - payment_withholding
+                        unresolved_dividend_tax_event_ids.add(receivable.event_id)
+            else:
                 reasons.append(f"{receivable.receivable_id}: 应收税费未知")
                 receivables_valid = False
-            else:
-                receivable_value += receivable.gross_cny - receivable.tax_cny
+
+        unresolved_records = [
+            record for record in self._dividend_tax_records.values()
+            if record.tax_status not in {"FINAL_TAX_MODELED", "RECONCILED"}
+        ]
+        unresolved_record_event_ids = {record.event_id for record in unresolved_records}
+        unresolved_dividend_tax_count = len(unresolved_records) + len(
+            unresolved_dividend_tax_event_ids.difference(unresolved_record_event_ids)
+        )
 
         claims_value = Decimal("0")
         claims_valid = True
@@ -2005,7 +2376,10 @@ class PortfolioLedger:
 
         if position_prices_valid and receivables_valid and claims_valid:
             nav = self._cash_cny + positions_value + receivable_value + claims_value
-            status: Literal["VALUED", "UNVALUED"] = "VALUED"
+            status: Literal["VALUED", "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX", "UNVALUED"] = (
+                "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX"
+                if unresolved_dividend_tax_count else "VALUED"
+            )
             pos_value: Decimal | None = positions_value
             receivable_total: Decimal | None = receivable_value
             claims_total: Decimal | None = claims_value
@@ -2025,6 +2399,11 @@ class PortfolioLedger:
             claims_value_cny=claims_total,
             stale_price_count=stale_count,
             reasons=tuple(reasons),
+            unresolved_dividend_tax_count=unresolved_dividend_tax_count,
+            valuation_tax_scope=(
+                "GROSS_CASH_EXCLUDING_UNRESOLVED_FUTURE_DIVIDEND_TAX"
+                if unresolved_dividend_tax_count else "NET_OF_KNOWN_OR_MODELED_TAX"
+            ),
         )
 
     def _seed_receivable(self, receivable: CashReceivable) -> None:

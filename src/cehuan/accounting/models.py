@@ -173,6 +173,15 @@ class CashReceivable:
     recognized_on: date
     payable_on: date | None
     status: Literal["PENDING", "SETTLED", "CANCELLED"] = "PENDING"
+    tax_treatment: Literal[
+        "FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD", "ACCOUNT_EVIDENCE_REQUIRED"
+    ] | None = None
+    eligible_shares: int | None = None
+    payment_withholding_per_share_cny: Decimal | None = None
+    payment_withheld_tax_cny: Decimal | None = None
+    payment_withholding_is_account_evidence: bool = False
+    payment_evidence_id: str | None = None
+    payment_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not str(self.receivable_id).strip() or not str(self.event_id).strip():
@@ -183,12 +192,145 @@ class CashReceivable:
             raise ValueError("tax_cny 不能大于 gross_cny")
         if self.status not in {"PENDING", "SETTLED", "CANCELLED"}:
             raise ValueError("应收状态必须是 PENDING/SETTLED/CANCELLED")
+        tax_treatment = self.tax_treatment or (
+            "FINAL_TAX_KNOWN" if tax is not None else "ACCOUNT_EVIDENCE_REQUIRED"
+        )
+        if tax_treatment not in {
+            "FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD", "ACCOUNT_EVIDENCE_REQUIRED",
+        }:
+            raise ValueError("未知分红税务处理状态")
+        if tax_treatment == "FINAL_TAX_KNOWN" and tax is None:
+            raise ValueError("FINAL_TAX_KNOWN 必须提供税额")
+        eligible_shares = None if self.eligible_shares is None else share_count(
+            self.eligible_shares, "eligible_shares", allow_zero=True
+        )
+        withholding_per_share = (
+            None if self.payment_withholding_per_share_cny is None
+            else decimal_value(self.payment_withholding_per_share_cny, "payment_withholding_per_share_cny", nonnegative=True)
+        )
+        payment_withheld = (
+            None if self.payment_withheld_tax_cny is None
+            else decimal_value(self.payment_withheld_tax_cny, "payment_withheld_tax_cny", nonnegative=True)
+        )
+        evidence_sha256 = self.payment_evidence_sha256
+        if evidence_sha256 is not None:
+            evidence_sha256 = str(evidence_sha256).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
+                raise ValueError("payment_evidence_sha256 必须为 SHA-256")
+        if self.payment_withholding_is_account_evidence and (
+            payment_withheld is None or not self.payment_evidence_id or evidence_sha256 is None
+        ):
+            raise ValueError("实际到账税费金额必须绑定账户证据编号和 SHA-256")
+        if tax_treatment == "DEFERRED_BY_HOLDING_PERIOD" and (
+            eligible_shares is None or withholding_per_share is None
+        ):
+            raise ValueError("递延税务状态必须记录享有分红的股数与发放日每股预扣规则")
         object.__setattr__(self, "receivable_id", str(self.receivable_id).strip())
         object.__setattr__(self, "event_id", str(self.event_id).strip())
         object.__setattr__(self, "gross_cny", gross)
         object.__setattr__(self, "tax_cny", tax)
         object.__setattr__(self, "recognized_on", calendar_date(self.recognized_on, "recognized_on"))
         object.__setattr__(self, "payable_on", calendar_date(self.payable_on, "payable_on", optional=True))
+        object.__setattr__(self, "tax_treatment", tax_treatment)
+        object.__setattr__(self, "eligible_shares", eligible_shares)
+        object.__setattr__(self, "payment_withholding_per_share_cny", withholding_per_share)
+        object.__setattr__(self, "payment_withheld_tax_cny", payment_withheld)
+        object.__setattr__(self, "payment_evidence_id", str(self.payment_evidence_id).strip() if self.payment_evidence_id else None)
+        object.__setattr__(self, "payment_evidence_sha256", evidence_sha256)
+
+
+@dataclass(frozen=True)
+class DividendTaxLotRecord:
+    record_id: str
+    event_id: str
+    symbol: str
+    lot_id: str
+    acquired_on: date
+    entitled_shares: int
+    remaining_shares: int
+    sold_shares: int
+    gross_dividend_cny: Decimal
+    tax_treatment: Literal[
+        "ACCOUNT_EVIDENCE_REQUIRED", "FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD"
+    ] = "ACCOUNT_EVIDENCE_REQUIRED"
+    payment_withheld_tax_cny: Decimal | None = None
+    payment_withholding_is_account_evidence: bool = False
+    final_tax_cny: Decimal | None = None
+    tax_reconciled_shares: int = 0
+    tax_status: Literal[
+        "ENTITLEMENT_RECORDED", "ACCRUED", "RECEIVED_TAX_PENDING",
+        "PARTIALLY_SOLD_TAX_PENDING", "SOLD_TAX_PENDING_REVIEW", "FINAL_TAX_MODELED", "RECONCILED",
+    ] = "ENTITLEMENT_RECORDED"
+    policy_source_id: str | None = None
+    policy_source_sha256: str | None = None
+    account_evidence_id: str | None = None
+    account_evidence_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        for field in ("record_id", "event_id", "lot_id"):
+            if not str(getattr(self, field)).strip():
+                raise ValueError(f"DividendTaxLotRecord.{field} 不能为空")
+            object.__setattr__(self, field, str(getattr(self, field)).strip())
+        object.__setattr__(self, "symbol", security_symbol(self.symbol, "DividendTaxLotRecord.symbol"))
+        object.__setattr__(self, "acquired_on", calendar_date(self.acquired_on, "DividendTaxLotRecord.acquired_on"))
+        entitled = share_count(self.entitled_shares, "entitled_shares", allow_zero=True)
+        remaining = share_count(self.remaining_shares, "remaining_shares", allow_zero=True)
+        sold = share_count(self.sold_shares, "sold_shares", allow_zero=True)
+        reconciled = share_count(self.tax_reconciled_shares, "tax_reconciled_shares", allow_zero=True)
+        if remaining + sold != entitled:
+            raise ValueError("DividendTaxLotRecord.remaining_shares + sold_shares 必须等于 entitled_shares")
+        if reconciled > sold:
+            raise ValueError("tax_reconciled_shares 不能大于 sold_shares")
+        gross = decimal_value(self.gross_dividend_cny, "gross_dividend_cny", nonnegative=True)
+        withheld = None if self.payment_withheld_tax_cny is None else decimal_value(
+            self.payment_withheld_tax_cny, "payment_withheld_tax_cny", nonnegative=True
+        )
+        final_tax = None if self.final_tax_cny is None else decimal_value(
+            self.final_tax_cny, "final_tax_cny", nonnegative=True
+        )
+        if final_tax is not None and final_tax > gross:
+            raise ValueError("DividendTaxLotRecord.final_tax_cny 不能大于税前分红")
+        if self.tax_treatment not in {
+            "ACCOUNT_EVIDENCE_REQUIRED", "FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD",
+        }:
+            raise ValueError("未知 DividendTaxLotRecord.tax_treatment")
+        if self.tax_status not in {
+            "ENTITLEMENT_RECORDED", "ACCRUED", "RECEIVED_TAX_PENDING",
+            "PARTIALLY_SOLD_TAX_PENDING", "SOLD_TAX_PENDING_REVIEW", "FINAL_TAX_MODELED", "RECONCILED",
+        }:
+            raise ValueError("未知 DividendTaxLotRecord.tax_status")
+        policy_sha = self.policy_source_sha256
+        evidence_sha = self.account_evidence_sha256
+        for field, value in (("policy_source_sha256", policy_sha), ("account_evidence_sha256", evidence_sha)):
+            if value is not None:
+                value = str(value).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", value):
+                    raise ValueError(f"DividendTaxLotRecord.{field} 必须为 SHA-256")
+                if field == "policy_source_sha256":
+                    policy_sha = value
+                else:
+                    evidence_sha = value
+        if self.tax_status == "RECONCILED" and (
+            final_tax is None or not self.account_evidence_id or evidence_sha is None
+        ):
+            raise ValueError("RECONCILED 税务记录必须有税额和账户证据")
+        if self.payment_withholding_is_account_evidence and (
+            withheld is None or not self.account_evidence_id or evidence_sha is None
+        ):
+            raise ValueError("批次实际发放日预扣金额必须绑定账户证据编号和 SHA-256")
+        if self.tax_status == "FINAL_TAX_MODELED" and final_tax is None:
+            raise ValueError("FINAL_TAX_MODELED 必须保存情景税额")
+        object.__setattr__(self, "entitled_shares", entitled)
+        object.__setattr__(self, "remaining_shares", remaining)
+        object.__setattr__(self, "sold_shares", sold)
+        object.__setattr__(self, "tax_reconciled_shares", reconciled)
+        object.__setattr__(self, "gross_dividend_cny", gross)
+        object.__setattr__(self, "payment_withheld_tax_cny", withheld)
+        object.__setattr__(self, "final_tax_cny", final_tax)
+        object.__setattr__(self, "policy_source_id", str(self.policy_source_id).strip() if self.policy_source_id else None)
+        object.__setattr__(self, "policy_source_sha256", policy_sha)
+        object.__setattr__(self, "account_evidence_id", str(self.account_evidence_id).strip() if self.account_evidence_id else None)
+        object.__setattr__(self, "account_evidence_sha256", evidence_sha)
 
 
 @dataclass(frozen=True)
@@ -366,7 +508,7 @@ class EntitlementSnapshot:
 
 @dataclass(frozen=True)
 class NavResult:
-    status: Literal["VALUED", "UNVALUED"]
+    status: Literal["VALUED", "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX", "UNVALUED"]
     valuation_date: date
     nav_cny: Decimal | None
     cash_cny: Decimal
@@ -375,6 +517,8 @@ class NavResult:
     claims_value_cny: Decimal | None
     stale_price_count: int
     reasons: tuple[str, ...]
+    unresolved_dividend_tax_count: int = 0
+    valuation_tax_scope: str = "NET_OF_KNOWN_TAX_ONLY"
 
 
 @dataclass(frozen=True)
@@ -386,6 +530,7 @@ class LedgerSnapshot:
     claims: tuple[NoncashClaim, ...]
     journal: tuple[LedgerEntry, ...]
     entitlements: tuple[EntitlementSnapshot, ...] = ()
+    dividend_tax_records: tuple[DividendTaxLotRecord, ...] = ()
     as_of_date: date | None = None
 
     def __post_init__(self) -> None:
@@ -399,6 +544,7 @@ class LedgerSnapshot:
         object.__setattr__(self, "claims", tuple(self.claims))
         object.__setattr__(self, "journal", tuple(self.journal))
         object.__setattr__(self, "entitlements", tuple(self.entitlements))
+        object.__setattr__(self, "dividend_tax_records", tuple(self.dividend_tax_records))
         as_of = calendar_date(self.as_of_date, "snapshot.as_of_date", optional=True)
         if as_of is not None and any(entry.booking_date > as_of for entry in self.journal):
             raise ValueError("LedgerSnapshot.journal 含晚于 as_of_date 的账务流水")

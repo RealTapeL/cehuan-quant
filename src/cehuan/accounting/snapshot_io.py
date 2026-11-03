@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from cehuan.accounting.models import (
     CashReceivable,
+    DividendTaxLotRecord,
     EntitledLot,
     EntitlementSnapshot,
     LedgerEntry,
@@ -56,7 +57,45 @@ def ledger_snapshot_from_dict(value: Mapping[str, Any]) -> LedgerSnapshot:
         recognized_on=_date(row["recognized_on"], "receivables.recognized_on"),
         payable_on=_date(row.get("payable_on"), "receivables.payable_on", optional=True),
         status=str(row.get("status", "PENDING")),
+        tax_treatment=row.get("tax_treatment"),
+        eligible_shares=row.get("eligible_shares"),
+        payment_withholding_per_share_cny=(
+            None if row.get("payment_withholding_per_share_cny") is None
+            else Decimal(str(row["payment_withholding_per_share_cny"]))
+        ),
+        payment_withheld_tax_cny=(
+            None if row.get("payment_withheld_tax_cny") is None
+            else Decimal(str(row["payment_withheld_tax_cny"]))
+        ),
+        payment_withholding_is_account_evidence=bool(row.get("payment_withholding_is_account_evidence", False)),
+        payment_evidence_id=row.get("payment_evidence_id"),
+        payment_evidence_sha256=row.get("payment_evidence_sha256"),
     ) for row in value["receivables"])
+
+    dividend_tax_records = tuple(DividendTaxLotRecord(
+        record_id=str(row["record_id"]),
+        event_id=str(row["event_id"]),
+        symbol=str(row["symbol"]),
+        lot_id=str(row["lot_id"]),
+        acquired_on=_date(row["acquired_on"], "dividend_tax_records.acquired_on"),
+        entitled_shares=int(row["entitled_shares"]),
+        remaining_shares=int(row["remaining_shares"]),
+        sold_shares=int(row["sold_shares"]),
+        gross_dividend_cny=Decimal(str(row["gross_dividend_cny"])),
+        tax_treatment=str(row.get("tax_treatment", "ACCOUNT_EVIDENCE_REQUIRED")),
+        payment_withheld_tax_cny=(
+            None if row.get("payment_withheld_tax_cny") is None
+            else Decimal(str(row["payment_withheld_tax_cny"]))
+        ),
+        payment_withholding_is_account_evidence=bool(row.get("payment_withholding_is_account_evidence", False)),
+        final_tax_cny=None if row.get("final_tax_cny") is None else Decimal(str(row["final_tax_cny"])),
+        tax_reconciled_shares=int(row.get("tax_reconciled_shares", 0)),
+        tax_status=str(row.get("tax_status", "ENTITLEMENT_RECORDED")),
+        policy_source_id=row.get("policy_source_id"),
+        policy_source_sha256=row.get("policy_source_sha256"),
+        account_evidence_id=row.get("account_evidence_id"),
+        account_evidence_sha256=row.get("account_evidence_sha256"),
+    ) for row in value.get("dividend_tax_records", ()))
 
     claims = tuple(NoncashClaim(
         claim_id=str(row["claim_id"]),
@@ -122,6 +161,7 @@ def ledger_snapshot_from_dict(value: Mapping[str, Any]) -> LedgerSnapshot:
         claims=claims,
         journal=tuple(journal_rows),
         entitlements=entitlements,
+        dividend_tax_records=dividend_tax_records,
         as_of_date=_date(value.get("as_of_date"), "as_of_date", optional=True),
     )
 

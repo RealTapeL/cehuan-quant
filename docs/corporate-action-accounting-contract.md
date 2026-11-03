@@ -8,7 +8,7 @@
 
 当前账本支持以下离线状态转移：
 
-- 现金分红：登记日收盘记录持仓快照，除息日确认应收，税费必须显式提供（未知时阻断 NAV），到账日将净额转现金；付款不能早于公告到账日。
+- 现金分红：登记日收盘记录持仓快照，除息日确认应收，发放日预扣与未来卖出税款分开记录。`FINAL_TAX_KNOWN` 是有明确输入的研究金额；`DEFERRED_BY_HOLDING_PERIOD` 记录发放日每股预扣假设，并为每个登记批次保留待核税务状态；`ACCOUNT_EVIDENCE_REQUIRED` 在没有账户证据前阻断应收估值/结算。实际到账扣款需用账户证据和 SHA-256 登记，后续卖出税只按实际账户税款证据过账，不由程序推导税率。
 - 送转：登记日收盘锁定持仓快照、逐批次成本分摊及权利数量；登记日至生效日之间原股可卖出而送转权利继续保留。生效日确认权利，新增股份登记日生成独立持仓批次，可流通日才可卖。登记至可流通期间用同证券未复权收盘价为权利估值；缺价即阻断 NAV。非整数获配必须在登记日提供账户层最终股数和分配依据，不自动四舍五入、向下取整或补现金。当前没有专门的公告零股规则模型，CSV 只接受 `ACCOUNT_RESULT_REQUIRED`，因此未提供账户结果时该情景停止。
 - 配股：登记权利先作为未估值权利阻断 NAV；必须明确选择认购或在期限届满后放弃。认购扣除明确的缴款和费用，待可流通日将权利转为独立批次。
 - 1:1 代码变更：仅接受 `CODE_CHANGE_1_TO_1` 且比例为 1；保留批次数量、成本和取得日，不生成现金、普通成交或费用流水。证券身份同一性及新代码行情仍由上游证据审计负责。
@@ -22,7 +22,26 @@
 
 `run_backtest(accounting_mode="ledger_v2")` 让账本作为研究成交后的现金、持仓批次与成本基础状态源，并可消费按日期生效的规则/费率表。类型化事件调度支持现金分红、`CODE_CHANGE_1_TO_1` 和送转。窗口内事件阶段必须对应输入交易日；落在窗口外的阶段保留在事件状态中，不要求为决定本窗口账务提前加载未来行情。窗口开始前已经产生、且在窗口内仍有后续阶段的送转必须提供经过校验的期初权益快照；没有快照时明确阻断。窗口前已发生的分红阶段也必须由期初应收与权益快照支撑。
 
-回测结果的 `accounting_snapshot.json` 写入 `as_of_date`、持仓、权利、来源 ID/哈希和 `next_phase_date`。后续窗口可用 `--accounting-opening-snapshot` 恢复；快照日期必须早于首个行情日，`--cash` 与快照当前现金的差异不得超过一分钱。续跑会验证未完成权利与本次事件表、事件来源及阶段日期匹配，缺少登记日快照、流水不平或来源不匹配都会阻断。分红/送转事件仍由输入提供，快照不会替代事件来源文件。
+回测结果的 `accounting_snapshot.json` 是**账本状态快照**，写入 `as_of_date`、持仓、权利、分红税务批次状态、来源 ID/哈希和 `next_phase_date`。后续窗口可用 `--accounting-opening-snapshot` 恢复账本，但它不会恢复信号预热、全局调仓位置或待执行目标，不能称作完整策略续跑。快照日期必须早于首个行情日，`--cash` 与快照当前现金的差异不得超过一分钱。续跑会验证未完成权利与本次事件表、事件来源及阶段日期匹配，缺少登记日快照、流水不平或来源不匹配都会阻断。
+
+### 完整规则策略 checkpoint（研究原型）
+
+`--backtest-checkpoint` 与 `--trading-calendar` 仅用于非正式 `ledger_v2` 诊断，恢复账本之外的待执行目标、全局交易日序号、调仓节奏、信号滚动历史、代码变更后的信号保护状态、上次估值价格和期末总权益。checkpoint 绑定配置、交易规则、费率、事件、历史行情文件和完整交易日历的规范化 SHA-256；日历前缀、下一交易日、状态自哈希和上一窗口数据文件也会复核。新窗口数据只作为执行区间；上一窗口信号历史用于预热，不重做历史交易或公司行动。连续运行与分段运行的一致性已由合成测试覆盖，但这是 `ledger_v2` 确定性规则策略的研究续跑原型，不是 Qlib 模型状态续训，也不适用于正式基线。
+
+CLI 使用方式：
+
+```bash
+uv run cehuan backtest \
+  --data data/private/window-1-bars.csv --cash 100000 \
+  --diagnostic --accounting-mode ledger_v2 --trading-calendar data/private/calendar.csv
+
+uv run cehuan backtest \
+  --data data/private/window-2-bars.csv --cash 90000 \
+  --diagnostic --accounting-mode ledger_v2 --trading-calendar data/private/calendar.csv \
+  --backtest-checkpoint outputs/experiments/<prior-run>/backtest_checkpoint.json
+```
+
+`--cash` 必须等于 checkpoint 中账本的现金；新窗口第一个行情日必须是记录的下一开市日。策略配置、规则、费用、事件或日历变化时，运行拒绝续跑并要求从受影响窗口重算。完成这一项仍不会改变 `baseline_ready=NOT_READY`。
 
 送转登记日快照在当日模拟订单后建立，登记日前后时点不得混用；非整数股结果没有账户分配结果时拒绝进入账本；新股在可流通日之前不可卖。中间登记权利估值使用同证券当日未复权收盘价作为 `UNDERLYING_CLOSE_PROXY`，并在账本流水中保存权利股数、价格日期、来源、行情输入散列、停牌状态，以及 `is_actual_right_trade_price=false`。该代理是研究估值假设，不是独立权利的真实成交价。缺价、停牌状态未知/停牌、股数未确认或散列缺失时阻断。正在处理的权利按事件 ID 维护，不再逐日扫描全部历史送转事件。
 
@@ -34,7 +53,7 @@
 
 完整的纯合成“计划 → 虚构成交 CSV → 对账复盘 → 下一轮结构化假设”运行命令见[合成闭环](synthetic-cycle.md)。它与正式基线门控分开。
 
-窗口快照续跑示意（输入行情 CSV 不含快照之后的未来日期；现金参数填快照当前现金）：
+账本状态快照续跑示意（此命令仅续账本状态，不代表完整策略续跑；输入行情 CSV 不含快照之后的未来日期；现金参数填快照当前现金）：
 
 ```bash
 uv run cehuan backtest --data data/private/window-2-bars.csv --cash 90000 --diagnostic --accounting-mode ledger_v2 --accounting-events data/private/accounting-events.csv --accounting-opening-snapshot outputs/experiments/<prior-run>/accounting_snapshot.json

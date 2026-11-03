@@ -21,6 +21,7 @@ def _event_row(archive: Path) -> dict[str, str]:
         "source_title": "Synthetic dividend notice", "source_page_reference": "p. 1",
         "source_archive_file": archive.name, "review_status": "REVIEWED", "reviewed_by": "test reviewer",
         "reviewed_at": "2026-11-03",
+        "tax_treatment": "", "payment_withholding_per_share_cny": "",
     }
 
 
@@ -35,6 +36,8 @@ def test_accounting_event_csv_binds_each_event_to_archived_source_bytes(tmp_path
     assert len(bundle.events) == 1
     assert bundle.events[0].event_id == "div-001"
     assert bundle.dividend_tax_cny_by_event["div-001"] == Decimal("0.02")
+    assert bundle.dividend_tax_treatment_by_event == {}
+    assert bundle.dividend_payment_withholding_per_share_cny_by_event == {}
     assert bundle.source_audit.iloc[0]["event_id"] == "div-001"
     assert bundle.source_audit.iloc[0]["source_hash_matches"]
     assert len(bundle.source_csv_sha256) == 64
@@ -100,4 +103,28 @@ def test_accounting_event_csv_reads_share_distribution_and_requires_all_event_da
     row["registration_date"] = ""
     pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
     with pytest.raises(ValueError, match="缺少 registration_date"):
+        read_accounting_event_csv(event_csv)
+
+
+def test_accounting_event_csv_reads_deferred_dividend_payment_withholding_policy(tmp_path):
+    archive = tmp_path / "notice.pdf"
+    archive.write_bytes(b"synthetic source")
+    row = _event_row(archive)
+    row.update({
+        "tax_cny": "",
+        "tax_treatment": "DEFERRED_BY_HOLDING_PERIOD",
+        "payment_withholding_per_share_cny": "0",
+    })
+    event_csv = tmp_path / "events.csv"
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+
+    bundle = read_accounting_event_csv(event_csv)
+
+    assert bundle.dividend_tax_cny_by_event["div-001"] is None
+    assert bundle.dividend_tax_treatment_by_event["div-001"] == "DEFERRED_BY_HOLDING_PERIOD"
+    assert bundle.dividend_payment_withholding_per_share_cny_by_event["div-001"] == Decimal("0")
+
+    row["tax_cny"] = "0.02"
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+    with pytest.raises(ValueError, match="要求 tax_cny 留空"):
         read_accounting_event_csv(event_csv)

@@ -20,8 +20,10 @@ ACCOUNTING_EVENT_CSV_COLUMNS = [
     "registration_date", "tradable_date", "security_identity", "share_ratio",
     "fractional_share_method", "tax_cny", "source_id", "source_url",
     "source_sha256", "source_title", "source_page_reference", "source_archive_file",
-    "review_status", "reviewed_by", "reviewed_at",
+    "review_status", "reviewed_by", "reviewed_at", "tax_treatment",
+    "payment_withholding_per_share_cny",
 ]
+OPTIONAL_COMPATIBILITY_COLUMNS = ("tax_treatment", "payment_withholding_per_share_cny")
 ACCOUNTING_EVENT_TYPES = {"CASH_DIVIDEND", "CODE_CHANGE_1_TO_1", "SHARE_DISTRIBUTION"}
 SOURCE_REVIEW_COLUMNS = (
     "source_id", "source_url", "source_sha256", "source_title", "source_page_reference",
@@ -33,6 +35,8 @@ SOURCE_REVIEW_COLUMNS = (
 class AccountingEventBundle:
     events: tuple[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent, ...]
     dividend_tax_cny_by_event: dict[str, Decimal | None]
+    dividend_tax_treatment_by_event: dict[str, str]
+    dividend_payment_withholding_per_share_cny_by_event: dict[str, Decimal]
     source_audit: pd.DataFrame
     source_csv_sha256: str
 
@@ -53,6 +57,9 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
         raise FileNotFoundError(f"公司行动事件 CSV 不存在：{source_path}")
     raw_bytes = source_path.read_bytes()
     frame = pd.read_csv(BytesIO(raw_bytes), dtype=str, keep_default_na=False)
+    for column in OPTIONAL_COMPATIBILITY_COLUMNS:
+        if column not in frame:
+            frame[column] = ""
     missing = sorted(set(ACCOUNTING_EVENT_CSV_COLUMNS).difference(frame.columns))
     if missing:
         raise ValueError("公司行动事件 CSV 缺少字段：" + ", ".join(missing))
@@ -60,7 +67,7 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
     for column in frame.columns:
         frame[column] = frame[column].map(_text)
     if frame.empty:
-        return AccountingEventBundle((), {}, pd.DataFrame(columns=[
+        return AccountingEventBundle((), {}, {}, {}, pd.DataFrame(columns=[
             "event_id", "event_type", "source_id", "source_archive_file",
             "declared_sha256", "observed_sha256", "review_status", "reviewed_by", "reviewed_at",
         ]), hashlib.sha256(raw_bytes).hexdigest())
@@ -78,6 +85,8 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
 
     events: list[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent] = []
     taxes: dict[str, Decimal | None] = {}
+    treatments: dict[str, str] = {}
+    payment_withholdings: dict[str, Decimal] = {}
     audits: list[dict[str, object]] = []
     for row in frame.to_dict(orient="records"):
         event_id = row["event_id"]
@@ -132,9 +141,34 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
                 None if not row["tax_cny"]
                 else decimal_value(row["tax_cny"], f"{event_id}.tax_cny", nonnegative=True)
             )
+            treatment = row["tax_treatment"].upper()
+            payment_withholding = row["payment_withholding_per_share_cny"]
+            if treatment and treatment not in {
+                "FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD", "ACCOUNT_EVIDENCE_REQUIRED",
+            }:
+                raise ValueError(f"{event_id} 的 tax_treatment 未知：{treatment}")
+            if treatment == "FINAL_TAX_KNOWN" and taxes[event_id] is None:
+                raise ValueError(f"{event_id} FINAL_TAX_KNOWN 必须提供 tax_cny")
+            if treatment == "DEFERRED_BY_HOLDING_PERIOD":
+                if taxes[event_id] is not None or not payment_withholding:
+                    raise ValueError(
+                        f"{event_id} DEFERRED_BY_HOLDING_PERIOD 要求 tax_cny 留空并提供发放日每股预扣金额"
+                    )
+                payment_withholdings[event_id] = decimal_value(
+                    payment_withholding, f"{event_id}.payment_withholding_per_share_cny", nonnegative=True
+                )
+            elif payment_withholding:
+                raise ValueError(
+                    f"{event_id} 只有 DEFERRED_BY_HOLDING_PERIOD 可以提供发放日每股预扣金额"
+                )
+            if treatment == "ACCOUNT_EVIDENCE_REQUIRED" and taxes[event_id] is not None:
+                raise ValueError(f"{event_id} ACCOUNT_EVIDENCE_REQUIRED 不能同时提供最终 tax_cny")
+            if treatment:
+                treatments[event_id] = treatment
         elif row["event_type"] == "CODE_CHANGE_1_TO_1":
             if any(row[column] for column in (
                 "symbol", "record_date", "ex_date", "payable_date", "gross_per_share_cny", "tax_cny",
+                "tax_treatment", "payment_withholding_per_share_cny",
             )):
                 raise ValueError(f"{event_id} 代码变更行包含非代码变更字段")
             for column in ("old_symbol", "new_symbol", "effective_date", "security_identity", "share_ratio"):
@@ -156,6 +190,7 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
             if any(row[column] for column in (
                 "ex_date", "payable_date", "gross_per_share_cny", "old_symbol", "new_symbol",
                 "security_identity", "tax_cny",
+                "tax_treatment", "payment_withholding_per_share_cny",
             )):
                 raise ValueError(f"{event_id} 送转行包含分红或代码变更专属字段")
             for column in (
@@ -194,6 +229,8 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
     return AccountingEventBundle(
         events=tuple(events),
         dividend_tax_cny_by_event=taxes,
+        dividend_tax_treatment_by_event=treatments,
+        dividend_payment_withholding_per_share_cny_by_event=payment_withholdings,
         source_audit=pd.DataFrame(audits),
         source_csv_sha256=hashlib.sha256(raw_bytes).hexdigest(),
     )

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from cehuan.backtest.engine import run_backtest
+from cehuan.backtest.checkpoint import read_backtest_checkpoint
 from cehuan.accounting.snapshot_io import read_ledger_snapshot
 from cehuan.config import load_config
 from cehuan.data.akshare_adapter import make_akshare_provider
@@ -192,6 +193,8 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--corporate-actions", help="正式模式下使用的公司行动表")
     backtest.add_argument("--accounting-events", help="带来源原件与人工复核字段的事件 CSV；仅限 ledger_v2 研究诊断")
     backtest.add_argument("--accounting-opening-snapshot", help="ledger_v2 分窗口续跑使用的前一期 accounting_snapshot.json")
+    backtest.add_argument("--backtest-checkpoint", help="完整 rule-based ledger_v2 研究策略续跑 checkpoint")
+    backtest.add_argument("--trading-calendar", help="checkpoint 续跑所用交易日历 CSV，至少覆盖期末后的下一开市日")
     backtest.add_argument("--corporate-action-coverage", help="逐证券公司行动覆盖与来源复核表")
     backtest.add_argument("--market-rules", help="有效日期交易规则 CSV")
     backtest.add_argument("--fees", help="有效日期历史费率 CSV")
@@ -657,6 +660,16 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "--accounting-opening-snapshot 仅支持 --diagnostic --accounting-mode ledger_v2，不能用于正式基线"
                 )
+            if args.backtest_checkpoint and (
+                args.formal or not args.diagnostic or args.accounting_mode != "ledger_v2"
+            ):
+                raise ValueError("--backtest-checkpoint 仅支持 --diagnostic --accounting-mode ledger_v2")
+            if args.backtest_checkpoint and args.accounting_opening_snapshot:
+                raise ValueError("完整策略 checkpoint 已包含账本快照，不能同时传 --accounting-opening-snapshot")
+            if args.trading_calendar and (args.formal or not args.diagnostic or args.accounting_mode != "ledger_v2"):
+                raise ValueError("--trading-calendar checkpoint 模式仅支持 --diagnostic --accounting-mode ledger_v2")
+            if args.backtest_checkpoint and not args.trading_calendar:
+                raise ValueError("--backtest-checkpoint 必须同时提供 --trading-calendar")
             if not args.formal and (bool(args.market_rules) != bool(args.fees)):
                 raise ValueError("研究诊断的 --market-rules 与 --fees 必须成对提供")
             if not args.formal and (args.market_rules or args.fees) and not args.diagnostic:
@@ -689,6 +702,26 @@ def main(argv: list[str] | None = None) -> int:
                 opening_snapshot_path = opening_snapshot_path.resolve()
                 opening_snapshot_sha256 = sha256_file(opening_snapshot_path)
                 opening_snapshot = read_ledger_snapshot(opening_snapshot_path)
+            backtest_checkpoint = None
+            backtest_checkpoint_path = None
+            backtest_checkpoint_file_sha256 = None
+            if args.backtest_checkpoint:
+                backtest_checkpoint_path = Path(args.backtest_checkpoint).expanduser()
+                if not backtest_checkpoint_path.is_absolute():
+                    backtest_checkpoint_path = REPO_ROOT / backtest_checkpoint_path
+                backtest_checkpoint_path = backtest_checkpoint_path.resolve()
+                backtest_checkpoint_file_sha256 = sha256_file(backtest_checkpoint_path)
+                backtest_checkpoint = read_backtest_checkpoint(backtest_checkpoint_path)
+            trading_calendar_path = None
+            trading_calendar_sha256 = None
+            trading_calendar = None
+            if args.trading_calendar:
+                trading_calendar_path = Path(args.trading_calendar).expanduser()
+                if not trading_calendar_path.is_absolute():
+                    trading_calendar_path = REPO_ROOT / trading_calendar_path
+                trading_calendar_path = trading_calendar_path.resolve()
+                trading_calendar_sha256 = sha256_file(trading_calendar_path)
+                trading_calendar = pd.read_csv(trading_calendar_path, dtype=str, keep_default_na=False)
             readiness_report = None
             expected_readiness_hashes = None
             readiness_context = None
@@ -804,7 +837,17 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("预验证报告与 --data 文件 SHA-256 不一致；请对该点时行情重新运行 universe-audit")
                 mutate_input = True
             else:
-                bars = read_bars(args.data)
+                bars_path = Path(args.data).expanduser()
+                if not bars_path.is_absolute():
+                    bars_path = REPO_ROOT / bars_path
+                bars_path = bars_path.resolve()
+                bars = read_bars(bars_path)
+                source_data_sha256 = sha256_file(bars_path)
+            if quality_argument:
+                bars_path = Path(args.data).expanduser()
+                if not bars_path.is_absolute():
+                    bars_path = REPO_ROOT / bars_path
+                bars_path = bars_path.resolve()
             universe_summary = None
             universe_discrepancies = None
             if args.universe:
@@ -871,12 +914,39 @@ def main(argv: list[str] | None = None) -> int:
                 dividend_tax_cny_by_event=(
                     accounting_event_bundle.dividend_tax_cny_by_event if accounting_event_bundle else None
                 ),
+                dividend_tax_treatment_by_event=(
+                    accounting_event_bundle.dividend_tax_treatment_by_event if accounting_event_bundle else None
+                ),
+                dividend_payment_withholding_per_share_cny_by_event=(
+                    accounting_event_bundle.dividend_payment_withholding_per_share_cny_by_event
+                    if accounting_event_bundle else None
+                ),
                 opening_accounting_snapshot=opening_snapshot,
+                backtest_checkpoint=backtest_checkpoint,
+                trading_calendar=trading_calendar,
+                source_data_path=bars_path,
             )
+            if sha256_file(bars_path) != source_data_sha256:
+                raise ValueError("回测期间当前窗口行情文件发生变化；本次实验结果不予保存")
             if opening_snapshot_path is not None:
                 if sha256_file(opening_snapshot_path) != opening_snapshot_sha256:
                     raise ValueError("回测期间期初账本快照文件发生变化；本次实验结果不予保存")
                 result["metrics"]["accounting_opening_snapshot_file_sha256"] = opening_snapshot_sha256
+            if backtest_checkpoint_path is not None:
+                if sha256_file(backtest_checkpoint_path) != backtest_checkpoint_file_sha256:
+                    raise ValueError("回测期间 backtest checkpoint 文件发生变化；本次实验结果不予保存")
+                if (
+                    backtest_checkpoint is not None
+                    and backtest_checkpoint.source_data_path
+                    and sha256_file(backtest_checkpoint.source_data_path)
+                    != backtest_checkpoint.last_window_data_sha256
+                ):
+                    raise ValueError("checkpoint 绑定的历史行情文件在回测期间发生变化；本次实验结果不予保存")
+                result["metrics"]["backtest_checkpoint_input_file_sha256"] = backtest_checkpoint_file_sha256
+            if trading_calendar_path is not None:
+                if sha256_file(trading_calendar_path) != trading_calendar_sha256:
+                    raise ValueError("回测期间交易日历文件发生变化；本次实验结果不予保存")
+                result["metrics"]["trading_calendar_input_sha256"] = trading_calendar_sha256
             if accounting_event_bundle is not None:
                 if sha256_file(accounting_event_path) != accounting_event_bundle.source_csv_sha256:
                     raise ValueError("回测期间公司行动事件 CSV 发生变化；本次实验结果不予保存")
@@ -902,6 +972,10 @@ def main(argv: list[str] | None = None) -> int:
                 accounting_event_bundle.source_audit.to_csv(folder / "accounting_event_source_audit.csv", index=False)
             if opening_snapshot_path is not None:
                 shutil.copyfile(opening_snapshot_path, folder / "accounting_opening_snapshot.json")
+            if backtest_checkpoint_path is not None:
+                shutil.copyfile(backtest_checkpoint_path, folder / "backtest_opening_checkpoint.json")
+            if trading_calendar_path is not None:
+                shutil.copyfile(trading_calendar_path, folder / "trading_calendar.csv")
             if research_market_rules_path is not None and research_fee_schedule_path is not None:
                 shutil.copyfile(research_market_rules_path, folder / "market_rule_schedule.csv")
                 shutil.copyfile(research_fee_schedule_path, folder / "fee_schedule.csv")
@@ -916,6 +990,11 @@ def main(argv: list[str] | None = None) -> int:
             if "accounting_snapshot" in result:
                 snapshot = result["accounting_snapshot"]
                 _write_json(asdict(snapshot) if is_dataclass(snapshot) else snapshot, folder / "accounting_snapshot.json")
+            if "backtest_checkpoint" in result:
+                checkpoint_path = folder / "backtest_checkpoint.json"
+                _write_json(result["backtest_checkpoint"].to_dict(), checkpoint_path)
+                result["metrics"]["backtest_checkpoint_file_sha256"] = sha256_file(checkpoint_path)
+                _write_json(result["metrics"], folder / "metrics.json")
             if universe_summary is not None:
                 _write_json(universe_summary, folder / "point_in_time_universe_audit.json")
                 universe_discrepancies.to_csv(folder / "point_in_time_universe_discrepancies.csv", index=False)

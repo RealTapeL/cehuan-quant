@@ -61,7 +61,7 @@ uv run cehuan review \
 
 ## 公司行动事件 CSV 研究输入
 
-`examples/accounting_events_template.csv` 提供 `CASH_DIVIDEND` 和 `CODE_CHANGE_1_TO_1` 的列结构。CLI 只允许这样接入研究账务引擎：
+`examples/accounting_events_template.csv` 提供 `CASH_DIVIDEND`、`CODE_CHANGE_1_TO_1` 和 `SHARE_DISTRIBUTION` 的列结构，并含可选分红税务字段 `tax_treatment` 与 `payment_withholding_per_share_cny`。旧 CSV 没有这两列时仍按旧口径推断：给了 `tax_cny` 就是显式研究最终税额，没有则要求账户证据。`DEFERRED_BY_HOLDING_PERIOD` 必须留空最终 `tax_cny` 并提供发放日每股预扣金额。CLI 只允许这样接入研究账务引擎：
 
 ```bash
 uv run cehuan backtest \
@@ -74,6 +74,18 @@ uv run cehuan backtest \
 
 每个事件行必须绑定本地归档原件、HTTPS 来源、SHA-256 和人工复核字段。适配器校验事件键、事件字段、点时日期、来源字段及归档原件字节散列，并把事件 CSV 散列和逐事件来源审计写入实验产物。它不会打开公告 URL、判断公告解释是否正确，也不证明事件覆盖完整。不得把合成示例或部分事件输入用于正式基线；`baseline_ready` 仍为 `NOT_READY`。
 
-`ledger_v2` 研究诊断现可调度现金分红、1:1 代码变更和受限送转事件。送转使用登记日收盘快照锁定持仓批次和成本分摊；生效日形成权利，股份登记日转成独立批次，可流通日才可卖。登记日至生效日前发生的卖出不会丢失送转权利；非整数获配若没有账户层股数及依据会在登记日阻断。事件后续阶段落在回测窗口外时，期末账本保留未完成权利及下一阶段日期；跨窗口续跑必须提供与事件及来源匹配、且日期早于新窗口的期初账本快照。没有期初快照的窗口前权益会阻断，不按零权利处理。
+分红账本区分登记日权益、除息日应收、发放日现金和未来卖出税务。发放日没有预扣不能推导出未来税额为零。若采用递延税务状态，NAV 标为 `VALUED_WITH_UNRESOLVED_DIVIDEND_TAX`，税务口径为 `GROSS_CASH_EXCLUDING_UNRESOLVED_FUTURE_DIVIDEND_TAX`，并记录未决批次数；这是未扣除潜在后续税款的研究估值，不是净税后收益。账户到账实际预扣可由账本 API 通过 `actual_withheld_tax_cny` 加账户证据 ID/哈希登记；后续卖出税款只由账户证据过账，程序不计算税率。账本状态快照包含逐批次未决税务；真实账户导入适配器尚未实现。
 
-登记至新增股份登记前，NAV 使用同一证券当日未复权收盘价作为 `UNDERLYING_CLOSE_PROXY`；流水和实验记录持仓权利数量、估值日期、底层价格来源与输入 SHA-256，并明确该价格不是权利成交价。缺收盘价、股数未确认、停牌或停牌状态未知会阻断 NAV。程序按进行中的权利维护待处理集合，不逐日扫描已结束事件。CSV 必须绑定本地原件哈希和人工复核字段，但程序不验证公告解释是否正确。2026-11-03 的真实公告小样已完成原件哈希与文本字段自动核对；三份记录的独立人工签认仍待完成。配股、非 1:1 合并、退市和完整逐证券事件覆盖审计尚未接入正式回测。详见[公司行动账务契约](corporate-action-accounting-contract.md)、[真实公告小样字段核对](corporate-action-sample-audit.md)和[正式基线就绪审计](baseline-readiness.md)。
+`ledger_v2` 研究诊断现可调度现金分红、1:1 代码变更和受限送转事件。送转使用登记日收盘快照锁定持仓批次和成本分摊；生效日形成权利，股份登记日转成独立批次，可流通日才可卖。登记日至生效日前发生的卖出不会丢失送转权利；非整数获配若没有账户层股数及依据会在登记日阻断。事件后续阶段落在回测窗口外时，期末账本保留未完成权利及下一阶段日期；账本状态续跑需提供相符的 opening snapshot，完整规则策略续跑则使用单独的 `backtest_checkpoint.json` 并同时提供完整交易日历。没有窗口前权益快照的权利会阻断，不按零权利处理。
+
+完整规则策略续跑的合成输入中，“连续一次跑”和“分段保存/恢复”逐日 NAV、成交、公司行动流水、账本快照和窗口交界待执行目标一致。checkpoint 还保留全局调仓位置、动量预热行、信号模式、代码变更信号保护状态、上次价格与前收、总权益和输入散列。该原型只支持 `ledger_v2` 规则策略，不代表 Qlib 训练状态续训，也不表示真实市场效果。
+
+运行同日现金分红 + 送转合成诊断（不读取真实行情或华泰账户）：
+
+```bash
+uv run python scripts/run_synthetic_action_diagnostic.py --output outputs/synthetic-action-diagnostic
+```
+
+脚本生成唯一输出目录，含行情、成交、账本流水、逐批次税务状态、NAV 曲线、快照、指标和 manifest。事件日期和比例是虚构字段，交易日使用生成的工作日 fixture；NAV 指标只能检查链路和账务算术，不能解释成策略表现或真实公告字段通过。
+
+登记至新增股份登记前，NAV 使用同一证券当日未复权收盘价作为 `UNDERLYING_CLOSE_PROXY`；流水和实验记录持仓权利数量、估值日期、底层价格来源与输入 SHA-256，并明确该价格不是权利成交价。缺收盘价、股数未确认、停牌或停牌状态未知会阻断 NAV。程序按进行中的权利维护待处理集合，不逐日扫描已结束事件。CSV 必须绑定本地原件哈希和人工复核字段，但程序不验证公告解释是否正确。2026-11-03 的真实公告小样已完成原件哈希与文本字段自动核对；逐字段审核表 `docs/evidence/corporate-action-sample-field-review.csv` 保留 `PENDING`，由维护者阅读原件后签认。华泰成交字段调查模板见[华泰字段调查说明](huatai-fill-field-investigation.md)；尚无脱敏样本，去重仍是审查原型。脚本使用独立合成事件，不会把真实公告记录改为 `REVIEWED`。配股、非 1:1 合并、退市和完整逐证券事件覆盖审计尚未接入正式回测。详见[公司行动账务契约](corporate-action-accounting-contract.md)、[真实公告小样字段核对](corporate-action-sample-audit.md)和[正式基线就绪审计](baseline-readiness.md)。

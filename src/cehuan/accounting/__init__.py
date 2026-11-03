@@ -13,6 +13,7 @@ from cehuan.accounting.events import (
 )
 from cehuan.accounting.models import (
     CashReceivable,
+    DividendTaxLotRecord,
     EntitledLot,
     EntitlementSnapshot,
     FeeItem,
@@ -27,6 +28,7 @@ from cehuan.accounting.models import (
 
 __all__ = [
     "CashReceivable",
+    "DividendTaxLotRecord",
     "CashDividendEvent",
     "ActionSource",
     "CodeChangeEvent",

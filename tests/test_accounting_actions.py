@@ -154,6 +154,119 @@ def test_unknown_dividend_tax_blocks_nav_and_cash_settlement():
         ledger.settle_receivable("dividend:div-1", settled_on="2026-11-10")
 
 
+def test_deferred_dividend_tax_tracks_lots_payment_cash_sales_and_account_reconciliation():
+    first_lot = _lot("lot-early", shares=100, basis="800")
+    second_lot = PositionLot(
+        lot_id="lot-late", symbol="SH600000", total_shares=100, sellable_shares=100,
+        cost_basis_cny=Decimal("900"), acquired_on="2026-06-01", sellable_from="2026-06-02",
+    )
+    ledger = PortfolioLedger(Decimal("0"), positions=(first_lot, second_lot))
+    event = _dividend()
+    ledger.record_cash_dividend(event, as_of=event.record_date)
+    ledger.accrue_cash_dividend(
+        event,
+        as_of=event.ex_date,
+        tax_cny=None,
+        tax_treatment="DEFERRED_BY_HOLDING_PERIOD",
+        payment_withholding_per_share_cny=Decimal("0"),
+    )
+
+    before_payment = ledger.mark_to_market(
+        event.ex_date, {event.symbol: _price("9.50", event.ex_date.isoformat())}
+    )
+    assert before_payment.status == "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX"
+    assert before_payment.nav_cny == Decimal("2000.00")
+    assert before_payment.valuation_tax_scope == "GROSS_CASH_EXCLUDING_UNRESOLVED_FUTURE_DIVIDEND_TAX"
+    assert before_payment.unresolved_dividend_tax_count == 2
+
+    ledger.settle_receivable(
+        "dividend:div-1",
+        settled_on="2026-11-10",
+        actual_withheld_tax_cny=Decimal("0"),
+        payment_evidence_id="statement-line-1",
+        payment_evidence_sha256="e" * 64,
+    )
+    assert ledger.cash_cny == Decimal("100.00")
+    settled = next(item for item in ledger.receivables if item.event_id == event.event_id)
+    assert settled.payment_withheld_tax_cny == Decimal("0.00")
+    assert settled.payment_withholding_is_account_evidence
+    assert all(item.tax_status == "RECEIVED_TAX_PENDING" for item in ledger.dividend_tax_records)
+
+    code_change = CodeChangeEvent(
+        event_id="code-change-after-dividend",
+        old_symbol="SH600000",
+        new_symbol="SH600001",
+        effective_date="2026-11-11",
+        security_identity="synthetic same issuer",
+        share_ratio=Decimal("1"),
+        known_at_utc="2026-11-01T08:00:00Z",
+        source=_source(),
+    )
+    ledger.apply_code_change(code_change, as_of=code_change.effective_date)
+    assert {item.symbol for item in ledger.dividend_tax_records} == {"SH600001"}
+    ledger.apply_fill(TradeFill(
+        fill_id="sell-after-code-change",
+        trade_date="2026-11-11",
+        symbol="SH600001",
+        side="SELL",
+        quantity=50,
+        price_cny=Decimal("10"),
+    ))
+    first_record = next(item for item in ledger.dividend_tax_records if item.lot_id == "lot-early")
+    assert (first_record.entitled_shares, first_record.remaining_shares, first_record.sold_shares) == (100, 50, 50)
+    assert first_record.tax_status == "PARTIALLY_SOLD_TAX_PENDING"
+
+    evidence = {"id": "tax-settlement-1", "sha": "f" * 64}
+    entries = ledger.reconcile_dividend_tax(
+        first_record.record_id,
+        reconciled_sold_shares=50,
+        tax_cny=Decimal("3.25"),
+        settled_on="2026-11-12",
+        account_evidence_id=evidence["id"],
+        account_evidence_sha256=evidence["sha"],
+    )
+    cash_after_reconciliation = ledger.cash_cny
+    assert cash_after_reconciliation == Decimal("596.75")
+    assert ledger.reconcile_dividend_tax(
+        first_record.record_id,
+        reconciled_sold_shares=50,
+        tax_cny=Decimal("3.25"),
+        settled_on="2026-11-12",
+        account_evidence_id=evidence["id"],
+        account_evidence_sha256=evidence["sha"],
+    ) == entries
+    assert ledger.cash_cny == cash_after_reconciliation
+    updated = next(item for item in ledger.dividend_tax_records if item.lot_id == "lot-early")
+    assert updated.tax_reconciled_shares == 50
+    assert updated.final_tax_cny == Decimal("3.25")
+    assert updated.account_evidence_id == evidence["id"]
+    nav = ledger.mark_to_market(
+        "2026-11-12", {"SH600001": _price("10", "2026-11-12")}
+    )
+    assert nav.status == "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX"
+    assert nav.unresolved_dividend_tax_count == 2
+
+
+def test_no_holder_dividend_with_deferred_policy_creates_no_phantom_tax_state():
+    ledger = PortfolioLedger(Decimal("100"))
+    event = _dividend()
+    ledger.record_cash_dividend(event, as_of=event.record_date)
+    ledger.accrue_cash_dividend(
+        event,
+        as_of=event.ex_date,
+        tax_cny=None,
+        tax_treatment="DEFERRED_BY_HOLDING_PERIOD",
+        payment_withholding_per_share_cny=Decimal("0"),
+    )
+
+    nav = ledger.mark_to_market(event.ex_date, {})
+    assert nav.status == "VALUED"
+    assert nav.nav_cny == Decimal("100")
+    assert ledger.dividend_tax_records == ()
+    ledger.settle_receivable("dividend:div-1", settled_on=event.payable_date)
+    assert ledger.cash_cny == Decimal("100")
+
+
 def test_share_distribution_preserves_cost_and_blocks_trading_new_shares_until_date():
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _distribution()

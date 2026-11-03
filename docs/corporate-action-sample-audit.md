@@ -6,6 +6,8 @@
 
 字段清单位于 [corporate-action-sample-audit.csv](evidence/corporate-action-sample-audit.csv)。程序读取清单中的私有原件和文本提取文件，核对原件 SHA-256 与公告文本所含字段 token：
 
+可逐字段人工签认的表是 [corporate-action-sample-field-review.csv](evidence/corporate-action-sample-field-review.csv)。每个公告值各占一行，`review_status` 目前全部为 `PENDING`，`reviewed_by`/`reviewed_at` 留空。自动读取文本或校验哈希不会替维护者签认；审阅者应对照归档 PDF 页码填写结论，并保留未知值，不推测公告没给出的精确首次可得时刻。
+
 ```bash
 uv run python -m cehuan.data.accounting_sample_audit --manifest docs/evidence/corporate-action-sample-audit.csv --output data/private/audits/corporate-action-samples-20261103/automated-audit.json
 ```
@@ -18,12 +20,28 @@ uv run python -m cehuan.data.accounting_sample_audit --manifest docs/evidence/co
 | `SH600101` 资本公积转增 | 登记日 2024-07-04；除权日、新增股份上市日 2024-07-05；每股转增 0.30 股 | 该公告文本没有明确个人账户小数股最终分配结果。本项目保留 `ACCOUNT_RESULT_REQUIRED`，不能由 0.30 比例推断账户整数股 |
 | `SZ300114 → SZ302132` 代码变更 | 新代码自 2025-02-17 启用；公告说明账户持有股份数量不变 | 登记日仅按 T-1 相对日期描述；本表不推定精确首次可得时刻，也不替代证券身份人工认定 |
 
+对明星电力公告，原文第一页列明每股现金红利 0.10 元（含税）、每股转增 0.3 股、股权登记日 2024-07-04，以及 2024-07-05 的除权息、新增无限售股份上市和现金发放日期。第一页与第三至四页说明：公告列出的个人股东及证券投资基金在派发时暂不扣缴个人所得税，之后转让股票时按持股期限处理。这说明“发放日无预扣”不等于“未来税款为零”；公告只说明适用规则，不包含某个华泰账户的实际到账金额或后续扣款。[明星电力实施公告原文](https://static.cninfo.com.cn/finalpage/2024-06-28/1220480655.PDF)
+
+## 字段归属与短区间诊断
+
+- **公告可直接支持**：公告日期、证券标识、登记/除权/到账/新增股流通日期、现金和转增比例、公告描述的股息税处理。所有字段仍需要人工按页码签认。
+- **待进一步核对**：公告首次对市场公开的精确时刻、代码变更身份事件的完整点时证据，以及公告未明确的零股结果。不能将公告发布日期自动当成当日开盘前可用时间。
+- **账户或结算资料才知道**：个人登记日实际持股批次、现金实际到账、后续税款、零碎股最终分配和持仓导出中的批次情况。发行人公告不能替代这些事实。
+
+短区间账务流程由独立的合成脚本验证：
+
+```bash
+uv run python scripts/run_synthetic_action_diagnostic.py --output outputs/synthetic-action-diagnostic
+```
+
+此脚本只在虚构行情中安排同日分红与送转，复用事件日期和比例作为测试场景背景；它使用合成 `ActionSource`、合成持仓及发放时零预扣假设，不读取上述三条待签认表，也不使用私有行情或账户数据。它可验证登记日共享持仓快照、双事件仅过账一次、股数和 NAV 口径、以及未决未来税务状态；输出仍是 `synthetic_ledger_v2_research_diagnostic`，不能称为真实公告短区间回测或正式绩效。
+
 公告分别来自[明星电力实施公告](https://static.cninfo.com.cn/finalpage/2024-06-28/1220480655.PDF)和[中航成飞代码变更实施公告](https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF)。PDF 原件保存在被 Git 忽略的 `data/private/evidence/` 下；本机登记哈希分别为：
 
 - 明星电力 2024 年实施公告：`c432142ae5ad8957bb4d01233a26cad3b4173a47368b1094c0689ff42b8a0571`
 - 中航成飞 2025 年代码变更公告：`dd68049c48df826848f361fd9e7b23dd20b6805144a2e5bc36e54db638611488`
 
-CSV 中 `review_status=PENDING_INDEPENDENT_HUMAN_SIGNOFF` 是有意保留的门槛。当前由 Codex 对归档文本做了初步字段检查；用户或指定维护者逐字段复核前，不能将其改成已人工签认，也不应用这三行直接构造正式事件数据。
+CSV 中 `review_status=PENDING_INDEPENDENT_HUMAN_SIGNOFF` 是有意保留的门槛。归档文本 token 检查只提供机器辅助线索；用户或指定维护者逐字段复核前，不能将其改成已人工签认，也不应用这三行直接构造经过审核的研究事件输入。
 
 ## 覆盖边界
 

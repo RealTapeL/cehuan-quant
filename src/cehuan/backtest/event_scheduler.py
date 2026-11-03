@@ -33,6 +33,8 @@ class AccountingEventSchedule:
     distribution_registrations: Mapping[date, tuple[ShareDistributionEvent, ...]]
     distribution_tradabilities: Mapping[date, tuple[ShareDistributionEvent, ...]]
     dividend_tax_cny: Mapping[str, Decimal | int | str | None]
+    dividend_tax_treatment: Mapping[str, str]
+    dividend_payment_withholding_per_share_cny: Mapping[str, Decimal | int | str | None]
     events: tuple[SupportedAccountingEvent, ...]
     window_start: date
     window_end: date
@@ -43,6 +45,8 @@ class AccountingEventSchedule:
         events: Iterable[SupportedAccountingEvent],
         session_dates: Iterable[date],
         dividend_tax_cny: Mapping[str, Decimal | int | str | None] | None = None,
+        dividend_tax_treatment: Mapping[str, str] | None = None,
+        dividend_payment_withholding_per_share_cny: Mapping[str, Decimal | int | str | None] | None = None,
     ) -> "AccountingEventSchedule":
         sessions = frozenset(session_dates)
         code_changes: dict[date, list[CodeChangeEvent]] = defaultdict(list)
@@ -114,6 +118,42 @@ class AccountingEventSchedule:
             if amount is None:
                 continue
             taxes[event_id] = decimal_value(amount, f"{event_id}.tax_cny", nonnegative=True)
+        treatments = {
+            str(event_id): str(value).strip().upper()
+            for event_id, value in (dividend_tax_treatment or {}).items()
+        }
+        unknown_treatments = set(treatments).difference(dividend_ids)
+        if unknown_treatments:
+            raise ValueError("分红税务处理表含未知 event_id：" + ", ".join(sorted(unknown_treatments)))
+        payment_withholdings = dict(dividend_payment_withholding_per_share_cny or {})
+        unknown_withholdings = set(payment_withholdings).difference(dividend_ids)
+        if unknown_withholdings:
+            raise ValueError("发放日预扣规则表含未知 event_id：" + ", ".join(sorted(unknown_withholdings)))
+        for event_id, amount in list(payment_withholdings.items()):
+            if amount is not None:
+                payment_withholdings[event_id] = decimal_value(
+                    amount, f"{event_id}.payment_withholding_per_share_cny", nonnegative=True
+                )
+        for event_id in dividend_ids:
+            treatment = treatments.get(event_id)
+            if treatment is None:
+                treatment = "FINAL_TAX_KNOWN" if taxes.get(event_id) is not None else "ACCOUNT_EVIDENCE_REQUIRED"
+            if treatment not in {"FINAL_TAX_KNOWN", "DEFERRED_BY_HOLDING_PERIOD", "ACCOUNT_EVIDENCE_REQUIRED"}:
+                raise ValueError(f"{event_id} 分红税务处理状态未知：{treatment}")
+            if treatment == "FINAL_TAX_KNOWN" and taxes.get(event_id) is None:
+                raise ValueError(f"{event_id} 采用 FINAL_TAX_KNOWN 时必须提供 tax_cny")
+            if treatment == "DEFERRED_BY_HOLDING_PERIOD":
+                if taxes.get(event_id) is not None:
+                    raise ValueError(f"{event_id} 递延税务不能把最终税额提前写入 tax_cny")
+                if event_id not in payment_withholdings or payment_withholdings[event_id] is None:
+                    raise ValueError(f"{event_id} 递延税务必须提供发放日每股预扣规则")
+            elif payment_withholdings.get(event_id) is not None:
+                raise ValueError(
+                    f"{event_id} 发放日每股预扣规则只允许用于 DEFERRED_BY_HOLDING_PERIOD"
+                )
+            if treatment == "ACCOUNT_EVIDENCE_REQUIRED" and taxes.get(event_id) is not None:
+                raise ValueError(f"{event_id} 需要账户证据时不能同时声明最终税额")
+            treatments[event_id] = treatment
 
         def freeze(mapping: dict[date, list[object]]) -> dict[date, tuple]:
             return {day: tuple(sorted(rows, key=lambda event: event.event_id)) for day, rows in mapping.items()}
@@ -129,6 +169,8 @@ class AccountingEventSchedule:
             distribution_registrations=freeze(distribution_registrations),
             distribution_tradabilities=freeze(distribution_tradabilities),
             dividend_tax_cny=taxes,
+            dividend_tax_treatment=treatments,
+            dividend_payment_withholding_per_share_cny=payment_withholdings,
             events=tuple(sorted(event_rows, key=lambda event: event.event_id)),
             window_start=window_start,
             window_end=window_end,

@@ -7,7 +7,7 @@ import subprocess
 import uuid
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -27,10 +27,12 @@ from cehuan.accounting import (
     ShareDistributionEvent,
     TradeFill,
 )
+from cehuan.backtest.checkpoint import BacktestCheckpoint, CheckpointPrice, SignalHistoryBar
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.backtest.event_scheduler import AccountingEventSchedule, SupportedAccountingEvent
 from cehuan.config import load_config
 from cehuan.data.canonical import BAR_COLUMNS, normalize_bar_frame, read_bars
+from cehuan.data.calendar import normalize_trading_calendar
 from cehuan.data.corporate_actions import normalize_corporate_actions, read_corporate_actions
 from cehuan.data.fee_schedule import map_fee_schedule_to_sessions, normalize_fee_schedule, scheduled_fee_components
 from cehuan.data.market_rules import attach_market_rule_schedule, normalize_market_rule_schedule
@@ -54,6 +56,7 @@ from cehuan.signals.strategy import (
     status_is_buy_eligible,
     status_is_sell_eligible,
 )
+from cehuan.data.adjustment import select_signal_prices
 
 
 def _git_metadata() -> dict[str, Any]:
@@ -93,6 +96,14 @@ def _normalized_table_digest(frame: pd.DataFrame) -> str:
         canonical[column] = canonical[column].astype("string").fillna("")
     payload = canonical.to_csv(index=False, lineterminator="\n").encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_path(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _fees(notional: float, side: str, costs: dict[str, Any]) -> float:
@@ -304,7 +315,12 @@ def run_backtest(
     fee_schedule: pd.DataFrame | None = None,
     accounting_events: Sequence[SupportedAccountingEvent] | None = None,
     dividend_tax_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
+    dividend_tax_treatment_by_event: Mapping[str, str] | None = None,
+    dividend_payment_withholding_per_share_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
     opening_accounting_snapshot: LedgerSnapshot | None = None,
+    backtest_checkpoint: BacktestCheckpoint | None = None,
+    trading_calendar: pd.DataFrame | None = None,
+    source_data_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -322,10 +338,23 @@ def run_backtest(
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(security_identity_events, pd.DataFrame):
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
-    if accounting_mode != "ledger_v2" and (accounting_events or dividend_tax_cny_by_event):
+    if accounting_mode != "ledger_v2" and (
+        accounting_events or dividend_tax_cny_by_event or dividend_tax_treatment_by_event
+        or dividend_payment_withholding_per_share_cny_by_event
+    ):
         raise ValueError("显式账务事件与分红税费仅支持 ledger_v2 的非正式研究诊断")
     if opening_accounting_snapshot is not None and accounting_mode != "ledger_v2":
         raise ValueError("期初账本快照仅支持 --diagnostic --accounting-mode ledger_v2")
+    if backtest_checkpoint is not None and accounting_mode != "ledger_v2":
+        raise ValueError("完整策略 checkpoint 仅支持 --diagnostic --accounting-mode ledger_v2")
+    if backtest_checkpoint is not None and opening_accounting_snapshot is not None:
+        raise ValueError("完整策略 checkpoint 已包含账本快照，不能再单独传入期初账本快照")
+    if (backtest_checkpoint is not None or trading_calendar is not None) and formal:
+        raise ValueError("策略 checkpoint 与交易日历续跑仅用于非正式研究诊断")
+    if trading_calendar is not None and accounting_mode != "ledger_v2":
+        raise ValueError("完整策略 checkpoint/交易日历状态目前仅支持 ledger_v2 研究诊断")
+    if backtest_checkpoint is not None and trading_calendar is None:
+        raise ValueError("完整策略续跑必须传入交易日历，校验交易日连续性")
     if (market_rule_schedule is None) != (fee_schedule is None):
         raise ValueError("有效日期规则和历史费率必须成对提供")
     use_effective_schedules = market_rule_schedule is not None
@@ -341,6 +370,20 @@ def run_backtest(
         compact=mutate_input,
         assume_sorted=mutate_input,
     )
+    current_window_bars_sha256 = hashlib.sha256(
+        pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+    ).hexdigest()
+    current_window_data_sha256 = source_data_sha256 or hashlib.sha256(
+        pd.util.hash_pandas_object(data[BAR_COLUMNS].reset_index(drop=True), index=False).values.tobytes()
+    ).hexdigest()
+    source_path = Path(source_data_path).expanduser().resolve() if source_data_path else None
+    if source_path is not None:
+        if not source_path.is_file():
+            raise FileNotFoundError(f"当前窗口行情文件不存在：{source_path}")
+        observed_current_data_sha256 = _sha256_path(source_path)
+        if source_data_sha256 is not None and observed_current_data_sha256 != source_data_sha256:
+            raise ValueError("当前窗口行情文件 SHA-256 与调用方绑定散列不一致")
+        current_window_data_sha256 = observed_current_data_sha256
     mark_columns = ("trade_date", "symbol", "close", "is_suspended", "data_source")
     mark_inputs = pd.DataFrame({
         column: (
@@ -472,30 +515,233 @@ def run_backtest(
             identity_events["old_symbol"].isin(symbols_in_data)
             | identity_events["new_symbol"].isin(symbols_in_data)
         ].reset_index(drop=True)
-    data = add_momentum(data, lookback, normalized=True)
-    data["previous_close"] = data.groupby("symbol", sort=False, observed=True)["close"].shift(1)
+    compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
+    config_sha256 = hashlib.sha256(
+        json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    identity_events_sha256 = _normalized_event_table_digest(identity_events)
+    corporate_actions_sha256 = _normalized_event_table_digest(action_events)
+    accounting_events_sha256 = hashlib.sha256(json.dumps(
+        {
+            "events": [asdict(event) for event in sorted(accounting_events or (), key=lambda event: event.event_id)],
+            "dividend_tax_cny_by_event": {
+                event_id: None if amount is None else str(amount)
+                for event_id, amount in sorted((dividend_tax_cny_by_event or {}).items())
+            },
+            "dividend_tax_treatment_by_event": dict(sorted((dividend_tax_treatment_by_event or {}).items())),
+            "dividend_payment_withholding_per_share_cny_by_event": {
+                event_id: None if amount is None else str(amount)
+                for event_id, amount in sorted((dividend_payment_withholding_per_share_cny_by_event or {}).items())
+            },
+        },
+        ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    normalized_calendar = normalize_trading_calendar(trading_calendar) if trading_calendar is not None else None
+    normalized_calendar_sha256 = (
+        _normalized_table_digest(normalized_calendar) if normalized_calendar is not None else None
+    )
+
+    data["signal_price"], current_signal_modes = select_signal_prices(data)
+    current_modes = {str(symbol): mode for symbol, mode in current_signal_modes.items()}
+    if backtest_checkpoint is None:
+        signal_modes = current_modes
+        feature_data = add_momentum(data, lookback, normalized=True)
+        feature_data["previous_close"] = feature_data.groupby("symbol", sort=False, observed=True)["close"].shift(1)
+        signal_history_source = feature_data[["trade_date", "symbol", "close", "signal_price"]].copy()
+    else:
+        if backtest_checkpoint.strategy_id != str(strategy["name"]):
+            raise ValueError("checkpoint 策略名称变化；请从受影响日期重新计算")
+        if backtest_checkpoint.config_sha256 != config_sha256:
+            raise ValueError("checkpoint 绑定的策略配置已变化；请从受影响日期重新计算")
+        if backtest_checkpoint.market_rules_sha256 != (
+            _normalized_table_digest(normalized_market_rules) if normalized_market_rules is not None else None
+        ):
+            raise ValueError("checkpoint 绑定的交易规则版本已变化；请从受影响日期重新计算")
+        if backtest_checkpoint.fee_schedule_sha256 != (
+            _normalized_table_digest(normalized_fee_schedule) if normalized_fee_schedule is not None else None
+        ):
+            raise ValueError("checkpoint 绑定的费率版本已变化；请从受影响日期重新计算")
+        if backtest_checkpoint.identity_events_sha256 != identity_events_sha256:
+            raise ValueError("checkpoint 绑定的证券身份事件已变化；请从受影响日期重新计算")
+        if backtest_checkpoint.corporate_actions_sha256 != corporate_actions_sha256:
+            raise ValueError("checkpoint 绑定的退市/公司行动输入已变化；请从受影响日期重新计算")
+        if backtest_checkpoint.source_data_path:
+            prior_path = Path(backtest_checkpoint.source_data_path)
+            if not prior_path.is_file():
+                raise FileNotFoundError(f"checkpoint 绑定的历史行情文件不存在：{prior_path}")
+            observed_prior = _sha256_path(prior_path)
+            if observed_prior != backtest_checkpoint.last_window_data_sha256:
+                raise ValueError("checkpoint 绑定的历史行情文件已修改；请从受影响日期重新计算")
+        if normalized_calendar is None:
+            raise ValueError("完整策略续跑必须传入交易日历")
+        if backtest_checkpoint.calendar_sha256 != normalized_calendar_sha256:
+            raise ValueError("checkpoint 绑定的完整交易日历版本已变化")
+        first_current_date = pd.Timestamp(data["trade_date"].min()).date()
+        last_current_date = pd.Timestamp(data["trade_date"].max()).date()
+        if first_current_date != backtest_checkpoint.next_expected_session:
+            raise ValueError(
+                f"续跑首日 {first_current_date} 不等于 checkpoint 记录的下一交易日 "
+                f"{backtest_checkpoint.next_expected_session}"
+            )
+        prior_calendar_rows = normalized_calendar.loc[
+            normalized_calendar["trade_date"] <= backtest_checkpoint.as_of_date
+        ].copy()
+        prior_calendar_sha256 = _normalized_table_digest(prior_calendar_rows)
+        if prior_calendar_sha256 != backtest_checkpoint.calendar_prefix_sha256:
+            raise ValueError("checkpoint 绑定的历史交易日历前缀已变化")
+        checkpoint_calendar_open = set(
+            normalized_calendar.loc[normalized_calendar["is_open"].fillna(False), "trade_date"]
+        )
+        if first_current_date not in checkpoint_calendar_open:
+            raise ValueError(f"续跑首日 {first_current_date} 不在交易日历开市日中")
+        prior_open = normalized_calendar.loc[
+            normalized_calendar["is_open"].fillna(False)
+            & (normalized_calendar["trade_date"] <= backtest_checkpoint.as_of_date),
+            "trade_date",
+        ]
+        expected_next = normalized_calendar.loc[
+            normalized_calendar["is_open"].fillna(False)
+            & (normalized_calendar["trade_date"] > backtest_checkpoint.as_of_date),
+            "trade_date",
+        ]
+        if prior_open.empty or expected_next.empty or expected_next.iloc[0] != first_current_date:
+            raise ValueError("续跑交易日历在 checkpoint 与当前窗口之间存在缺口或缺少下一交易日")
+
+        checkpoint_modes = dict(backtest_checkpoint.signal_price_modes)
+        signal_modes = dict(checkpoint_modes)
+        for symbol, current_mode in current_modes.items():
+            prior_mode = checkpoint_modes.get(symbol)
+            if prior_mode is None:
+                signal_modes[symbol] = current_mode
+            elif prior_mode == "adjusted_close" and current_mode != "adjusted_close":
+                raise ValueError(f"{symbol} 续跑后复权价格缺失/变化；不能沿用 checkpoint 信号历史")
+            elif prior_mode == "raw_close_no_adjustment" and current_mode != "raw_close_no_adjustment":
+                raise ValueError(f"{symbol} 续跑后复权字段可用性发生变化；请重新计算信号历史")
+
+        current_signal_values: list[float] = []
+        for row_index, row in data.iterrows():
+            symbol = str(row["symbol"])
+            mode = signal_modes[symbol]
+            if mode == "adjusted_close":
+                value = pd.to_numeric(pd.Series([row.get("adjusted_close")]), errors="coerce").iloc[0]
+            elif mode == "raw_close_no_adjustment":
+                value = row["close"]
+            else:
+                value = np.nan
+            if mode != "unusable_mixed_or_nonpositive_adjustment" and (
+                pd.isna(value) or not np.isfinite(float(value)) or float(value) <= 0
+            ):
+                raise ValueError(f"{symbol} 续跑信号价格无效；请重新生成完整历史特征")
+            current_signal_values.append(float(value) if not pd.isna(value) else np.nan)
+        data["signal_price"] = current_signal_values
+        history_frame = pd.DataFrame([
+            {
+                "trade_date": item.trade_date,
+                "symbol": item.symbol,
+                "close": float(item.close_cny),
+                "signal_price": np.nan if item.signal_price_cny is None else float(item.signal_price_cny),
+            }
+            for item in backtest_checkpoint.signal_history
+        ])
+        current_feature_rows = data[["trade_date", "symbol", "close", "signal_price"]].copy()
+        signal_history_source = pd.concat([history_frame, current_feature_rows], ignore_index=True)
+        signal_history_source = signal_history_source.sort_values(["trade_date", "symbol"], kind="stable")
+        signal_history_source["momentum"] = signal_history_source.groupby(
+            "symbol", sort=False, observed=True
+        )["signal_price"].transform(lambda values: values.div(values.shift(lookback)).sub(1.0))
+        signal_history_source["previous_close"] = signal_history_source.groupby(
+            "symbol", sort=False, observed=True
+        )["close"].shift(1)
+        features = signal_history_source.loc[
+            signal_history_source["trade_date"].isin(data["trade_date"]),
+            ["trade_date", "symbol", "momentum", "previous_close"],
+        ]
+        data = data.merge(features, on=["trade_date", "symbol"], how="left", validate="one_to_one")
+    if backtest_checkpoint is None:
+        data = feature_data
+    if normalized_calendar is not None:
+        bar_sessions = sorted(pd.to_datetime(data["trade_date"]).dt.date.unique())
+        calendar_open_sessions = sorted(
+            normalized_calendar.loc[normalized_calendar["is_open"].fillna(False), "trade_date"].tolist()
+        )
+        expected_in_window = [day for day in calendar_open_sessions if bar_sessions[0] <= day <= bar_sessions[-1]]
+        if bar_sessions != expected_in_window:
+            missing_sessions = sorted(set(expected_in_window).difference(bar_sessions))
+            extra_sessions = sorted(set(bar_sessions).difference(calendar_open_sessions))
+            raise ValueError(
+                "回测行情日期与交易日历不连续："
+                f"missing={','.join(day.isoformat() for day in missing_sessions[:10])}; "
+                f"closed_or_unknown={','.join(day.isoformat() for day in extra_sessions[:10])}"
+            )
     trade_dates = data["trade_date"].to_numpy()
     boundaries = np.flatnonzero(trade_dates[1:] != trade_dates[:-1]) + 1
     day_starts = np.concatenate(([0], boundaries))
     day_ends = np.concatenate((boundaries, [len(data)]))
     dates = [data.iloc[start]["trade_date"] for start in day_starts]
+    if normalized_calendar is not None:
+        last_session_date = pd.Timestamp(dates[-1]).date()
+        future_open_dates = normalized_calendar.loc[
+            normalized_calendar["is_open"].fillna(False)
+            & (normalized_calendar["trade_date"] > last_session_date),
+            "trade_date",
+        ]
+        if future_open_dates.empty:
+            raise ValueError("完整策略 checkpoint 需要包含回测期末之后的下一开市日历日期")
     scheduled_fees_by_date = (
         map_fee_schedule_to_sessions(normalized_fee_schedule, dates)
         if normalized_fee_schedule is not None else {}
     )
-    date_session_index = {
-        pd.Timestamp(value).strftime("%Y-%m-%d"): index for index, value in enumerate(dates)
-    }
-    if len(dates) <= lookback + 1:
+    if not dates:
+        raise ValueError("回测输入至少需要一个交易日")
+    if backtest_checkpoint is None and len(dates) <= lookback + 1:
         raise ValueError(f"至少需要 {lookback + 2} 个交易日，当前只有 {len(dates)} 天")
+    global_session_start = (
+        backtest_checkpoint.global_session_index + 1 if backtest_checkpoint is not None else 0
+    )
+    trade_sequence_start = backtest_checkpoint.trade_count if backtest_checkpoint is not None else 0
+    next_open_session_by_date: dict[str, date] = {}
+    if normalized_calendar is not None:
+        calendar_open_dates = normalized_calendar.loc[
+            normalized_calendar["is_open"].fillna(False), "trade_date"
+        ].tolist()
+        for current, following in zip(calendar_open_dates, calendar_open_dates[1:]):
+            next_open_session_by_date[current.isoformat()] = following
+    for index, value in enumerate(dates[:-1]):
+        next_open_session_by_date.setdefault(
+            pd.Timestamp(value).strftime("%Y-%m-%d"), pd.Timestamp(dates[index + 1]).date()
+        )
 
     accounting_event_list = tuple(accounting_events or ())
     event_schedule = AccountingEventSchedule.build(
         accounting_event_list,
         (pd.Timestamp(value).date() for value in dates),
         dividend_tax_cny_by_event,
+        dividend_tax_treatment_by_event,
+        dividend_payment_withholding_per_share_cny_by_event,
     )
+    accounting_events_sha256 = hashlib.sha256(json.dumps(
+        {
+            "events": [asdict(event) for event in sorted(accounting_event_list, key=lambda item: item.event_id)],
+            "dividend_tax_cny_by_event": {
+                event_id: None if amount is None else str(amount)
+                for event_id, amount in sorted(event_schedule.dividend_tax_cny.items())
+            },
+            "dividend_tax_treatment_by_event": dict(sorted(event_schedule.dividend_tax_treatment.items())),
+            "dividend_payment_withholding_per_share_cny_by_event": {
+                event_id: None if amount is None else str(amount)
+                for event_id, amount in sorted(event_schedule.dividend_payment_withholding_per_share_cny.items())
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if backtest_checkpoint is not None and backtest_checkpoint.accounting_events_sha256 != accounting_events_sha256:
+        raise ValueError("checkpoint 绑定的公司行动事件或分红税务处理已变化；请从受影响日期重新计算")
 
+    if backtest_checkpoint is not None:
+        opening_accounting_snapshot = backtest_checkpoint.ledger_snapshot
     cash = float(initial_cash_cny)
     holdings: dict[str, int] = {}
     cost_basis_cny: dict[str, float] = {}
@@ -503,6 +749,7 @@ def run_backtest(
     last_prices: dict[str, float] = {}
     last_price_dates: dict[str, str] = {}
     last_price_sources: dict[str, str] = {}
+    last_price_global_indices: dict[str, int] = {}
     if opening_accounting_snapshot is not None:
         if opening_accounting_snapshot.as_of_date is None:
             raise ValueError("期初账本快照缺少 as_of_date，无法验证跨窗口时间边界")
@@ -678,6 +925,12 @@ def run_backtest(
 
     if execution_ledger is not None:
         sync_projection_from_ledger()
+    if backtest_checkpoint is not None:
+        for mark in backtest_checkpoint.last_prices:
+            last_prices[mark.symbol] = float(mark.price_cny)
+            last_price_dates[mark.symbol] = mark.price_date.isoformat()
+            last_price_sources[mark.symbol] = mark.source
+            last_price_global_indices[mark.symbol] = mark.global_session_index
 
     active_distribution_claims: dict[str, ShareDistributionEvent] = {}
     if execution_ledger is not None:
@@ -691,8 +944,12 @@ def run_backtest(
                     raise ValueError(f"期初待登记权利 {claim.event_id} 缺少对应送转事件")
                 active_distribution_claims[event.event_id] = event
 
-    pending_targets: dict[str, float] | None = None
-    transition_signal_ready_index: dict[str, int] = {}
+    pending_targets: dict[str, float] | None = (
+        dict(backtest_checkpoint.pending_targets) if backtest_checkpoint is not None else None
+    )
+    transition_signal_ready_index: dict[str, int] = (
+        dict(backtest_checkpoint.transition_signal_ready_index) if backtest_checkpoint is not None else {}
+    )
     equity_rows: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     security_events: list[dict[str, Any]] = []
@@ -705,6 +962,7 @@ def run_backtest(
     } if not identity_events.empty else {}
 
     for index, (date, start, end) in enumerate(zip(dates, day_starts, day_ends)):
+        global_index = global_session_start + index
         day = data.iloc[start:end].set_index("symbol", drop=False)
         day_date = pd.Timestamp(date).strftime("%Y-%m-%d")
 
@@ -732,10 +990,11 @@ def run_backtest(
                 pending_targets.pop(old_symbol, None)
                 pending_targets.pop(new_symbol, None)
             if shares_before:
-                transition_signal_ready_index[new_symbol] = index + lookback
+                transition_signal_ready_index[new_symbol] = global_index + lookback
             last_prices.pop(old_symbol, None)
             last_price_dates.pop(old_symbol, None)
             last_price_sources.pop(old_symbol, None)
+            last_price_global_indices.pop(old_symbol, None)
             security_events.append({
                 "trade_date": day_date,
                 "event_id": event.event_id,
@@ -869,8 +1128,11 @@ def run_backtest(
                 existing_since = holding_since.get(new_symbol, "")
                 candidates = [value for value in (existing_since, old_holding_since) if value]
                 holding_since[new_symbol] = min(candidates) if candidates else day_date
-                transition_signal_ready_index[new_symbol] = index + lookback
+                transition_signal_ready_index[new_symbol] = global_index + lookback
             last_prices.pop(old_symbol, None)
+            last_price_dates.pop(old_symbol, None)
+            last_price_sources.pop(old_symbol, None)
+            last_price_global_indices.pop(old_symbol, None)
             security_events.append({
                 "trade_date": day_date,
                 "event_id": str(event["event_id"]),
@@ -910,7 +1172,7 @@ def run_backtest(
             # lookback. A signal from the previous code is never carried over.
             protected_symbols = {
                 symbol for symbol, ready_index in transition_signal_ready_index.items()
-                if symbol in holdings and index <= ready_index
+                if symbol in holdings and global_index <= ready_index
             }
             for symbol in protected_symbols:
                 target_shares[symbol] = holdings[symbol]
@@ -978,7 +1240,7 @@ def run_backtest(
                     cost_basis_cny[symbol] = max(0.0, cost_basis_cny.get(symbol, 0.0) - allocated_basis)
                 else:
                     (entry,) = execution_ledger.apply_fill(TradeFill(
-                        fill_id=f"bt-{day_date}-{symbol}-SELL-{len(trades):08d}",
+                        fill_id=f"bt-{day_date}-{symbol}-SELL-{trade_sequence_start + len(trades):08d}",
                         trade_date=day_date,
                         symbol=symbol,
                         side="SELL",
@@ -1078,8 +1340,13 @@ def run_backtest(
                     cost_basis_cny[symbol] = cost_basis_cny.get(symbol, 0.0) + notional + fees
                     holding_since.setdefault(symbol, day_date)
                 else:
+                    sellable_from = next_open_session_by_date.get(day_date)
+                    if sellable_from is None:
+                        raise ValueError(
+                            f"{day_date} 买入成交缺少下一交易日历，无法确定 T+1 可卖日期"
+                        )
                     execution_ledger.apply_fill(TradeFill(
-                        fill_id=f"bt-{day_date}-{symbol}-BUY-{len(trades):08d}",
+                        fill_id=f"bt-{day_date}-{symbol}-BUY-{trade_sequence_start + len(trades):08d}",
                         trade_date=day_date,
                         symbol=symbol,
                         side="BUY",
@@ -1089,7 +1356,7 @@ def run_backtest(
                             FeeItem(name, Decimal(str(amount)))
                             for name, amount in fee_components.items()
                         ),
-                        sellable_from=dates[index + 1],
+                        sellable_from=sellable_from,
                     ))
                     sync_projection_from_ledger()
                 total_turnover += notional
@@ -1118,7 +1385,8 @@ def run_backtest(
         # Company-action accounting is applied after the simulated open fills:
         # record-date entitlement reflects end-of-session holdings, accrual is
         # recognized on ex-date, and payable cash is settled on its scheduled
-        # date. An unknown dividend tax leaves NAV unvalued and stops the run.
+        # date. Unknown receivable tax blocks NAV; unresolved future tax after
+        # deferred-at-payment treatment is reported with an explicit gross scope.
         if execution_ledger is not None:
             action_day = pd.Timestamp(date).date()
             for event in event_schedule.distribution_records.get(action_day, ()):
@@ -1141,6 +1409,10 @@ def run_backtest(
                     event,
                     as_of=event.ex_date,
                     tax_cny=event_schedule.dividend_tax_cny.get(event.event_id),
+                    tax_treatment=event_schedule.dividend_tax_treatment.get(event.event_id),
+                    payment_withholding_per_share_cny=(
+                        event_schedule.dividend_payment_withholding_per_share_cny.get(event.event_id)
+                    ),
                 )
             for event in event_schedule.dividend_payments.get(action_day, ()):
                 if event.payable_date == event.ex_date:
@@ -1155,6 +1427,7 @@ def run_backtest(
                 last_prices[symbol] = float(row["close"])
                 last_price_dates[symbol] = day_date
                 last_price_sources[symbol] = str(row.get("data_source", "normalized_input_bars"))
+                last_price_global_indices[symbol] = global_index
         if execution_ledger is None:
             equity = cash + sum(shares * last_prices.get(symbol, 0.0) for symbol, shares in holdings.items())
         else:
@@ -1167,22 +1440,42 @@ def run_backtest(
                     price_cny=Decimal(str(last_prices[symbol])),
                     price_date=quote_date,
                     source=last_price_sources.get(symbol, "normalized_input_bars"),
-                    age_sessions=max(0, index - date_session_index[quote_date]),
+                    age_sessions=max(0, global_index - last_price_global_indices.get(symbol, global_index)),
                 )
             nav = execution_ledger.mark_to_market(
                 day_date,
                 prices,
                 max_stale_age_sessions=max_stale_price_age,
             )
-            if nav.status != "VALUED" or nav.nav_cny is None:
+            if nav.status == "UNVALUED" or nav.nav_cny is None:
                 raise ValueError(
                     f"ledger_v2 在 {day_date} 无法计算可信 NAV：" + "；".join(nav.reasons)
                 )
             equity = float(nav.nav_cny)
             sync_projection_from_ledger()
-        equity_rows.append({"trade_date": day_date, "equity_cny": equity, "cash_cny": cash, "holdings_count": len(holdings)})
+            tax_review_status = nav.status
+            tax_scope = nav.valuation_tax_scope
+            unresolved_dividend_tax_count = nav.unresolved_dividend_tax_count
+        if execution_ledger is None:
+            tax_review_status = "NOT_APPLICABLE"
+            tax_scope = "NOT_APPLICABLE"
+            unresolved_dividend_tax_count = 0
+        equity_rows.append({
+            "trade_date": day_date,
+            "equity_cny": equity,
+            "cash_cny": cash,
+            "holdings_count": len(holdings),
+            "tax_review_status": tax_review_status,
+            "valuation_tax_scope": tax_scope,
+            "unresolved_dividend_tax_count": unresolved_dividend_tax_count,
+        })
 
-        if index >= lookback and (index - lookback) % rebalance_sessions == 0 and index + 1 < len(dates):
+        create_final_pending_signal = backtest_checkpoint is not None or normalized_calendar is not None
+        if (
+            global_index >= lookback
+            and (global_index - lookback) % rebalance_sessions == 0
+            and (index + 1 < len(dates) or create_final_pending_signal)
+        ):
             ranked = rank_precomputed_day(day, strategy, market, require_order_rules=use_effective_schedules)
             selected = ranked.head(int(strategy["max_positions"]))
             if not selected.empty:
@@ -1196,8 +1489,12 @@ def run_backtest(
 
     curve = pd.DataFrame(equity_rows)
     curve["return"] = curve["equity_cny"].pct_change().fillna(0.0)
-    close_returns = data.groupby("symbol", sort=False, observed=True)["close"].pct_change()
-    data["raw_close_return"] = close_returns
+    if backtest_checkpoint is not None:
+        curve.loc[curve.index[0], "return"] = (
+            float(curve.loc[curve.index[0], "equity_cny"])
+            / float(backtest_checkpoint.previous_equity_cny) - 1.0
+        )
+    data["raw_close_return"] = data["close"].div(data["previous_close"]).sub(1.0)
     benchmark_symbol = str(config.get("benchmark", {}).get("symbol", ""))
     benchmark_data: pd.DataFrame | None = None
     if benchmark_frame is not None:
@@ -1240,6 +1537,14 @@ def run_backtest(
             invalid_dates = curve.loc[invalid_closes.to_numpy(), "trade_date"].astype(str).tolist()
             raise ValueError("基准数据评价区间收盘价无效：" + ", ".join(invalid_dates))
         peer_curve = aligned_close.astype(float).pct_change(fill_method=None).fillna(0.0).reset_index(drop=True)
+        if backtest_checkpoint is not None:
+            if backtest_checkpoint.benchmark_symbol != benchmark_symbol:
+                raise ValueError("checkpoint 基准标的与本次运行配置不同")
+            if backtest_checkpoint.benchmark_previous_close_cny is None:
+                raise ValueError("checkpoint 缺少上一窗口基准收盘价，无法衔接基准日收益")
+            peer_curve.iloc[0] = (
+                float(aligned_close.iloc[0]) / float(backtest_checkpoint.benchmark_previous_close_cny) - 1.0
+            )
     else:
         benchmark_values = peer_returns
         peer_curve = pd.Series(
@@ -1247,14 +1552,32 @@ def run_backtest(
             index=curve.index,
             dtype=float,
         )
-    benchmark_base_equity = float(curve["equity_cny"].iloc[0])
-    benchmark = pd.Series(benchmark_base_equity * (1.0 + peer_curve.fillna(0.0)).cumprod().to_numpy())
-    equity_series = curve["equity_cny"]
+    benchmark_base_equity = (
+        float(backtest_checkpoint.previous_equity_cny)
+        if backtest_checkpoint is not None else float(curve["equity_cny"].iloc[0])
+    )
+    benchmark_values = pd.Series(
+        benchmark_base_equity * (1.0 + peer_curve.fillna(0.0)).cumprod().to_numpy()
+    )
+    benchmark = (
+        pd.concat([pd.Series([benchmark_base_equity]), benchmark_values], ignore_index=True)
+        if backtest_checkpoint is not None else benchmark_values
+    )
+    equity_series = (
+        pd.concat(
+            [pd.Series([float(backtest_checkpoint.previous_equity_cny)]), curve["equity_cny"]],
+            ignore_index=True,
+        )
+        if backtest_checkpoint is not None else curve["equity_cny"]
+    )
 
     compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
     config_json = json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str)
     data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
+    ).hexdigest()
+    data_digest = hashlib.sha256(
+        f"{data_digest}:{current_window_bars_sha256}".encode("utf-8")
     ).hexdigest()
     opening_snapshot_sha256 = None
     if opening_accounting_snapshot is not None:
@@ -1300,6 +1623,11 @@ def run_backtest(
                 "dividend_tax_cny_by_event": {
                     event_id: None if amount is None else str(amount)
                     for event_id, amount in sorted(event_schedule.dividend_tax_cny.items())
+                },
+                "dividend_tax_treatment_by_event": dict(sorted(event_schedule.dividend_tax_treatment.items())),
+                "dividend_payment_withholding_per_share_cny_by_event": {
+                    event_id: None if amount is None else str(amount)
+                    for event_id, amount in sorted(event_schedule.dividend_payment_withholding_per_share_cny.items())
                 },
             },
             ensure_ascii=False,
@@ -1351,7 +1679,13 @@ def run_backtest(
         int(config.get("backtest", {}).get("rolling_step_sessions", 20)),
     )
     trade_frame = pd.DataFrame(trades)
-    metrics = _metrics(equity_series, curve["return"], total_turnover / max(float(equity_series.mean()), 1.0), benchmark)
+    metric_returns = equity_series.pct_change().fillna(0.0)
+    metrics = _metrics(
+        equity_series,
+        metric_returns,
+        total_turnover / max(float(equity_series.mean()), 1.0),
+        benchmark,
+    )
     limitations = [
         "基线以收盘 t 的信号在下一交易日开盘模拟；不代表可成交价格。",
         "日线 OHLC 无法重建开盘队列、盘口流动性、真实停牌日与部分涨跌停成交。",
@@ -1369,11 +1703,106 @@ def run_backtest(
         limitations.append("沪深300基准采用价格指数收盘价，不含成分股分红的总回报。")
     else:
         limitations.append("没有独立指数行情时，使用输入股票池等权收益作参照；该参照不是市场指数，也不修正幸存者偏差。")
+    strategy_checkpoint: BacktestCheckpoint | None = None
+    if normalized_calendar is not None:
+        if execution_ledger is None:
+            raise ValueError("完整策略 checkpoint 需要 ledger_v2 账本")
+        last_date = pd.Timestamp(dates[-1]).date()
+        future_open_dates = normalized_calendar.loc[
+            normalized_calendar["is_open"].fillna(False)
+            & (normalized_calendar["trade_date"] > last_date),
+            "trade_date",
+        ]
+        if future_open_dates.empty:
+            raise ValueError("checkpoint 缺少期末后的下一开市日")
+        history_cutoff = pd.Timestamp(last_date)
+        history = signal_history_source.loc[
+            pd.to_datetime(signal_history_source["trade_date"]) <= history_cutoff
+        ].copy()
+        history_rows: list[SignalHistoryBar] = []
+        for symbol, group in history.groupby("symbol", sort=False, observed=True):
+            for row in group.sort_values("trade_date", kind="stable").tail(lookback).itertuples(index=False):
+                signal_value = None if pd.isna(row.signal_price) else Decimal(str(float(row.signal_price)))
+                history_rows.append(SignalHistoryBar(
+                    symbol=str(symbol),
+                    trade_date=pd.Timestamp(row.trade_date).date(),
+                    close_cny=Decimal(str(float(row.close))),
+                    signal_price_cny=signal_value,
+                ))
+        checkpoint_prices = tuple(
+            CheckpointPrice(
+                symbol=symbol,
+                price_cny=Decimal(str(price)),
+                price_date=last_price_dates[symbol],
+                global_session_index=last_price_global_indices.get(
+                    symbol, global_session_start + len(dates) - 1
+                ),
+                source=last_price_sources.get(symbol, "normalized_input_bars"),
+            )
+            for symbol, price in sorted(last_prices.items())
+            if symbol in holdings and symbol in last_price_dates
+        )
+        benchmark_previous_close: Decimal | None = None
+        checkpoint_benchmark_symbol: str | None = None
+        if benchmark_method.startswith("configured_index_close_return:"):
+            checkpoint_benchmark_symbol = benchmark_symbol
+            benchmark_as_of = benchmark_rows.loc[
+                pd.to_datetime(benchmark_rows["trade_date"]).dt.date == last_date
+            ]
+            if benchmark_as_of.empty:
+                raise ValueError(f"checkpoint 缺少期末基准收盘价：{last_date} {benchmark_symbol}")
+            benchmark_previous_close = Decimal(str(float(benchmark_as_of.iloc[-1]["close"])))
+        ledger_snapshot = execution_ledger.snapshot(as_of_date=last_date)
+        calendar_prefix = normalized_calendar.loc[
+            normalized_calendar["trade_date"] <= last_date
+        ].copy()
+        chain_previous = backtest_checkpoint.data_chain_sha256 if backtest_checkpoint is not None else ""
+        current_chain_part = (
+            f"{current_window_data_sha256}:{current_window_bars_sha256}:"
+            f"{benchmark_data_digest or 'peer_from_input'}"
+        )
+        data_chain_sha256 = hashlib.sha256(
+            f"{chain_previous}:{current_chain_part}".encode("utf-8")
+        ).hexdigest()
+        strategy_checkpoint = BacktestCheckpoint(
+            schema_version=1,
+            strategy_id=str(strategy["name"]),
+            as_of_date=last_date,
+            next_expected_session=future_open_dates.iloc[0],
+            global_session_index=global_session_start + len(dates) - 1,
+            trade_count=trade_sequence_start + len(trades),
+            pending_targets=tuple(sorted((pending_targets or {}).items())),
+            transition_signal_ready_index=tuple(sorted(transition_signal_ready_index.items())),
+            signal_history=tuple(history_rows),
+            signal_price_modes=tuple(sorted(signal_modes.items())),
+            last_prices=checkpoint_prices,
+            previous_equity_cny=Decimal(str(float(curve["equity_cny"].iloc[-1]))),
+            ledger_snapshot=ledger_snapshot,
+            config_sha256=config_sha256,
+            market_rules_sha256=(
+                _normalized_table_digest(normalized_market_rules) if normalized_market_rules is not None else None
+            ),
+            fee_schedule_sha256=(
+                _normalized_table_digest(normalized_fee_schedule) if normalized_fee_schedule is not None else None
+            ),
+            accounting_events_sha256=accounting_event_data_sha256 or accounting_events_sha256,
+            identity_events_sha256=identity_events_sha256,
+            corporate_actions_sha256=corporate_actions_sha256,
+            calendar_sha256=normalized_calendar_sha256,
+            calendar_prefix_sha256=_normalized_table_digest(calendar_prefix),
+            last_window_data_sha256=current_window_data_sha256,
+            last_window_bars_sha256=current_window_bars_sha256,
+            data_chain_sha256=data_chain_sha256,
+            source_data_path=str(source_path) if source_path is not None else None,
+            benchmark_symbol=checkpoint_benchmark_symbol,
+            benchmark_previous_close_cny=benchmark_previous_close,
+        ).sealed()
     metrics.update({
         "experiment_id": f"chq-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}",
         "strategy_id": str(strategy["name"]),
         "config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
         "data_version_sha256": data_digest,
+        "normalized_window_bars_sha256": current_window_bars_sha256,
         "security_identity_events_sha256": identity_event_data_sha256,
         "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
         "corporate_actions_sha256": corporate_action_data_sha256,
@@ -1384,12 +1813,38 @@ def run_backtest(
         "dividend_tax_known_event_ids": sorted(
             event_id for event_id, amount in event_schedule.dividend_tax_cny.items() if amount is not None
         ),
+        "dividend_tax_treatment_by_event": dict(sorted(event_schedule.dividend_tax_treatment.items())),
+        "dividend_payment_withholding_per_share_cny_by_event": {
+            event_id: None if amount is None else str(amount)
+            for event_id, amount in sorted(event_schedule.dividend_payment_withholding_per_share_cny.items())
+        },
+        "dividend_tax_valuation_scope": (
+            str(curve["valuation_tax_scope"].iloc[-1]) if "valuation_tax_scope" in curve else "NOT_APPLICABLE"
+        ),
+        "unresolved_dividend_tax_count_at_end": (
+            int(curve["unresolved_dividend_tax_count"].iloc[-1])
+            if "unresolved_dividend_tax_count" in curve else 0
+        ),
+        "unresolved_dividend_tax_count_max": (
+            int(curve["unresolved_dividend_tax_count"].max())
+            if "unresolved_dividend_tax_count" in curve else 0
+        ),
         "accounting_event_scheduler_status": "supported_subset_applied" if accounting_event_list else "no_typed_events",
         "accounting_valuation_inputs_sha256": accounting_valuation_inputs_sha256,
         "accounting_opening_snapshot_sha256": opening_snapshot_sha256,
         "accounting_opening_snapshot_as_of": (
             opening_accounting_snapshot.as_of_date.isoformat()
             if opening_accounting_snapshot is not None and opening_accounting_snapshot.as_of_date else None
+        ),
+        "backtest_checkpoint_sha256": strategy_checkpoint.state_sha256 if strategy_checkpoint else None,
+        "backtest_checkpoint_as_of": strategy_checkpoint.as_of_date.isoformat() if strategy_checkpoint else None,
+        "backtest_checkpoint_next_expected_session": (
+            strategy_checkpoint.next_expected_session.isoformat() if strategy_checkpoint else None
+        ),
+        "backtest_continuation_scope": (
+            "full_rule_based_strategy_checkpoint_v1" if strategy_checkpoint
+            else "ledger_snapshot_only" if opening_accounting_snapshot is not None
+            else "single_window_no_continuation"
         ),
         "market_rule_schedule_sha256": market_rule_schedule_digest,
         "market_rule_schedule_rows": int(len(normalized_market_rules)) if normalized_market_rules is not None else 0,
@@ -1501,7 +1956,12 @@ def run_backtest(
             }
             for entry in execution_ledger.journal
         ])
-        result["accounting_snapshot"] = execution_ledger.snapshot(as_of_date=pd.Timestamp(dates[-1]).date())
+        result["accounting_snapshot"] = (
+            strategy_checkpoint.ledger_snapshot if strategy_checkpoint is not None
+            else execution_ledger.snapshot(as_of_date=pd.Timestamp(dates[-1]).date())
+        )
+        if strategy_checkpoint is not None:
+            result["backtest_checkpoint"] = strategy_checkpoint
         result["metrics"]["accounting_mode"] = "ledger_v2"
         result["metrics"]["accounting_result_type"] = "ledger_state_source_research_diagnostic_not_formal"
         result["metrics"]["valuation_max_stale_age_sessions"] = max_stale_price_age
