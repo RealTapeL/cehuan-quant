@@ -1,6 +1,7 @@
 """Pure accounting models and ledger transitions for research simulations."""
 
 from cehuan.accounting.ledger import PortfolioLedger
+from cehuan.accounting.snapshot_io import ledger_snapshot_from_dict, read_ledger_snapshot
 from cehuan.accounting.events import (
     ActionSource,
     CashDividendEvent,
@@ -44,4 +45,6 @@ __all__ = [
     "ShareDistributionEvent",
     "ShareSwapMergerEvent",
     "TradeFill",
+    "ledger_snapshot_from_dict",
+    "read_ledger_snapshot",
 ]

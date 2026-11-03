@@ -283,6 +283,9 @@ def test_distribution_claim_survives_record_date_sale_and_settles_on_registratio
         as_of=event.effective_date,
         underlying_close_cny=Decimal("7.7"),
         price_source="synthetic_underlying_close",
+        price_source_sha256="d" * 64,
+        price_date=event.effective_date,
+        is_suspended=False,
     )
     valued = ledger.mark_to_market(
         event.effective_date,

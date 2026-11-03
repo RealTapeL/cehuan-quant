@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from cehuan.backtest.engine import run_backtest
+from cehuan.accounting.snapshot_io import read_ledger_snapshot
 from cehuan.config import load_config
 from cehuan.data.akshare_adapter import make_akshare_provider
 from cehuan.data.baostock_adapter import BaoStockSession, create_baostock_snapshot
@@ -190,6 +191,7 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--readiness-quality", help="正式模式下绑定 readiness 的点时质量 JSON")
     backtest.add_argument("--corporate-actions", help="正式模式下使用的公司行动表")
     backtest.add_argument("--accounting-events", help="带来源原件与人工复核字段的事件 CSV；仅限 ledger_v2 研究诊断")
+    backtest.add_argument("--accounting-opening-snapshot", help="ledger_v2 分窗口续跑使用的前一期 accounting_snapshot.json")
     backtest.add_argument("--corporate-action-coverage", help="逐证券公司行动覆盖与来源复核表")
     backtest.add_argument("--market-rules", help="有效日期交易规则 CSV")
     backtest.add_argument("--fees", help="有效日期历史费率 CSV")
@@ -649,6 +651,12 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("ledger 账务模式仅供非正式研究，请显式附加 --diagnostic")
             if args.accounting_events and (args.formal or not args.diagnostic or args.accounting_mode != "ledger_v2"):
                 raise ValueError("--accounting-events 仅支持 --diagnostic --accounting-mode ledger_v2，不能用于正式基线")
+            if args.accounting_opening_snapshot and (
+                args.formal or not args.diagnostic or args.accounting_mode != "ledger_v2"
+            ):
+                raise ValueError(
+                    "--accounting-opening-snapshot 仅支持 --diagnostic --accounting-mode ledger_v2，不能用于正式基线"
+                )
             if not args.formal and (bool(args.market_rules) != bool(args.fees)):
                 raise ValueError("研究诊断的 --market-rules 与 --fees 必须成对提供")
             if not args.formal and (args.market_rules or args.fees) and not args.diagnostic:
@@ -671,6 +679,16 @@ def main(argv: list[str] | None = None) -> int:
                     accounting_event_path = REPO_ROOT / accounting_event_path
                 accounting_event_path = accounting_event_path.resolve()
                 accounting_event_bundle = read_accounting_event_csv(accounting_event_path)
+            opening_snapshot = None
+            opening_snapshot_path = None
+            opening_snapshot_sha256 = None
+            if args.accounting_opening_snapshot:
+                opening_snapshot_path = Path(args.accounting_opening_snapshot).expanduser()
+                if not opening_snapshot_path.is_absolute():
+                    opening_snapshot_path = REPO_ROOT / opening_snapshot_path
+                opening_snapshot_path = opening_snapshot_path.resolve()
+                opening_snapshot_sha256 = sha256_file(opening_snapshot_path)
+                opening_snapshot = read_ledger_snapshot(opening_snapshot_path)
             readiness_report = None
             expected_readiness_hashes = None
             readiness_context = None
@@ -853,7 +871,12 @@ def main(argv: list[str] | None = None) -> int:
                 dividend_tax_cny_by_event=(
                     accounting_event_bundle.dividend_tax_cny_by_event if accounting_event_bundle else None
                 ),
+                opening_accounting_snapshot=opening_snapshot,
             )
+            if opening_snapshot_path is not None:
+                if sha256_file(opening_snapshot_path) != opening_snapshot_sha256:
+                    raise ValueError("回测期间期初账本快照文件发生变化；本次实验结果不予保存")
+                result["metrics"]["accounting_opening_snapshot_file_sha256"] = opening_snapshot_sha256
             if accounting_event_bundle is not None:
                 if sha256_file(accounting_event_path) != accounting_event_bundle.source_csv_sha256:
                     raise ValueError("回测期间公司行动事件 CSV 发生变化；本次实验结果不予保存")
@@ -877,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
             if accounting_event_bundle is not None and accounting_event_path is not None:
                 shutil.copyfile(accounting_event_path, folder / "accounting_events.csv")
                 accounting_event_bundle.source_audit.to_csv(folder / "accounting_event_source_audit.csv", index=False)
+            if opening_snapshot_path is not None:
+                shutil.copyfile(opening_snapshot_path, folder / "accounting_opening_snapshot.json")
             if research_market_rules_path is not None and research_fee_schedule_path is not None:
                 shutil.copyfile(research_market_rules_path, folder / "market_rule_schedule.csv")
                 shutil.copyfile(research_fee_schedule_path, folder / "fee_schedule.csv")

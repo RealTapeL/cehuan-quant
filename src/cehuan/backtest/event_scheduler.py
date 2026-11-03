@@ -31,7 +31,11 @@ class AccountingEventSchedule:
     distribution_records: Mapping[date, tuple[ShareDistributionEvent, ...]]
     distribution_effective: Mapping[date, tuple[ShareDistributionEvent, ...]]
     distribution_registrations: Mapping[date, tuple[ShareDistributionEvent, ...]]
+    distribution_tradabilities: Mapping[date, tuple[ShareDistributionEvent, ...]]
     dividend_tax_cny: Mapping[str, Decimal | int | str | None]
+    events: tuple[SupportedAccountingEvent, ...]
+    window_start: date
+    window_end: date
 
     @classmethod
     def build(
@@ -48,8 +52,20 @@ class AccountingEventSchedule:
         distribution_records: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
         distribution_effective: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
         distribution_registrations: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
+        distribution_tradabilities: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
+        if not sessions:
+            raise ValueError("公司行动调度至少需要一个输入交易日")
+        window_start, window_end = min(sessions), max(sessions)
         event_ids: set[str] = set()
         dividend_ids: set[str] = set()
+        event_rows: list[SupportedAccountingEvent] = []
+
+        def schedule_phase(mapping: dict[date, list[object]], day: date, label: str, event: object) -> None:
+            if window_start <= day <= window_end and day not in sessions:
+                event_id = getattr(event, "event_id", "unknown")
+                raise ValueError(f"账务事件 {event_id} 的{label}落在输入区间内但缺少交易日：{day}")
+            if day in sessions:
+                mapping[day].append(event)
 
         for event in events:
             if not isinstance(event, (CashDividendEvent, CodeChangeEvent, ShareDistributionEvent)):
@@ -60,10 +76,9 @@ class AccountingEventSchedule:
             if event.event_id in event_ids:
                 raise ValueError(f"账务事件 event_id 重复：{event.event_id}")
             event_ids.add(event.event_id)
+            event_rows.append(event)
             if isinstance(event, CodeChangeEvent):
-                if event.effective_date not in sessions:
-                    raise ValueError(f"代码变更 {event.event_id} 生效日不在输入交易日中：{event.effective_date}")
-                code_changes[event.effective_date].append(event)
+                schedule_phase(code_changes, event.effective_date, "生效日", event)
                 continue
 
             if isinstance(event, ShareDistributionEvent):
@@ -73,24 +88,23 @@ class AccountingEventSchedule:
                     ("新增股份登记日", event.registration_date),
                     ("可流通日", event.tradable_date),
                 ):
-                    if day not in sessions:
-                        raise ValueError(f"送转 {event.event_id} 的{label}不在输入交易日中：{day}")
-                distribution_records[event.record_date].append(event)
-                distribution_effective[event.effective_date].append(event)
-                distribution_registrations[event.registration_date].append(event)
+                    schedule_phase(
+                        {
+                            "登记日": distribution_records,
+                            "生效日": distribution_effective,
+                            "新增股份登记日": distribution_registrations,
+                            "可流通日": distribution_tradabilities,
+                        }[label],
+                        day,
+                        label,
+                        event,
+                    )
                 continue
 
             dividend_ids.add(event.event_id)
-            for label, day in (
-                ("登记日", event.record_date),
-                ("除息日", event.ex_date),
-                ("派息日", event.payable_date),
-            ):
-                if day not in sessions:
-                    raise ValueError(f"现金分红 {event.event_id} 的{label}不在输入交易日中：{day}")
-            dividend_records[event.record_date].append(event)
-            dividend_accruals[event.ex_date].append(event)
-            dividend_payments[event.payable_date].append(event)
+            schedule_phase(dividend_records, event.record_date, "登记日", event)
+            schedule_phase(dividend_accruals, event.ex_date, "除息日", event)
+            schedule_phase(dividend_payments, event.payable_date, "派息日", event)
 
         taxes = dict(dividend_tax_cny or {})
         unknown_taxes = set(taxes).difference(dividend_ids)
@@ -113,5 +127,9 @@ class AccountingEventSchedule:
             distribution_records=freeze(distribution_records),
             distribution_effective=freeze(distribution_effective),
             distribution_registrations=freeze(distribution_registrations),
+            distribution_tradabilities=freeze(distribution_tradabilities),
             dividend_tax_cny=taxes,
+            events=tuple(sorted(event_rows, key=lambda event: event.event_id)),
+            window_start=window_start,
+            window_end=window_end,
         )

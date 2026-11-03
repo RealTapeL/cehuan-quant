@@ -207,6 +207,9 @@ class NoncashClaim:
     acquired_on: date | None = None
     valuation_as_of: date | None = None
     lot_allocations: tuple[tuple[str, int, Decimal, date], ...] = ()
+    next_phase_date: date | None = None
+    source_id: str | None = None
+    source_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not str(self.claim_id).strip() or not str(self.event_id).strip():
@@ -221,6 +224,7 @@ class NoncashClaim:
             self.valuation_cny, "valuation_cny", nonnegative=True
         )
         valuation_as_of = calendar_date(self.valuation_as_of, "valuation_as_of", optional=True)
+        next_phase_date = calendar_date(self.next_phase_date, "next_phase_date", optional=True)
         basis = decimal_value(self.cost_basis_cny, "cost_basis_cny", nonnegative=True)
         lot_allocations: list[tuple[str, int, Decimal, date]] = []
         for allocation in self.lot_allocations:
@@ -259,6 +263,12 @@ class NoncashClaim:
         object.__setattr__(self, "acquired_on", calendar_date(self.acquired_on, "acquired_on", optional=True))
         object.__setattr__(self, "valuation_as_of", valuation_as_of)
         object.__setattr__(self, "lot_allocations", tuple(lot_allocations))
+        object.__setattr__(self, "next_phase_date", next_phase_date)
+        object.__setattr__(self, "source_id", str(self.source_id).strip() if self.source_id else None)
+        source_sha256 = str(self.source_sha256).strip().lower() if self.source_sha256 else None
+        if source_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            raise ValueError("NoncashClaim.source_sha256 必须是 SHA-256")
+        object.__setattr__(self, "source_sha256", source_sha256)
         status = str(self.status).strip()
         if not status:
             raise ValueError("权利状态不能为空")
@@ -376,3 +386,20 @@ class LedgerSnapshot:
     claims: tuple[NoncashClaim, ...]
     journal: tuple[LedgerEntry, ...]
     entitlements: tuple[EntitlementSnapshot, ...] = ()
+    as_of_date: date | None = None
+
+    def __post_init__(self) -> None:
+        portfolio_id = str(self.portfolio_id).strip()
+        if not portfolio_id:
+            raise ValueError("LedgerSnapshot.portfolio_id 不能为空")
+        object.__setattr__(self, "portfolio_id", portfolio_id)
+        object.__setattr__(self, "cash_cny", decimal_value(self.cash_cny, "snapshot.cash_cny", nonnegative=True))
+        object.__setattr__(self, "positions", tuple(self.positions))
+        object.__setattr__(self, "receivables", tuple(self.receivables))
+        object.__setattr__(self, "claims", tuple(self.claims))
+        object.__setattr__(self, "journal", tuple(self.journal))
+        object.__setattr__(self, "entitlements", tuple(self.entitlements))
+        as_of = calendar_date(self.as_of_date, "snapshot.as_of_date", optional=True)
+        if as_of is not None and any(entry.booking_date > as_of for entry in self.journal):
+            raise ValueError("LedgerSnapshot.journal 含晚于 as_of_date 的账务流水")
+        object.__setattr__(self, "as_of_date", as_of)

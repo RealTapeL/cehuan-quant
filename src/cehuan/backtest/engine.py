@@ -17,7 +17,16 @@ import numpy as np
 import pandas as pd
 
 from cehuan import __version__
-from cehuan.accounting import FeeItem, PortfolioLedger, PriceMark, ShareDistributionEvent, TradeFill
+from cehuan.accounting import (
+    CashDividendEvent,
+    CodeChangeEvent,
+    FeeItem,
+    LedgerSnapshot,
+    PortfolioLedger,
+    PriceMark,
+    ShareDistributionEvent,
+    TradeFill,
+)
 from cehuan.backtest.accounting_shadow import run_accounting_shadow
 from cehuan.backtest.event_scheduler import AccountingEventSchedule, SupportedAccountingEvent
 from cehuan.config import load_config
@@ -295,6 +304,7 @@ def run_backtest(
     fee_schedule: pd.DataFrame | None = None,
     accounting_events: Sequence[SupportedAccountingEvent] | None = None,
     dividend_tax_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
+    opening_accounting_snapshot: LedgerSnapshot | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
 
@@ -314,6 +324,8 @@ def run_backtest(
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if accounting_mode != "ledger_v2" and (accounting_events or dividend_tax_cny_by_event):
         raise ValueError("显式账务事件与分红税费仅支持 ledger_v2 的非正式研究诊断")
+    if opening_accounting_snapshot is not None and accounting_mode != "ledger_v2":
+        raise ValueError("期初账本快照仅支持 --diagnostic --accounting-mode ledger_v2")
     if (market_rule_schedule is None) != (fee_schedule is None):
         raise ValueError("有效日期规则和历史费率必须成对提供")
     use_effective_schedules = market_rule_schedule is not None
@@ -329,6 +341,18 @@ def run_backtest(
         compact=mutate_input,
         assume_sorted=mutate_input,
     )
+    mark_columns = ("trade_date", "symbol", "close", "is_suspended", "data_source")
+    mark_inputs = pd.DataFrame({
+        column: (
+            data[column].astype("string").fillna("")
+            if column in data.columns else pd.Series("", index=data.index, dtype="string")
+        )
+        for column in mark_columns
+    }).sort_values(["trade_date", "symbol"], kind="stable")
+    mark_digest = hashlib.sha256()
+    mark_digest.update((source_data_sha256 or "").encode("ascii", errors="ignore"))
+    mark_digest.update(mark_inputs.to_csv(index=False, lineterminator="\n").encode("utf-8"))
+    accounting_valuation_inputs_sha256 = mark_digest.hexdigest()
     normalized_market_rules = None
     normalized_fee_schedule = None
     if use_effective_schedules:
@@ -479,10 +503,135 @@ def run_backtest(
     last_prices: dict[str, float] = {}
     last_price_dates: dict[str, str] = {}
     last_price_sources: dict[str, str] = {}
-    execution_ledger = (
-        PortfolioLedger(Decimal(str(initial_cash_cny)), portfolio_id="backtest-ledger-v2")
-        if accounting_mode == "ledger_v2" else None
-    )
+    if opening_accounting_snapshot is not None:
+        if opening_accounting_snapshot.as_of_date is None:
+            raise ValueError("期初账本快照缺少 as_of_date，无法验证跨窗口时间边界")
+        first_session = pd.Timestamp(dates[0]).date()
+        if opening_accounting_snapshot.as_of_date >= first_session:
+            raise ValueError(
+                f"期初账本快照日期 {opening_accounting_snapshot.as_of_date} 必须早于首个输入交易日 {first_session}"
+            )
+        cash_argument = Decimal(str(initial_cash_cny))
+        if abs(opening_accounting_snapshot.cash_cny - cash_argument) > Decimal("0.01"):
+            raise ValueError(
+                "--cash 与期初账本快照 cash_cny 相差超过一分钱；请传入快照当前现金，避免现金口径混淆"
+            )
+        if any(entry.booking_date > opening_accounting_snapshot.as_of_date for entry in opening_accounting_snapshot.journal):
+            raise ValueError("期初账本快照包含晚于 as_of_date 的账务流水")
+    execution_ledger = None
+    if accounting_mode == "ledger_v2":
+        execution_ledger = (
+            PortfolioLedger.from_snapshot(opening_accounting_snapshot)
+            if opening_accounting_snapshot is not None
+            else PortfolioLedger(Decimal(str(initial_cash_cny)), portfolio_id="backtest-ledger-v2")
+        )
+
+    event_by_id = {event.event_id: event for event in accounting_event_list}
+    start_day = pd.Timestamp(dates[0]).date()
+    if opening_accounting_snapshot is None:
+        for event in accounting_event_list:
+            if isinstance(event, ShareDistributionEvent) and event.record_date < start_day and any(
+                phase >= start_day for phase in (event.effective_date, event.registration_date, event.tradable_date)
+            ):
+                raise ValueError(
+                    f"送转 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照；"
+                    "请提供连续预热账本或经过校验的 opening snapshot，不能按零权利继续"
+                )
+            if isinstance(event, CashDividendEvent) and event.record_date < start_day and (
+                event.ex_date >= start_day or event.payable_date >= start_day
+            ):
+                raise ValueError(
+                    f"现金分红 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照"
+                )
+    if opening_accounting_snapshot is not None:
+        entitlement_by_id = {item.event_id: item for item in opening_accounting_snapshot.entitlements}
+        claim_by_id = {item.event_id: item for item in opening_accounting_snapshot.claims}
+        receivable_by_id = {item.event_id: item for item in opening_accounting_snapshot.receivables}
+        for event in accounting_event_list:
+            if isinstance(event, ShareDistributionEvent) and event.record_date < start_day:
+                has_window_phase = any(phase >= start_day for phase in (
+                    event.effective_date, event.registration_date, event.tradable_date,
+                ))
+                if has_window_phase:
+                    entitlement = entitlement_by_id.get(event.event_id)
+                    claim = claim_by_id.get(event.event_id)
+                    if entitlement is None or entitlement.captured_on != event.record_date:
+                        raise ValueError(
+                            f"送转 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照"
+                        )
+                    if claim is None:
+                        raise ValueError(
+                            f"送转 {event.event_id} ({event.symbol}) 缺少期初权利账目；不能按零权利继续"
+                        )
+                    if entitlement.symbol != event.symbol or claim.exact_entitlement != (
+                        Decimal(entitlement.total_shares) * event.shares_per_old_share
+                    ):
+                        raise ValueError(f"送转 {event.event_id} 的期初权益证券或精确股数与事件不匹配")
+                    if claim.source_id != event.source.source_id or claim.source_sha256 != event.source.sha256:
+                        raise ValueError(f"送转 {event.event_id} 的期初权利来源哈希与本次事件不匹配")
+                    snapshot_day = opening_accounting_snapshot.as_of_date
+                    if event.effective_date > snapshot_day and claim.status not in {
+                        "DISTRIBUTION_NOT_YET_EFFECTIVE", "CANCELLED",
+                    }:
+                        raise ValueError(f"送转 {event.event_id} 期初状态提前反映尚未发生的生效日 {event.effective_date}")
+                    if event.effective_date <= snapshot_day and event.registration_date > snapshot_day and claim.status not in {
+                        "DISTRIBUTION_PENDING_REGISTRATION", "CANCELLED",
+                    }:
+                        raise ValueError(f"送转 {event.event_id} 期初状态未反映已发生的生效日 {event.effective_date}")
+                    if event.registration_date <= snapshot_day and claim.status not in {"SETTLED", "CANCELLED"}:
+                        raise ValueError(f"送转 {event.event_id} 期初状态未反映已发生的登记日 {event.registration_date}")
+                    expected_next_phase = (
+                        None if claim.status == "CANCELLED"
+                        else event.effective_date if event.effective_date > snapshot_day
+                        else event.registration_date if event.registration_date > snapshot_day
+                        else event.tradable_date if event.tradable_date > snapshot_day and claim.status == "SETTLED"
+                        else None
+                    )
+                    if claim.next_phase_date != expected_next_phase:
+                        raise ValueError(
+                            f"送转 {event.event_id} 期初下一阶段日期不匹配："
+                            f"expected={expected_next_phase}, actual={claim.next_phase_date}"
+                        )
+            elif isinstance(event, CashDividendEvent) and event.record_date < start_day:
+                has_window_phase = event.ex_date >= start_day or event.payable_date >= start_day
+                if has_window_phase:
+                    entitlement = entitlement_by_id.get(event.event_id)
+                    if entitlement is None or entitlement.captured_on != event.record_date or entitlement.symbol != event.symbol:
+                        raise ValueError(
+                            f"现金分红 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照"
+                        )
+                    if event.ex_date < start_day <= event.payable_date:
+                        receivable = receivable_by_id.get(event.event_id)
+                        if receivable is None:
+                            raise ValueError(
+                                f"现金分红 {event.event_id} 已在窗口前除息，但缺少期初应收款"
+                            )
+        if opening_accounting_snapshot is not None:
+            for event in accounting_event_list:
+                if isinstance(event, CodeChangeEvent) and event.effective_date < start_day:
+                    old_lots = [lot for lot in opening_accounting_snapshot.positions if lot.symbol == event.old_symbol]
+                    if old_lots and not any(
+                        entry.event_id == event.event_id and entry.entry_type == "CODE_CHANGE_1_TO_1"
+                        for entry in opening_accounting_snapshot.journal
+                    ):
+                        raise ValueError(
+                            f"期初账本仍持有已于 {event.effective_date} 变更代码的 {event.old_symbol}，"
+                            "且流水未证明该 1:1 迁移"
+                        )
+        known_event_ids = set(event_by_id)
+        for claim in opening_accounting_snapshot.claims:
+            if (
+                claim.status in {"DISTRIBUTION_NOT_YET_EFFECTIVE", "DISTRIBUTION_PENDING_REGISTRATION"}
+                or claim.next_phase_date is not None
+            ) and claim.event_id not in known_event_ids:
+                raise ValueError(
+                    f"期初账本含未完成送转 {claim.event_id}，但本次事件输入中没有对应公告事件"
+                )
+        for receivable in opening_accounting_snapshot.receivables:
+            if receivable.status == "PENDING" and receivable.payable_on and receivable.payable_on >= start_day and receivable.event_id not in known_event_ids:
+                raise ValueError(
+                    f"期初账本含待支付分红 {receivable.event_id}，但本次事件输入中没有对应公告事件"
+                )
 
     def mark_distribution_claim_at_close(
         event: ShareDistributionEvent,
@@ -507,6 +656,9 @@ def run_backtest(
             as_of=action_day,
             underlying_close_cny=Decimal(str(float(row["close"]))),
             price_source=str(row.get("data_source", "normalized_input_bars")),
+            price_source_sha256=accounting_valuation_inputs_sha256,
+            price_date=action_day,
+            is_suspended=False,
         )
 
     def sync_projection_from_ledger() -> None:
@@ -523,6 +675,21 @@ def run_backtest(
             acquired = lot.acquired_on.isoformat()
             previous = holding_since.get(lot.symbol)
             holding_since[lot.symbol] = min(previous, acquired) if previous else acquired
+
+    if execution_ledger is not None:
+        sync_projection_from_ledger()
+
+    active_distribution_claims: dict[str, ShareDistributionEvent] = {}
+    if execution_ledger is not None:
+        events_by_id = {
+            event.event_id: event for event in accounting_event_list if isinstance(event, ShareDistributionEvent)
+        }
+        for claim in execution_ledger.claims:
+            if claim.status == "DISTRIBUTION_PENDING_REGISTRATION":
+                event = events_by_id.get(claim.event_id)
+                if event is None:
+                    raise ValueError(f"期初待登记权利 {claim.event_id} 缺少对应送转事件")
+                active_distribution_claims[event.event_id] = event
 
     pending_targets: dict[str, float] | None = None
     transition_signal_ready_index: dict[str, int] = {}
@@ -593,6 +760,12 @@ def run_backtest(
                 raise ValueError("送转账务事件仅支持 ledger_v2")
             execution_ledger.apply_share_distribution(event, as_of=event.effective_date)
             sync_projection_from_ledger()
+            updated_claim = next(
+                (item for item in execution_ledger.claims if item.claim_id == f"distribution:{event.event_id}"),
+                None,
+            )
+            if updated_claim is not None and updated_claim.status == "DISTRIBUTION_PENDING_REGISTRATION":
+                active_distribution_claims[event.event_id] = event
             security_events.append({
                 "trade_date": day_date,
                 "event_id": event.event_id,
@@ -614,6 +787,7 @@ def run_backtest(
             if claim is None or claim.status == "CANCELLED":
                 continue
             execution_ledger.register_share_distribution(event, as_of=event.registration_date)
+            active_distribution_claims.pop(event.event_id, None)
             sync_projection_from_ledger()
             security_events.append({
                 "trade_date": day_date,
@@ -624,6 +798,25 @@ def run_backtest(
                 "tradable_date": event.tradable_date.isoformat(),
                 "cash_delta_cny": 0,
                 "trade_or_commission_created": False,
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        for event in event_schedule.distribution_tradabilities.get(pd.Timestamp(date).date(), ()):
+            if execution_ledger is None:
+                raise ValueError("送转可流通阶段仅支持 ledger_v2")
+            claim = next(
+                (item for item in execution_ledger.claims if item.claim_id == f"distribution:{event.event_id}"),
+                None,
+            )
+            if claim is None or claim.status in {"CANCELLED", "DISTRIBUTION_NOT_YET_EFFECTIVE"}:
+                continue
+            execution_ledger.mark_share_distribution_tradable(event, as_of=event.tradable_date)
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "SHARE_DISTRIBUTION_TRADABLE",
+                "symbol": event.symbol,
+                "tradable_date": event.tradable_date.isoformat(),
                 "accounting_source": "typed_accounting_event_ledger_v2",
             })
 
@@ -932,21 +1125,17 @@ def run_backtest(
                 execution_ledger.record_share_distribution(event, as_of=event.record_date)
             for event in event_schedule.dividend_records.get(action_day, ()):
                 execution_ledger.record_cash_dividend(event, as_of=event.record_date)
-            for event in event_schedule.distribution_effective.get(action_day, ()):
-                if event.registration_date == event.effective_date:
+            for pending_event in tuple(active_distribution_claims.values()):
+                if not pending_event.effective_date <= action_day < pending_event.registration_date:
                     continue
-                claim = next((item for item in execution_ledger.claims if item.claim_id == f"distribution:{event.event_id}"), None)
+                claim = next(
+                    (item for item in execution_ledger.claims if item.claim_id == f"distribution:{pending_event.event_id}"),
+                    None,
+                )
                 if claim is None or claim.status != "DISTRIBUTION_PENDING_REGISTRATION":
+                    active_distribution_claims.pop(pending_event.event_id, None)
                     continue
-                mark_distribution_claim_at_close(event, action_day, day)
-            for event in event_schedule.distribution_effective.values():
-                for pending_event in event:
-                    if not pending_event.effective_date < action_day < pending_event.registration_date:
-                        continue
-                    claim = next((item for item in execution_ledger.claims if item.claim_id == f"distribution:{pending_event.event_id}"), None)
-                    if claim is None or claim.status != "DISTRIBUTION_PENDING_REGISTRATION":
-                        continue
-                    mark_distribution_claim_at_close(pending_event, action_day, day)
+                mark_distribution_claim_at_close(pending_event, action_day, day)
             for event in event_schedule.dividend_accruals.get(action_day, ()):
                 execution_ledger.accrue_cash_dividend(
                     event,
@@ -1058,13 +1247,24 @@ def run_backtest(
             index=curve.index,
             dtype=float,
         )
-    benchmark = pd.Series(initial_cash_cny * (1.0 + peer_curve.fillna(0.0)).cumprod().to_numpy())
+    benchmark_base_equity = float(curve["equity_cny"].iloc[0])
+    benchmark = pd.Series(benchmark_base_equity * (1.0 + peer_curve.fillna(0.0)).cumprod().to_numpy())
     equity_series = curve["equity_cny"]
 
     compact_config = {name: config[name] for name in ("data", "strategy", "market", "costs", "backtest", "benchmark") if name in config}
     config_json = json.dumps(compact_config, ensure_ascii=False, sort_keys=True, default=str)
     data_digest = source_data_sha256 or hashlib.sha256(
         pd.util.hash_pandas_object(data[BAR_COLUMNS], index=False).values.tobytes()
+    ).hexdigest()
+    opening_snapshot_sha256 = None
+    if opening_accounting_snapshot is not None:
+        snapshot_payload = json.dumps(
+            asdict(opening_accounting_snapshot), ensure_ascii=False, sort_keys=True,
+            default=str, separators=(",", ":"),
+        ).encode("utf-8")
+        opening_snapshot_sha256 = hashlib.sha256(snapshot_payload).hexdigest()
+    data_digest = hashlib.sha256(
+        f"{data_digest}:{accounting_valuation_inputs_sha256}:{opening_snapshot_sha256 or ''}".encode("utf-8")
     ).hexdigest()
     market_rule_schedule_digest = (
         _normalized_table_digest(normalized_market_rules) if normalized_market_rules is not None else None
@@ -1185,6 +1385,12 @@ def run_backtest(
             event_id for event_id, amount in event_schedule.dividend_tax_cny.items() if amount is not None
         ),
         "accounting_event_scheduler_status": "supported_subset_applied" if accounting_event_list else "no_typed_events",
+        "accounting_valuation_inputs_sha256": accounting_valuation_inputs_sha256,
+        "accounting_opening_snapshot_sha256": opening_snapshot_sha256,
+        "accounting_opening_snapshot_as_of": (
+            opening_accounting_snapshot.as_of_date.isoformat()
+            if opening_accounting_snapshot is not None and opening_accounting_snapshot.as_of_date else None
+        ),
         "market_rule_schedule_sha256": market_rule_schedule_digest,
         "market_rule_schedule_rows": int(len(normalized_market_rules)) if normalized_market_rules is not None else 0,
         "fee_schedule_sha256": fee_schedule_digest,
@@ -1213,6 +1419,7 @@ def run_backtest(
         "benchmark_data_start": str(benchmark_rows["trade_date"].min()) if not benchmark_rows.empty else None,
         "benchmark_data_end": str(benchmark_rows["trade_date"].max()) if not benchmark_rows.empty else None,
         "initial_cash_cny": initial_cash_cny,
+        "evaluation_start_equity_cny": benchmark_base_equity,
         "trade_count": len(trades),
         "blocked_order_count": len(blocked_orders),
         "total_commission_cny": float(trade_frame.get("commission_cny", pd.Series(dtype=float)).fillna(0).sum()),
@@ -1294,7 +1501,7 @@ def run_backtest(
             }
             for entry in execution_ledger.journal
         ])
-        result["accounting_snapshot"] = execution_ledger.snapshot()
+        result["accounting_snapshot"] = execution_ledger.snapshot(as_of_date=pd.Timestamp(dates[-1]).date())
         result["metrics"]["accounting_mode"] = "ledger_v2"
         result["metrics"]["accounting_result_type"] = "ledger_state_source_research_diagnostic_not_formal"
         result["metrics"]["valuation_max_stale_age_sessions"] = max_stale_price_age

@@ -334,7 +334,7 @@ def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type()
     from cehuan.backtest.event_scheduler import AccountingEventSchedule
     from cehuan.accounting import ShareDistributionEvent
 
-    with pytest.raises(ValueError, match="除息日不在输入交易日"):
+    with pytest.raises(ValueError, match="除息日落在输入区间内但缺少交易日"):
         dividend = CashDividendEvent(
             event_id="off-calendar-dividend", symbol="SZ000001",
             record_date="2025-01-01", ex_date="2025-01-02", payable_date="2025-01-03",
@@ -349,8 +349,8 @@ def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type()
         shares_per_old_share=Decimal("0.1"), known_at_utc="2024-12-01T00:00:00+00:00",
         source=_action_source(),
     )
-    with pytest.raises(ValueError, match="生效日不在输入交易日"):
-        AccountingEventSchedule.build([distribution], [date(2025, 1, 1)])
+    with pytest.raises(ValueError, match="生效日落在输入区间内但缺少交易日"):
+        AccountingEventSchedule.build([distribution], [date(2025, 1, 1), date(2025, 1, 3)])
 
 
 def test_ledger_v2_schedules_share_distribution_record_effective_registration_and_tradability():
@@ -393,6 +393,7 @@ def test_ledger_v2_schedules_share_distribution_record_effective_registration_an
         "SHARE_DISTRIBUTION_RIGHT_CONFIRMED",
         "SHARE_DISTRIBUTION_RIGHT_MARK",
         "SHARE_DISTRIBUTION_REGISTERED",
+        "SHARE_DISTRIBUTION_TRADABLE",
     }
     record = journal.loc[journal["entry_type"] == "SHARE_DISTRIBUTION_ENTITLEMENT_SNAPSHOT"].iloc[0]
     assert int(record["cash_delta_cny"]) == 0
@@ -411,8 +412,271 @@ def test_ledger_v2_schedules_share_distribution_record_effective_registration_an
     )
     assert registration_entry.position_deltas[0][0] == event.symbol
     assert registration_entry.position_deltas[0][1] > 0
+    mark_entry = journal.loc[journal["entry_type"] == "SHARE_DISTRIBUTION_RIGHT_MARK"].iloc[-1]
+    mark_details = mark_entry["details"]
+    assert mark_details["valuation_method"] == "UNDERLYING_CLOSE_PROXY"
+    assert mark_details["underlying_symbol"] == event.symbol
+    assert mark_details["price_date"] == mark_entry["booking_date"]
+    assert mark_details["is_suspended"] == "False"
+    assert mark_details["is_actual_right_trade_price"] == "False"
+    assert len(mark_details["price_source_sha256"]) == 64
     sells = result["trades"].loc[result["trades"]["side"] == "SELL"]
     assert sells.empty or (sells["trade_date"] >= event.tradable_date.isoformat()).all()
+
+
+def test_distribution_window_can_end_before_registration_and_preserves_pending_right():
+    from cehuan.accounting import ShareDistributionEvent
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=8)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    event = ShareDistributionEvent(
+        event_id="window-cut-share-distribution",
+        symbol="SZ000001",
+        record_date=dates[4],
+        effective_date=dates[5],
+        registration_date="2025-01-13",
+        tradable_date="2025-01-14",
+        shares_per_old_share=Decimal("0.3"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+
+    result = run_backtest(
+        data,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(event,),
+    )
+
+    snapshot = result["accounting_snapshot"]
+    claim = next(row for row in snapshot.claims if row.event_id == event.event_id)
+    assert snapshot.as_of_date == pd.Timestamp(dates[-1]).date()
+    assert claim.status == "DISTRIBUTION_PENDING_REGISTRATION"
+    assert claim.final_allocated_shares > 0
+    assert claim.next_phase_date == event.registration_date
+    assert claim.valuation_as_of == snapshot.as_of_date
+    assert claim.source_id == event.source.source_id
+    assert claim.source_sha256 == event.source.sha256
+    assert not any(lot.source_event_id == event.event_id for lot in snapshot.positions)
+    assert result["equity_curve"]["equity_cny"].notna().all()
+    mark = result["accounting_journal"].loc[
+        result["accounting_journal"]["entry_type"] == "SHARE_DISTRIBUTION_RIGHT_MARK"
+    ].iloc[-1]
+    assert mark["details"]["price_source_sha256"] == result["metrics"]["accounting_valuation_inputs_sha256"]
+
+    alternate_data_source = data.copy()
+    alternate_data_source["data_source"] = "synthetic_alternate_price_provider"
+    alternate = run_backtest(
+        alternate_data_source,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(event,),
+    )
+    assert alternate["metrics"]["accounting_valuation_inputs_sha256"] != result["metrics"]["accounting_valuation_inputs_sha256"]
+    assert alternate["metrics"]["data_version_sha256"] != result["metrics"]["data_version_sha256"]
+
+
+def test_pre_window_distribution_requires_validated_opening_rights_and_resumes():
+    from cehuan.accounting import LedgerSnapshot, PortfolioLedger, PositionLot, ShareDistributionEvent
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = _bars(days=10)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    dates = sorted(data["trade_date"].unique())
+    event = ShareDistributionEvent(
+        event_id="carry-in-distribution",
+        symbol="SZ000001",
+        record_date="2024-12-30",
+        effective_date=dates[1],
+        registration_date=dates[7],
+        tradable_date=dates[8],
+        shares_per_old_share=Decimal("0.3"),
+        known_at_utc="2024-12-20T00:00:00+00:00",
+        source=_action_source(),
+    )
+
+    with pytest.raises(ValueError, match="缺少覆盖登记日 2024-12-30 的期初权益快照"):
+        run_backtest(
+            data,
+            100_000,
+            config,
+            security_identity_events=pd.DataFrame(),
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_v2",
+            accounting_events=(event,),
+        )
+
+    opening_ledger = PortfolioLedger(
+        Decimal("100000"),
+        portfolio_id="window-carry-test",
+        positions=(PositionLot(
+            lot_id="pre-window-lot",
+            symbol=event.symbol,
+            total_shares=100,
+            sellable_shares=100,
+            cost_basis_cny=Decimal("1000"),
+            acquired_on=date(2024, 12, 1),
+            sellable_from=date(2024, 12, 1),
+        ),),
+    )
+    opening_ledger.record_share_distribution(event, as_of=event.record_date)
+    opening_snapshot = opening_ledger.snapshot(as_of_date="2024-12-31")
+
+    result = run_backtest(
+        data,
+        100_000,
+        config,
+        security_identity_events=pd.DataFrame(),
+        corporate_actions=pd.DataFrame(),
+        accounting_mode="ledger_v2",
+        accounting_events=(event,),
+        opening_accounting_snapshot=opening_snapshot,
+    )
+    snapshot = result["accounting_snapshot"]
+    claim = next(row for row in snapshot.claims if row.event_id == event.event_id)
+    assert claim.status == "SETTLED"
+    assert claim.next_phase_date is None
+    assert claim.final_allocated_shares == 30
+    assert len([entry for entry in snapshot.journal if entry.entry_type == "SHARE_DISTRIBUTION_ENTITLEMENT_SNAPSHOT"]) == 1
+    new_lot = next(lot for lot in snapshot.positions if lot.source_event_id == event.event_id)
+    assert new_lot.total_shares == 30
+    assert new_lot.sellable_on(pd.Timestamp(dates[7]).date()) == 0
+    assert new_lot.sellable_on(pd.Timestamp(dates[8]).date()) == 30
+
+
+def test_pre_window_snapshot_json_round_trip_and_snapshot_date_validation():
+    from dataclasses import asdict
+    import json
+
+    from cehuan.accounting import LedgerSnapshot, PortfolioLedger, PositionLot, ledger_snapshot_from_dict
+
+    ledger = PortfolioLedger(
+        Decimal("1200"),
+        positions=(PositionLot(
+            lot_id="snapshot-lot", symbol="SZ000001", total_shares=100,
+            sellable_shares=100, cost_basis_cny=Decimal("1000"),
+            acquired_on=date(2024, 12, 1), sellable_from=date(2024, 12, 1),
+        ),),
+    )
+    snapshot = ledger.snapshot(as_of_date="2024-12-31")
+    reloaded = ledger_snapshot_from_dict(json.loads(json.dumps(asdict(snapshot), default=str)))
+    assert reloaded == snapshot
+
+
+def test_share_distribution_result_not_available_after_window_is_never_guessed():
+    from cehuan.accounting import PortfolioLedger, PositionLot, ShareDistributionEvent
+
+    event = ShareDistributionEvent(
+        event_id="late-allocation-result",
+        symbol="SZ000001",
+        record_date="2025-01-04",
+        effective_date="2025-01-05",
+        registration_date="2025-01-09",
+        tradable_date="2025-01-10",
+        shares_per_old_share=Decimal("0.125"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+    ledger = PortfolioLedger(
+        Decimal("1000"),
+        positions=(PositionLot(
+            lot_id="fractional-entitlement-lot", symbol=event.symbol,
+            total_shares=100, sellable_shares=100, cost_basis_cny=Decimal("1000"),
+            acquired_on=date(2024, 12, 1), sellable_from=date(2024, 12, 1),
+        ),),
+    )
+    with pytest.raises(ValueError, match="需登记账户层最终获配股数"):
+        ledger.record_share_distribution(event, as_of=event.record_date)
+    assert not ledger.claims
+    assert sum(lot.total_shares for lot in ledger.positions) == 100
+
+
+def test_distribution_full_and_snapshot_resumed_accounting_are_identical():
+    from dataclasses import asdict
+
+    from cehuan.accounting import PortfolioLedger, PositionLot, PriceMark, ShareDistributionEvent
+
+    event = ShareDistributionEvent(
+        event_id="full-vs-resumed-distribution",
+        symbol="SZ000001",
+        record_date="2025-01-02",
+        effective_date="2025-01-03",
+        registration_date="2025-01-06",
+        tradable_date="2025-01-07",
+        shares_per_old_share=Decimal("0.3"),
+        known_at_utc="2024-12-01T00:00:00+00:00",
+        source=_action_source(),
+    )
+
+    def initial_ledger() -> PortfolioLedger:
+        ledger = PortfolioLedger(
+            Decimal("10000"),
+            portfolio_id="full-vs-split",
+            positions=(PositionLot(
+                lot_id="opening-lot", symbol=event.symbol, total_shares=100,
+                sellable_shares=100, cost_basis_cny=Decimal("1000"),
+                acquired_on=date(2024, 12, 1), sellable_from=date(2024, 12, 1),
+            ),),
+        )
+        ledger.record_share_distribution(event, as_of=event.record_date)
+        ledger.apply_share_distribution(event, as_of=event.effective_date)
+        return ledger
+
+    def mark(ledger: PortfolioLedger, day: str) -> None:
+        ledger.mark_share_distribution_claim(
+            event,
+            as_of=day,
+            underlying_close_cny=Decimal("10.5"),
+            price_source="synthetic-underlying-close",
+            price_source_sha256="e" * 64,
+            price_date=day,
+            is_suspended=False,
+        )
+
+    continuous = initial_ledger()
+    mark(continuous, "2025-01-03")
+    mark(continuous, "2025-01-04")
+    mark(continuous, "2025-01-05")
+    continuous.register_share_distribution(event, as_of=event.registration_date)
+    continuous.mark_share_distribution_tradable(event, as_of=event.tradable_date)
+
+    first_window = initial_ledger()
+    mark(first_window, "2025-01-03")
+    mark(first_window, "2025-01-04")
+    split_snapshot = first_window.snapshot(as_of_date="2025-01-04")
+    resumed = PortfolioLedger.from_snapshot(split_snapshot)
+    mark(resumed, "2025-01-05")
+    resumed.register_share_distribution(event, as_of=event.registration_date)
+    resumed.mark_share_distribution_tradable(event, as_of=event.tradable_date)
+
+    assert asdict(continuous.snapshot(as_of_date="2025-01-07")) == asdict(
+        resumed.snapshot(as_of_date="2025-01-07")
+    )
+    nav_prices = {
+        event.symbol: PriceMark(
+            price_cny=Decimal("10.5"),
+            price_date=date(2025, 1, 7),
+            source="synthetic-close",
+            age_sessions=0,
+        )
+    }
+    assert continuous.mark_to_market("2025-01-07", nav_prices) == resumed.mark_to_market(
+        "2025-01-07", nav_prices
+    )
 
 
 def test_unpriced_or_suspended_interim_distribution_claim_blocks_diagnostic_nav():
@@ -444,6 +708,26 @@ def test_unpriced_or_suspended_interim_distribution_claim_blocks_diagnostic_nav(
     with pytest.raises(ValueError, match="停牌状态未知或已停牌"):
         run_backtest(
             data,
+            100_000,
+            config,
+            security_identity_events=pd.DataFrame(),
+            corporate_actions=pd.DataFrame(),
+            accounting_mode="ledger_v2",
+            accounting_events=(event,),
+        )
+
+    unknown_status = _bars(days=16)
+    unknown_status["is_listed"] = True
+    unknown_status["is_suspended"] = False
+    unknown_status["is_suspended"] = unknown_status["is_suspended"].astype("boolean")
+    unknown_status["is_st"] = False
+    unknown_status.loc[
+        (unknown_status["symbol"] == event.symbol) & (unknown_status["trade_date"] == dates[6]),
+        "is_suspended",
+    ] = pd.NA
+    with pytest.raises(ValueError, match="停牌状态未知或已停牌"):
+        run_backtest(
+            unknown_status,
             100_000,
             config,
             security_identity_events=pd.DataFrame(),
@@ -577,6 +861,8 @@ def test_scheduled_rules_and_fees_are_research_only_and_must_be_paired():
 
 
 def test_cli_scheduled_diagnostic_saves_bound_tables_and_ledger_outputs(tmp_path, monkeypatch, capsys):
+    import json
+
     from cehuan.cli import main as cli_main
 
     data_path = tmp_path / "bars.csv"
@@ -620,3 +906,28 @@ def test_cli_scheduled_diagnostic_saves_bound_tables_and_ledger_outputs(tmp_path
     assert (experiment_dir / "fee_schedule.csv").is_file()
     assert (experiment_dir / "accounting_journal.csv").is_file()
     assert (experiment_dir / "accounting_snapshot.json").is_file()
+
+    previous_snapshot = json.loads((experiment_dir / "accounting_snapshot.json").read_text(encoding="utf-8"))
+    followup_data = _bars().copy()
+    followup_data["trade_date"] = (
+        pd.to_datetime(followup_data["trade_date"]) + pd.Timedelta(days=20)
+    ).dt.strftime("%Y-%m-%d")
+    followup_path = tmp_path / "followup-bars.csv"
+    followup_data.to_csv(followup_path, index=False)
+    followup_args = [
+        "backtest", "--data", str(followup_path), "--cash", str(previous_snapshot["cash_cny"]),
+        "--config", str(config_path),
+        "--identity-events", str(repo_root / "examples/empty_security_identity_events.csv"),
+        "--corporate-actions", str(repo_root / "examples/empty_corporate_actions.csv"),
+        "--diagnostic", "--accounting-mode", "ledger_v2",
+        "--accounting-opening-snapshot", str(experiment_dir / "accounting_snapshot.json"),
+    ]
+    assert cli_main.main(followup_args) == 0
+    capsys.readouterr()
+    followup_experiments = list((tmp_path / "outputs/experiments").iterdir())
+    assert len(followup_experiments) == 2
+    continued = next(folder for folder in followup_experiments if folder != experiment_dir)
+    assert (continued / "accounting_opening_snapshot.json").is_file()
+    continued_metrics = json.loads((continued / "metrics.json").read_text(encoding="utf-8"))
+    assert continued_metrics["accounting_opening_snapshot_as_of"] == previous_snapshot["as_of_date"]
+    assert continued_metrics["accounting_opening_snapshot_file_sha256"]

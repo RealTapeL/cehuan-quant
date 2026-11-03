@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
@@ -65,6 +66,76 @@ class PortfolioLedger:
         self._operations: dict[str, tuple[str, tuple[LedgerEntry, ...]]] = {}
         self._event_families: dict[str, str] = {}
         self.assert_invariants()
+
+    @classmethod
+    def from_snapshot(cls, snapshot: LedgerSnapshot) -> "PortfolioLedger":
+        """Restore a ledger state for a later research window.
+
+        The snapshot contains the open state and complete prior journal, so the
+        original opening balances can be reconstructed and the normal ledger
+        invariants remain active after restoration.
+        """
+        if not isinstance(snapshot, LedgerSnapshot):
+            raise TypeError("from_snapshot 只接受 LedgerSnapshot")
+        ledger = object.__new__(cls)
+        ledger.portfolio_id = snapshot.portfolio_id
+        ledger._cash_cny = snapshot.cash_cny
+        ledger._positions = cls._index_unique(snapshot.positions, "lot_id", "持仓批次")
+        ledger._receivables = cls._index_unique(snapshot.receivables, "receivable_id", "应收款")
+        ledger._claims = cls._index_unique(snapshot.claims, "claim_id", "非现金权利")
+        ledger._action_entitlements = cls._index_unique(
+            snapshot.entitlements, "event_id", "公司行动持仓快照"
+        )
+        ledger._journal = list(snapshot.journal)
+        ledger._operations = {}
+
+        cash_journal_delta = sum(
+            (entry.cash_delta_cny for entry in ledger._journal), start=Decimal("0")
+        )
+        ledger._initial_cash_cny = ledger._cash_cny - cash_journal_delta
+        if ledger._initial_cash_cny < 0:
+            raise ValueError("账本快照无法从流水还原出非负期初现金")
+
+        current_positions = cls._position_totals(ledger._positions.values())
+        journal_positions: dict[str, int] = {}
+        ledger._event_families = {}
+        for entry in ledger._journal:
+            for symbol, quantity in entry.position_deltas:
+                journal_positions[symbol] = journal_positions.get(symbol, 0) + quantity
+            phase = entry.phase.upper()
+            if phase == "FILL":
+                family = "TRADE_FILL"
+            elif phase.startswith("DIVIDEND_") or phase == "DIVIDEND_PAYMENT":
+                family = "CASH_DIVIDEND"
+            elif phase.startswith("DISTRIBUTION_") or phase == "SHARE_DISTRIBUTION":
+                family = "SHARE_DISTRIBUTION"
+            elif phase.startswith("RIGHTS_"):
+                family = "RIGHTS_OFFERING"
+            elif phase.startswith("SHARE_SWAP_"):
+                family = "SHARE_SWAP_MERGER"
+            elif phase.startswith("DELISTING_"):
+                family = "DELISTING"
+            elif phase == "IDENTITY_MIGRATION":
+                family = "CODE_CHANGE_1_TO_1"
+            else:
+                family = phase
+            prior = ledger._event_families.setdefault(entry.event_id, family)
+            if prior != family:
+                raise ValueError(f"快照流水 event_id {entry.event_id} 涉及多个事件类型")
+
+        ledger._initial_position_shares = {
+            symbol: quantity - journal_positions.get(symbol, 0)
+            for symbol, quantity in current_positions.items()
+        }
+        for symbol, quantity in journal_positions.items():
+            ledger._initial_position_shares.setdefault(symbol, -quantity)
+        if any(quantity < 0 for quantity in ledger._initial_position_shares.values()):
+            raise ValueError("账本快照无法从流水还原出非负期初持仓")
+        ledger._initial_position_shares = {
+            symbol: quantity for symbol, quantity in ledger._initial_position_shares.items() if quantity
+        }
+        ledger.assert_invariants()
+        return ledger
 
     @staticmethod
     def _index_unique(items: Iterable[object], key: str, label: str) -> dict[str, object]:
@@ -212,7 +283,7 @@ class PortfolioLedger:
             totals[lot.symbol] = totals.get(lot.symbol, 0) + lot.total_shares
         return totals
 
-    def snapshot(self) -> LedgerSnapshot:
+    def snapshot(self, *, as_of_date: date | str | None = None) -> LedgerSnapshot:
         return LedgerSnapshot(
             portfolio_id=self.portfolio_id,
             cash_cny=self._cash_cny,
@@ -223,6 +294,7 @@ class PortfolioLedger:
             entitlements=tuple(
                 self._action_entitlements[key] for key in sorted(self._action_entitlements)
             ),
+            as_of_date=calendar_date(as_of_date, "snapshot.as_of_date", optional=True),
         )
 
     def assert_invariants(self) -> None:
@@ -503,6 +575,9 @@ class PortfolioLedger:
                 cost_basis_cny=claim_basis,
                 acquired_on=acquired_on,
                 lot_allocations=tuple(allocations),
+                next_phase_date=event.effective_date if allocated_new_shares else None,
+                source_id=event.source.source_id,
+                source_sha256=event.source.sha256,
             )
             return (candidate._entry(
                 operation_key, event.event_id, "DISTRIBUTION_RECORD", event.record_date,
@@ -746,13 +821,19 @@ class PortfolioLedger:
             immediate_registration = event.registration_date == event.effective_date
             if immediate_registration:
                 self._register_distribution_lots(candidate, event, current_claim)
-                candidate._claims[claim_id] = replace(current_claim, status="SETTLED")
+                candidate._claims[claim_id] = replace(
+                    current_claim,
+                    status="SETTLED",
+                    next_phase_date=(event.tradable_date if event.tradable_date > day else None),
+                )
                 position_deltas = ((event.symbol, current_claim.final_allocated_shares or 0),)
                 entry_type = "SHARE_DISTRIBUTION_REGISTERED"
                 status = "SETTLED"
             else:
                 candidate._claims[claim_id] = replace(
-                    current_claim, status="DISTRIBUTION_PENDING_REGISTRATION"
+                    current_claim,
+                    status="DISTRIBUTION_PENDING_REGISTRATION",
+                    next_phase_date=event.registration_date,
                 )
                 position_deltas = ()
                 entry_type = "SHARE_DISTRIBUTION_RIGHT_CONFIRMED"
@@ -804,6 +885,9 @@ class PortfolioLedger:
         as_of: date | str,
         underlying_close_cny: Decimal | int | str,
         price_source: str,
+        price_source_sha256: str,
+        price_date: date | str,
+        is_suspended: bool | None,
     ) -> tuple[LedgerEntry, ...]:
         day = calendar_date(as_of, "as_of")
         if not event.effective_date <= day < event.registration_date:
@@ -818,6 +902,16 @@ class PortfolioLedger:
         source = str(price_source).strip()
         if not source:
             raise ValueError("送转权利估值必须绑定底层收盘价来源")
+        source_hash = str(price_source_sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+            raise ValueError("送转权利估值必须绑定底层行情 SHA-256")
+        quote_date = calendar_date(price_date, "price_date")
+        if quote_date != day:
+            raise ValueError("送转权利估值必须使用估值日对应的收盘价")
+        if is_suspended is not False:
+            raise ValueError("底层证券停牌状态未知或已停牌，不能使用收盘价代理估值")
+        if claim.final_allocated_shares is None:
+            raise ValueError(f"送转权利 {claim_id} 的最终获配股数未确认，不能使用估值代理")
         value = price * int(claim.final_allocated_shares or 0)
         payload = {
             "event_id": event.event_id,
@@ -826,7 +920,10 @@ class PortfolioLedger:
             "underlying_close_cny": str(price),
             "valuation_cny": str(value),
             "price_source": source,
-            "source_sha256": event.source.sha256,
+            "price_source_sha256": source_hash,
+            "price_date": quote_date.isoformat(),
+            "is_suspended": False,
+            "action_source_sha256": event.source.sha256,
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
@@ -834,7 +931,7 @@ class PortfolioLedger:
             candidate._claims[claim_id] = replace(
                 current,
                 valuation_cny=value,
-                valuation_source=f"underlying_close_proxy:{source}",
+                valuation_source=f"UNDERLYING_CLOSE_PROXY:{source}:{source_hash}",
                 valuation_as_of=day,
             )
             return (candidate._entry(
@@ -847,6 +944,12 @@ class PortfolioLedger:
                     "valuation_cny": value,
                     "valuation_method": "UNDERLYING_CLOSE_PROXY",
                     "price_source": source,
+                    "price_source_sha256": source_hash,
+                    "underlying_symbol": event.symbol,
+                    "price_date": quote_date.isoformat(),
+                    "is_suspended": False,
+                    "is_actual_right_trade_price": False,
+                    "next_phase_date": event.registration_date.isoformat(),
                     **self._source_details(event.source),
                 },
             ),)
@@ -888,6 +991,7 @@ class PortfolioLedger:
                 valuation_cny=None,
                 valuation_source=None,
                 valuation_as_of=None,
+                next_phase_date=(event.tradable_date if event.tradable_date > day else None),
             )
             shares = int(current.final_allocated_shares or 0)
             return (candidate._entry(
@@ -904,6 +1008,44 @@ class PortfolioLedger:
             ),)
 
         return self._apply_once(event.event_id, "DISTRIBUTION_REGISTRATION", payload, mutate)
+
+    def mark_share_distribution_tradable(
+        self, event: ShareDistributionEvent, *, as_of: date | str
+    ) -> tuple[LedgerEntry, ...]:
+        """Record the date on which registered distribution shares become sellable."""
+        day = calendar_date(as_of, "as_of")
+        if day != event.tradable_date:
+            raise ValueError("送转新增股份只能在公告的可流通日开放卖出")
+        claim_id = f"distribution:{event.event_id}"
+        claim = next((item for item in self.claims if item.claim_id == claim_id), None)
+        if claim is None or claim.status != "SETTLED":
+            raise ValueError(f"送转权利 {claim_id} 尚未完成新股登记，不能进入可流通阶段")
+        if not any(lot.source_event_id == event.event_id for lot in self._positions.values()):
+            if claim.final_allocated_shares:
+                raise ValueError(f"送转权利 {claim_id} 缺少已登记的新股持仓批次")
+        payload = {
+            "event_id": event.event_id,
+            "claim_id": claim_id,
+            "tradable_date": day.isoformat(),
+            "source_sha256": event.source.sha256,
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            current = candidate._claims[claim_id]
+            candidate._claims[claim_id] = replace(current, next_phase_date=None)
+            return (candidate._entry(
+                operation_key, event.event_id, "DISTRIBUTION_TRADABLE", day,
+                "SHARE_DISTRIBUTION_TRADABLE", Decimal("0"), (), {
+                    "claim_id": claim_id,
+                    "shares": current.final_allocated_shares or 0,
+                    "tradable_date": day.isoformat(),
+                    "cash_delta_cny": "0",
+                    "trade_or_commission_created": False,
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, "DISTRIBUTION_TRADABLE", payload, mutate)
 
     def decide_rights_offering(
         self,
