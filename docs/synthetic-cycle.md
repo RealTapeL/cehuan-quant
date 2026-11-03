@@ -40,7 +40,7 @@ uv run python examples/run_synthetic_cycle.py --output outputs/synthetic-cycle -
 
 ## 人工 CSV 复盘
 
-`review` 可接收明确的委托状态证据、用户修改计划的原版文件和可选成交导入登记簿。程序为每次运行创建唯一输出目录，并在 `manifest.json` 记录计划、成交、映射、快照与状态证据文件散列。账户原始 CSV 不会复制进产物目录。
+`review` 可接收明确的委托状态证据、用户修改计划的原版文件和可选成交导入登记簿。程序先在临时目录写完报告与 manifest，再原子发布完整输出目录，最后登记成交文件；登记簿同时绑定 `cycle_run_id`、成交散列、输出 manifest 路径及其散列。报告写入失败时不会创建登记，登记失败时会移除本次报告目录，因此可以用同一输出路径重试。若进程恰在目录发布和登记提交之间退出，重试会验证原目录及输入散列后补登记；若登记已提交，则核对原登记并按成功恢复。相同成交文件并发处理时，登记簿锁只允许一个运行成功，另一份临时报告会清理。每次运行的 manifest 记录计划、成交、映射、快照与状态证据文件散列。账户原始 CSV 不会复制进产物目录。
 
 ```bash
 uv run cehuan review \
@@ -49,8 +49,11 @@ uv run cehuan review \
   --fills data/private/review/fills.csv \
   --order-statuses data/private/review/order-statuses.csv \
   --positions data/private/review/positions.csv \
-  --import-registry data/private/review/fill-import-registry.json
+  --import-registry data/private/review/fill-import-registry.json \
+  --output-dir data/private/review/reports/plan-cycle-2026-11-03
 ```
+
+首次运行应为新的计划周期选一个不存在的输出目录；需要恢复时沿用该目录路径。
 
 `--order-statuses` 的字段见 `examples/order_statuses_template.csv`，需要订单 ID、计划 ID、证券、方向、状态、带时区的报告时间、本地原件路径及原件 SHA-256。适配器会重新计算本地原件散列；这只验证字节一致，不验证原件内容的解释。没有委托状态证据时，`NO_FILL` 只说明成交 CSV 中没有匹配成交；它不等于撤单、拒绝或过期。没有持仓快照时，持仓和可卖数量未知，不视作零。
 

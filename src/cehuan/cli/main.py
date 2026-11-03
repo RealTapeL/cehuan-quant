@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
+import os
 import shutil
 import shlex
 import sys
@@ -45,7 +46,7 @@ from cehuan.review.reconcile import (
     read_positions,
     review_markdown,
 )
-from cehuan.review.import_registry import register_fill_import
+from cehuan.review.import_registry import find_fill_import_record, register_fill_import
 from cehuan.signals.plan import generate_plan, plan_markdown
 
 
@@ -972,49 +973,105 @@ def main(argv: list[str] | None = None) -> int:
             if not root.is_absolute():
                 root = REPO_ROOT / root
             root = root.resolve()
+            registry_path = input_path(args.import_registry) if args.import_registry else None
+            fills_sha256 = input_hashes_before["fills"]
+            plan_ids = plan_frame["plan_id"].dropna().astype(str).unique().tolist() if "plan_id" in plan_frame else []
+            cycle_run_id = plan_ids[0] if len(plan_ids) == 1 else None
             if root.exists():
+                manifest_path = root / "manifest.json"
+                if registry_path is not None and manifest_path.is_file():
+                    existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    existing_import_reference = existing_manifest.get("fill_import_reference") or {}
+                    if (
+                        existing_manifest.get("result_type") == "manual_account_reconciliation_csv_not_broker_connected"
+                        and existing_manifest.get("input_sha256") == input_hashes_before
+                        and existing_manifest.get("cycle_run_id") == cycle_run_id
+                        and existing_import_reference.get("source_sha256") == fills_sha256
+                    ):
+                        existing_record = find_fill_import_record(fills_path, registry_path)
+                        existing_manifest_hash = sha256_file(manifest_path)
+                        if existing_record is not None:
+                            same_run = (
+                                existing_record.get("output_manifest_path") == str(manifest_path)
+                                and existing_record.get("output_manifest_sha256") == existing_manifest_hash
+                            )
+                            if same_run:
+                                print(f"复盘和成交导入已完成；按原运行恢复成功：{manifest_path}")
+                                return 0
+                            raise ValueError("该成交文件已登记到另一份复盘产物；本次不会重复计入")
+                        receipt = register_fill_import(
+                            fills_path,
+                            registry_path,
+                            row_count=len(fills),
+                            cycle_run_id=cycle_run_id,
+                            output_manifest_path=manifest_path,
+                        )
+                        print(f"恢复已发布的复盘并完成成交登记：{manifest_path} ({receipt['import_id']})")
+                        return 0
                 raise FileExistsError(f"复盘输出目录已经存在，拒绝覆盖：{root}")
-            import_receipt = None
-            if args.import_registry:
-                plan_ids = plan_frame["plan_id"].dropna().astype(str).unique().tolist() if "plan_id" in plan_frame else []
-                import_receipt = register_fill_import(
-                    fills_path,
-                    input_path(args.import_registry),
-                    row_count=len(fills),
-                    cycle_run_id=plan_ids[0] if len(plan_ids) == 1 else None,
-                )
-            root.mkdir(parents=True, exist_ok=False)
-            report.to_csv(root / "review.csv", index=False)
-            if position_report is not None:
-                position_report.to_csv(root / "review_positions.csv", index=False)
-            if order_statuses is not None:
-                order_statuses.to_csv(root / "review_order_statuses.csv", index=False)
-            if plan_revision_report is not None:
-                plan_revision_report.to_csv(root / "plan_revision_diff.csv", index=False)
-            markdown = review_markdown(report, position_report)
-            if plan_revision_report is not None:
-                markdown += "\n## 计划修订留痕\n\n"
-                markdown += f"修改字段的计划行数：{len(plan_revision_report)}。证据类型：用户提供的原计划与修改后计划 CSV 差异；系统不独立验证修改人身份。\n"
-                if plan_revision_report.empty:
-                    markdown += "两份计划字段相同。\n"
-            (root / "review.md").write_text(markdown, encoding="utf-8")
-            if import_receipt is not None:
-                _write_json(import_receipt, root / "fill_import_receipt.json")
-            manifest = {
-                "schema_version": 1,
-                "run_id": run_id,
-                "result_type": "manual_account_reconciliation_csv_not_broker_connected",
-                "input_sha256": input_hashes_before,
-                "input_paths": {name: str(path) for name, path in tracked_inputs.items()},
-                "position_snapshot_status": "PROVIDED_CSV" if positions_path else "NOT_PROVIDED",
-                "order_status_evidence_status": "PROVIDED" if statuses_path else "NOT_PROVIDED",
-                "plan_revision_diff_status": "PROVIDED" if original_plan_path else "NOT_PROVIDED",
-                "fill_import_receipt": import_receipt,
-                "broker_connection_or_order": False,
-            }
-            _write_json(manifest, root / "manifest.json")
+            fill_import_reference = None
+            if registry_path is not None:
+                fill_import_reference = {
+                    "import_id": f"fill-import-{fills_sha256[:16]}",
+                    "source_sha256": fills_sha256,
+                    "registry_path": str(registry_path),
+                }
+            staging = root.with_name(f".{root.name}.staging-{uuid.uuid4().hex[:8]}")
+            root.parent.mkdir(parents=True, exist_ok=True)
+            staging.mkdir(parents=False, exist_ok=False)
+            published = False
+            try:
+                report.to_csv(staging / "review.csv", index=False)
+                if position_report is not None:
+                    position_report.to_csv(staging / "review_positions.csv", index=False)
+                if order_statuses is not None:
+                    order_statuses.to_csv(staging / "review_order_statuses.csv", index=False)
+                if plan_revision_report is not None:
+                    plan_revision_report.to_csv(staging / "plan_revision_diff.csv", index=False)
+                markdown = review_markdown(report, position_report)
+                if plan_revision_report is not None:
+                    markdown += "\n## 计划修订留痕\n\n"
+                    markdown += f"修改字段的计划行数：{len(plan_revision_report)}。证据类型：用户提供的原计划与修改后计划 CSV 差异；系统不独立验证修改人身份。\n"
+                    if plan_revision_report.empty:
+                        markdown += "两份计划字段相同。\n"
+                (staging / "review.md").write_text(markdown, encoding="utf-8")
+                manifest = {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "cycle_run_id": cycle_run_id,
+                    "result_type": "manual_account_reconciliation_csv_not_broker_connected",
+                    "input_sha256": input_hashes_before,
+                    "input_paths": {name: str(path) for name, path in tracked_inputs.items()},
+                    "position_snapshot_status": "PROVIDED_CSV" if positions_path else "NOT_PROVIDED",
+                    "order_status_evidence_status": "PROVIDED" if statuses_path else "NOT_PROVIDED",
+                    "plan_revision_diff_status": "PROVIDED" if original_plan_path else "NOT_PROVIDED",
+                    "fill_import_reference": fill_import_reference,
+                    "broker_connection_or_order": False,
+                }
+                _write_json(manifest, staging / "manifest.json")
+                input_hashes_at_publish = {name: sha256_file(path) for name, path in tracked_inputs.items()}
+                if input_hashes_before != input_hashes_at_publish:
+                    raise ValueError("复盘产物写入期间输入文件发生变化；拒绝登记成交")
+                os.replace(staging, root)
+                published = True
+                import_receipt = None
+                if registry_path is not None:
+                    import_receipt = register_fill_import(
+                        fills_path,
+                        registry_path,
+                        row_count=len(fills),
+                        cycle_run_id=cycle_run_id,
+                        output_manifest_path=root / "manifest.json",
+                    )
+            except Exception:
+                shutil.rmtree(staging, ignore_errors=True)
+                if published:
+                    shutil.rmtree(root, ignore_errors=True)
+                raise
             print(markdown)
             print(f"复盘文件：{root / 'review.md'}\n运行清单：{root / 'manifest.json'}")
+            if import_receipt is not None:
+                print(f"成交导入登记：{registry_path} ({import_receipt['import_id']})")
             return 0
 
         if args.command == "qlib-check":
