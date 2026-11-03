@@ -213,6 +213,6 @@ NAV = cash_total
 
 因此本文的合成样例是目标会计结果，不表示现有引擎已经满足它们。正式门控只有在以下条件同时成立后才可改变：事件数据逐证券覆盖完整；账户/模拟整数分配和权利估值可复核；账本流水与日终 NAV 恒等核对；规则和历史费用真实参与撮合；缺行/冲突/未决权利自动阻断；合成与真实公告穿透案例均经针对性验证。正式基线仍由程序 readiness 结果决定，不接受人工布尔开关。
 
-关联文档：[证券身份事件与公司行动边界](security-identity.md)、[正式基线就绪审计](baseline-readiness.md)、[2023–2025 数据准备记录](data-preparation-2023-2025.md)。
+关联文档：[证券身份事件与公司行动边界](security-identity.md)、[配股事件每日调度设计（尚未接入）](rights-offering-scheduler-design.md)、[正式基线就绪审计](baseline-readiness.md)、[2023–2025 数据准备记录](data-preparation-2023-2025.md)。
 
 三份公告样本的私有人工审阅包生成方法见[公告审阅包说明](announcement-review-packet.md)。

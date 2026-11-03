@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import shutil
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -229,6 +230,33 @@ def build_accounting_sample_review_pack(
             raise ValueError(f"{sample_id}/{row['field_name']}: 字段表来源哈希与样本清单不一致")
         if row.get("archive_path", "").strip() not in {"", source["archive_path"].strip()}:
             raise ValueError(f"{sample_id}/{row['field_name']}: 字段表原件路径与样本清单不一致")
+        review_status = row.get("review_status", "PENDING").strip() or "PENDING"
+        allowed_review_statuses = {
+            "PENDING", "VERIFIED_FROM_ANNOUNCEMENT", "NOT_IN_ANNOUNCEMENT",
+            "NEEDS_OTHER_SOURCE", "UNRESOLVED",
+        }
+        if review_status not in allowed_review_statuses:
+            raise ValueError(f"{sample_id}/{row['field_name']}: 未知 review_status={review_status}")
+        if review_status != "PENDING":
+            reviewer = row.get("reviewed_by", "").strip()
+            reviewed_at = row.get("reviewed_at", "").strip()
+            reviewed_hash = row.get("reviewed_source_sha256", "").strip().lower()
+            excerpt = row.get("reviewer_excerpt", "").strip()
+            reason = row.get("reviewer_reason", "").strip()
+            if not reviewer or not reviewed_at:
+                raise ValueError(f"{sample_id}/{row['field_name']}: 已簽認狀態必須提供實際審核人和日期")
+            try:
+                parsed_reviewed_at = date.fromisoformat(reviewed_at)
+            except ValueError as exc:
+                raise ValueError(f"{sample_id}/{row['field_name']}: reviewed_at 必须是 YYYY-MM-DD") from exc
+            if parsed_reviewed_at.isoformat() != reviewed_at:
+                raise ValueError(f"{sample_id}/{row['field_name']}: reviewed_at 必须是 YYYY-MM-DD")
+            if reviewed_hash != source["source_sha256"].strip().lower():
+                raise ValueError(f"{sample_id}/{row['field_name']}: 已簽認原件 SHA-256 必須匹配樣本清單")
+            if review_status == "VERIFIED_FROM_ANNOUNCEMENT" and not excerpt:
+                raise ValueError(f"{sample_id}/{row['field_name']}: 公告核實必須保存人工核對摘錄或定位")
+            if review_status != "VERIFIED_FROM_ANNOUNCEMENT" and not reason:
+                raise ValueError(f"{sample_id}/{row['field_name']}: 非公告核實狀態必須說明原因或待补证事项")
         pages, locator = _candidate_page_excerpts(
             field_name=row["field_name"].strip(),
             official_value=row["official_value"].strip(),
@@ -245,12 +273,12 @@ def build_accounting_sample_review_pack(
             "local_text_copy": copy_by_sample[sample_id]["text"],
             "candidate_page_numbers": pages,
             "candidate_excerpt_or_locator_status": locator,
-            "field_scope": (
+            "field_scope": row.get("evidence_scope", "").strip() or (
                 "ACCOUNT_EVIDENCE_REQUIRED" if "ACCOUNT" in row["official_value"].upper()
                 or "NOT IN ANNOUNCEMENT" in row["official_value"].upper()
                 else "ANNOUNCEMENT_CANDIDATE_REQUIRES_HUMAN_CHECK"
             ),
-            "review_status": row["review_status"].strip() or "PENDING",
+            "review_status": review_status,
         })
     review_csv = output / "review_fields.csv"
     with review_csv.open("x", encoding="utf-8", newline="") as handle:

@@ -35,3 +35,11 @@ def test_announcement_field_review_matrix_is_valid_and_unsigned():
     assert set(fields["review_status"]) == {"PENDING"}
     assert not fields["reviewed_by"].str.strip().any()
     assert not fields["reviewed_at"].str.strip().any()
+    assert set(fields["suggested_review_outcome"]) <= {
+        "VERIFIED_FROM_ANNOUNCEMENT", "NOT_IN_ANNOUNCEMENT", "NEEDS_OTHER_SOURCE", "UNRESOLVED",
+    }
+    assert fields["review_guidance"].str.strip().all()
+    assert not fields["reviewer_excerpt"].str.strip().any()
+    assert not fields["reviewer_reason"].str.strip().any()
+    assert not fields["reviewed_source_sha256"].str.strip().any()
+    assert len(fields) == 23

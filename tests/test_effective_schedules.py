@@ -223,6 +223,23 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
             backtest_checkpoint=checkpoint, trading_calendar=calendar,
         )
 
+    future_event = CashDividendEvent(
+        event_id="checkpoint-future-append-must-remain-blocked",
+        symbol="SZ000003", record_date="2025-01-15", ex_date="2025-01-16",
+        payable_date="2025-01-17", gross_per_share_cny=Decimal("0.01"),
+        known_at_utc="2025-01-13T08:01:00Z", source=_action_source(),
+    )
+    with pytest.raises(ValueError, match="公司行动事件或分红税务处理已变化"):
+        run_backtest(
+            data.loc[data["trade_date"] >= "2025-01-14"].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config,
+            accounting_mode="ledger_v2", security_identity_events=empty_identity,
+            corporate_actions=empty_actions, accounting_events=(*accounting_events, future_event),
+            dividend_tax_treatment_by_event={dividend.event_id: "DEFERRED_BY_HOLDING_PERIOD"},
+            dividend_payment_withholding_per_share_cny_by_event={dividend.event_id: Decimal("0")},
+            backtest_checkpoint=checkpoint, trading_calendar=calendar,
+        )
+
     second = run_backtest(
         data.loc[data["trade_date"] >= "2025-01-14"].copy(),
         float(checkpoint.ledger_snapshot.cash_cny), config,

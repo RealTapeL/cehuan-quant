@@ -4,6 +4,8 @@ import csv
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from cehuan.data.accounting_sample_audit import verify_accounting_sample_manifest
 from cehuan.data.accounting_sample_audit import build_accounting_sample_review_pack
 
@@ -106,3 +108,26 @@ def test_review_pack_copies_sources_adds_candidate_excerpt_and_keeps_signoff_pen
     assert "没有改变输入" in (output / "README.md").read_text(encoding="utf-8") or "保持输入值" in (
         output / "README.md"
     ).read_text(encoding="utf-8")
+
+
+def test_review_pack_rejects_unsigned_human_conclusion(tmp_path: Path):
+    manifest = _manifest(tmp_path, b"synthetic official-notice fixture")
+    repo = manifest.parents[2]
+    fields = manifest.parent / "field-review.csv"
+    row = {
+        "sample_id": "sample-1", "event_type": "CASH_DIVIDEND", "field_name": "record_date",
+        "official_value": "2024-07-04", "source_published_date": "2024-06-28",
+        "source_title": "test", "source_url": "https://example.invalid/source.pdf",
+        "archive_path": "data/private/source.pdf",
+        "source_sha256": hashlib.sha256(b"synthetic official-notice fixture").hexdigest(),
+        "page_reference": "PDF第1页", "machine_extracted_value": "2024/7/4",
+        "review_status": "VERIFIED_FROM_ANNOUNCEMENT", "reviewed_by": "", "reviewed_at": "",
+        "notes": "", "reviewer_excerpt": "", "reviewer_reason": "", "reviewed_source_sha256": "",
+    }
+    with fields.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row), lineterminator="\n")
+        writer.writeheader()
+        writer.writerow(row)
+
+    with pytest.raises(ValueError, match="和日期"):
+        build_accounting_sample_review_pack(manifest, fields, repo / "outputs" / "bad-review-pack")

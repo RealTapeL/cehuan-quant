@@ -6,6 +6,70 @@
 
 这条边界刻意保守：新公告可能是更正，也可能改变 checkpoint 前已经建立的持仓权利、税务批次或价格处理。仅凭事件生效日期在未来，不能证明它不会回溯影响历史。
 
+## 只读预检器（研究用，不放行续跑）
+
+`src/cehuan/backtest/incremental_inputs.py` 提供第一版兼容性预检。它比较两份显式输入证明，并报告候选追加、历史变化、阻断原因和可能受影响日期。它**不会**修改 checkpoint，也不会改变 `run_backtest()` 当前的完整输入哈希校验；报告中的 `can_continue` 和 `engine_resume_supported` 始终为 `false`。
+
+命令：
+
+```bash
+uv run python scripts/audit_checkpoint_incremental_inputs.py \
+  --checkpoint data/private/checkpoints/backtest_checkpoint.json \
+  --baseline-proof data/private/checkpoints/input-proof-baseline.json \
+  --candidate-proof data/private/checkpoints/input-proof-candidate.json \
+  --output outputs/checkpoint-incremental-audit/report.json
+```
+
+输入证明 JSON 的 schema_version 为 1，结构示意：
+
+```json
+{
+  "schema_version": 1,
+  "increment_id": "opaque-stable-id-for-this-import",
+  "checkpoint": {
+    "state_sha256": "<checkpoint state SHA-256>",
+    "as_of_date": "2025-01-13",
+    "next_expected_session": "2025-01-14",
+    "decision_cutoff_utc": "2025-01-13T08:00:00Z",
+    "cutoff_source": "明确说明截止时间依据的来源",
+    "cutoff_source_sha256": "<evidence SHA-256>",
+    "applied_increment_ids": [],
+    "applied_increment_sha256s": []
+  },
+  "inputs": {
+    "strategy_config_sha256": "<SHA-256>",
+    "historical_bars_prefix_sha256": "<SHA-256>",
+    "events": [{
+      "event_id": "event-id",
+      "content_sha256": "<canonical event SHA-256>",
+      "first_impact_date": "2025-01-15",
+      "known_at_utc": "2025-01-13T08:01:00Z",
+      "source_sha256": "<source SHA-256>"
+    }],
+    "calendar": [{"date": "2025-01-14", "is_open": true}],
+    "rules": [{
+      "row_id": "rule-id", "valid_from": "2025-01-15", "valid_to": null,
+      "content_sha256": "<canonical row SHA-256>",
+      "known_at_utc": "2025-01-13T08:01:00Z", "source_sha256": "<source SHA-256>"
+    }],
+    "fees": []
+  }
+}
+```
+
+执行约束：
+
+- 实际 checkpoint 必须先通过 `read_backtest_checkpoint()` 的封存校验，且 baseline proof 的 checkpoint 哈希、截止日和下一开市日必须与它一致。
+- 截止时点必须由调用者显式提供来源及 SHA-256；工具不从 `as_of_date` 推断盘前/盘后时刻，也不验证来源文件内容的法律或业务含义。
+- baseline 中每条已使用事件也需要带时区 `known_at_utc`。若旧事件只有公告日期或缺少首次可得证据，预检会报告历史来源证明不足并要求重新计算；不能用新造的 cutoff 替旧输入补证。
+- 事件只有在 ID 为新增、来源和内容哈希有效、`known_at_utc` 严格晚于截止时点且 `first_impact_date` 晚于 checkpoint 日时，才会列为候选新增。事件更正、删除、晚到影响历史或精确时点不明都阻断。
+- 日历只接受新增的未来日期。已有日期不能修改或删除；原 checkpoint 记录的下一开市日必须仍然存在且保持开市。
+- 新规则和费率要求未来生效、截止时点之后才可得，并提供行内容和来源哈希。当前项目规则/费率 CSV 没有 `known_at_utc`，因此直接把新行导入现有表还不能满足此预检。
+- 策略配置及已使用行情前缀必须保持相同哈希。重复 `increment_id` 或相同追加内容摘要会被报告为已应用；baseline 与 candidate 必须引用同一份 checkpoint 状态及已应用增量登记。
+- 报告是候选兼容性证据，不是输入合并器或收益验证；增量事件重复应用、跨窗口账本/成交/NAV 一致性，以及与连续运行等价仍未由本预检器实现。
+
+报告至少包含 `candidate_append_compatible`、`can_continue`、`engine_resume_supported`、追加项、变更项、阻断项、最早可能影响日期和是否需要重算。若只有整体前缀哈希变化而没有逐行差异，日期精度会明确标成未知，不能猜测一个回溯起点。
+
 ## 未来增量输入的候选规则
 
 如果以后实现增量续跑，输入必须分成不可变历史前缀与可追加未来后缀，并对每类输入分别核验：
@@ -23,4 +87,6 @@
 
 ## 当前验收状态
 
-本轮合成测试固定了当前严格行为：改变已处理日历内容、只追加未来日历日期、在 checkpoint 后增加未来已知公司行动，都会拒绝续跑。上述候选规则只是设计契约，尚未开放增量输入路径。直到增量合并、晚到更正、重复应用与连续/分段一致性均有实现和测试前，继续使用完整哈希相等校验。
+预检器的单元测试覆盖未来事件追加、历史影响事件、事件更正、盘前/盘后边界、日期级时点拒绝、未来日历追加、历史日历修改、未来规则附证、历史费用变化和重复增量 ID。它们验证的是**报告分类逻辑**，不是策略状态的实际增量续跑。
+
+直到增量合并、晚到更正、重复应用、完整策略 checkpoint 续跑与连续/分段成交、账本和 NAV 一致性都进入引擎并通过测试前，继续使用完整哈希相等校验。正式基线状态也不因这个预检器改变。

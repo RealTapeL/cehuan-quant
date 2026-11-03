@@ -6,7 +6,7 @@
 
 字段清单位于 [corporate-action-sample-audit.csv](evidence/corporate-action-sample-audit.csv)。程序读取清单中的私有原件和文本提取文件，核对原件 SHA-256 与公告文本所含字段 token：
 
-可逐字段人工签认的表是 [corporate-action-sample-field-review.csv](evidence/corporate-action-sample-field-review.csv)。每个公告值各占一行，`review_status` 目前全部为 `PENDING`，`reviewed_by`/`reviewed_at` 留空。自动读取文本或校验哈希不会替维护者签认；审阅者应对照归档 PDF 页码填写结论，并保留未知值，不推测公告没给出的精确首次可得时刻。
+可逐字段人工签认的表是 [corporate-action-sample-field-review.csv](evidence/corporate-action-sample-field-review.csv)。23 个字段各占一行，`review_status` 目前全部为 `PENDING`，`reviewed_by`、`reviewed_at`、人工摘录、理由和复核原件哈希均留空。`suggested_review_outcome`/`review_guidance` 是待人工检查的机器建议，不能当成复核结论。自动读取文本或校验哈希不会替维护者签认；审阅者应对照归档 PDF 页码填写结论，并保留未知值，不推测公告没给出的精确首次可得时刻。
 
 ```bash
 uv run python -m cehuan.data.accounting_sample_audit --manifest docs/evidence/corporate-action-sample-audit.csv --output data/private/audits/corporate-action-samples-20261103/automated-audit.json
@@ -35,6 +35,15 @@ uv run python scripts/run_synthetic_action_diagnostic.py --output outputs/synthe
 ```
 
 此脚本只在虚构行情中安排同日分红与送转，复用事件日期和比例作为测试场景背景；它使用合成 `ActionSource`、合成持仓及发放时零预扣假设，不读取上述三条待签认表，也不使用私有行情或账户数据。它可验证登记日共享持仓快照、双事件仅过账一次、股数和 NAV 口径、以及未决未来税务状态；输出仍是 `synthetic_ledger_v2_research_diagnostic`，不能称为真实公告短区间回测或正式绩效。
+
+代码变更的合成穿透案例：
+
+```bash
+uv run python scripts/run_synthetic_code_change_diagnostic.py \
+  --output outputs/synthetic-code-change-diagnostic
+```
+
+该脚本生成虚构的 `SZ300114 → SZ302132` 1:1 事件和行情，并检查持股数量、成本、现金及普通成交数在代码迁移当日守恒。它没有读取中航成飞公告字段表，不证明真实账户持仓或点时信息。两个脚本均只验证**账务与报告流程**，不构成真实公告短区间诊断。真实公告诊断仍需实际复核人完成字段签认、取得可核查的公告首次可得时点或保守边界、以及准备并标记虚构期初持仓和适用行情/规则。
 
 公告分别来自[明星电力实施公告](https://static.cninfo.com.cn/finalpage/2024-06-28/1220480655.PDF)和[中航成飞代码变更实施公告](https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF)。PDF 原件保存在被 Git 忽略的 `data/private/evidence/` 下；本机登记哈希分别为：
 
