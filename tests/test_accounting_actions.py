@@ -179,17 +179,20 @@ def test_deferred_dividend_tax_tracks_lots_payment_cash_sales_and_account_reconc
     assert before_payment.valuation_tax_scope == "GROSS_CASH_EXCLUDING_UNRESOLVED_FUTURE_DIVIDEND_TAX"
     assert before_payment.unresolved_dividend_tax_count == 2
 
-    ledger.settle_receivable(
+    payment_entries = ledger.settle_receivable(
         "dividend:div-1",
         settled_on="2026-11-10",
-        actual_withheld_tax_cny=Decimal("0"),
+        actual_withheld_tax_cny=Decimal("0.50"),
         payment_evidence_id="statement-line-1",
         payment_evidence_sha256="e" * 64,
     )
-    assert ledger.cash_cny == Decimal("100.00")
+    assert ledger.cash_cny == Decimal("99.50")
     settled = next(item for item in ledger.receivables if item.event_id == event.event_id)
-    assert settled.payment_withheld_tax_cny == Decimal("0.00")
+    assert settled.payment_withheld_tax_cny == Decimal("0.50")
     assert settled.payment_withholding_is_account_evidence
+    payment_details = dict(payment_entries[0].details)
+    assert payment_details["payment_withholding_policy_estimate_cny"] == "0.00"
+    assert payment_details["payment_withholding_actual_vs_policy_delta_cny"] == "0.50"
     assert all(item.tax_status == "RECEIVED_TAX_PENDING" for item in ledger.dividend_tax_records)
 
     code_change = CodeChangeEvent(
@@ -226,7 +229,7 @@ def test_deferred_dividend_tax_tracks_lots_payment_cash_sales_and_account_reconc
         account_evidence_sha256=evidence["sha"],
     )
     cash_after_reconciliation = ledger.cash_cny
-    assert cash_after_reconciliation == Decimal("596.75")
+    assert cash_after_reconciliation == Decimal("596.25")
     assert ledger.reconcile_dividend_tax(
         first_record.record_id,
         reconciled_sold_shares=50,

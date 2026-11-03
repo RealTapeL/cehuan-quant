@@ -347,6 +347,10 @@ def run_backtest(
         raise ValueError("期初账本快照仅支持 --diagnostic --accounting-mode ledger_v2")
     if backtest_checkpoint is not None and accounting_mode != "ledger_v2":
         raise ValueError("完整策略 checkpoint 仅支持 --diagnostic --accounting-mode ledger_v2")
+    if backtest_checkpoint is not None:
+        if not isinstance(backtest_checkpoint, BacktestCheckpoint):
+            raise ValueError("backtest_checkpoint 必须是经过校验的 BacktestCheckpoint")
+        backtest_checkpoint.require_sealed()
     if backtest_checkpoint is not None and opening_accounting_snapshot is not None:
         raise ValueError("完整策略 checkpoint 已包含账本快照，不能再单独传入期初账本快照")
     if (backtest_checkpoint is not None or trading_calendar is not None) and formal:
@@ -1797,6 +1801,51 @@ def run_backtest(
             benchmark_symbol=checkpoint_benchmark_symbol,
             benchmark_previous_close_cny=benchmark_previous_close,
         ).sealed()
+    final_tax_scope = (
+        str(curve["valuation_tax_scope"].iloc[-1])
+        if "valuation_tax_scope" in curve else "NOT_APPLICABLE"
+    )
+    tax_records = execution_ledger.dividend_tax_records if execution_ledger is not None else ()
+    unresolved_tax_records = [
+        record for record in tax_records
+        if record.tax_status not in {"FINAL_TAX_MODELED", "RECONCILED"}
+    ]
+    dividend_tax_review = {
+        "status": (
+            "UNRESOLVED_FUTURE_DIVIDEND_TAX" if unresolved_tax_records
+            else "NO_UNRESOLVED_DIVIDEND_TAX" if execution_ledger is not None
+            else "NOT_APPLICABLE"
+        ),
+        "valuation_tax_scope": final_tax_scope,
+        "nav_includes_unresolved_future_tax": False if unresolved_tax_records else None,
+        "unresolved_record_count": len(unresolved_tax_records),
+        "unresolved_records": [
+            {
+                "event_id": record.event_id,
+                "symbol": record.symbol,
+                "lot_id": record.lot_id,
+                "acquired_on": record.acquired_on.isoformat(),
+                "entitled_shares": record.entitled_shares,
+                "remaining_shares": record.remaining_shares,
+                "sold_shares": record.sold_shares,
+                "gross_dividend_cny": str(record.gross_dividend_cny),
+                "payment_withheld_tax_cny": (
+                    None if record.payment_withheld_tax_cny is None else str(record.payment_withheld_tax_cny)
+                ),
+                "payment_withholding_is_account_evidence": record.payment_withholding_is_account_evidence,
+                "tax_treatment": record.tax_treatment,
+                "tax_status": record.tax_status,
+                "account_evidence_id": record.account_evidence_id,
+                "account_evidence_sha256": record.account_evidence_sha256,
+            }
+            for record in unresolved_tax_records
+        ],
+        "interpretation": (
+            "NAV 使用已到账现金/已知发放日预扣口径；未核实的未来分红税不从 NAV 扣除。"
+            "发放日预扣为零不代表后续转让税款为零。"
+            if unresolved_tax_records else "当前回测末日没有未决分红税批次。"
+        ),
+    }
     metrics.update({
         "experiment_id": f"chq-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}",
         "strategy_id": str(strategy["name"]),
@@ -1821,6 +1870,7 @@ def run_backtest(
         "dividend_tax_valuation_scope": (
             str(curve["valuation_tax_scope"].iloc[-1]) if "valuation_tax_scope" in curve else "NOT_APPLICABLE"
         ),
+        "dividend_tax_review": dividend_tax_review,
         "unresolved_dividend_tax_count_at_end": (
             int(curve["unresolved_dividend_tax_count"].iloc[-1])
             if "unresolved_dividend_tax_count" in curve else 0

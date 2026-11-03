@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from decimal import Decimal
@@ -158,8 +159,16 @@ class BacktestCheckpoint:
         object.__setattr__(self, "benchmark_symbol", self.benchmark_symbol.strip().upper() if self.benchmark_symbol else None)
         object.__setattr__(self, "benchmark_previous_close_cny", benchmark_close)
         object.__setattr__(self, "source_data_path", str(Path(self.source_data_path).expanduser().resolve()) if self.source_data_path else None)
-        if self.state_sha256 and self.state_sha256 != self.calculate_state_sha256():
-            raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
+        state_hash = self.state_sha256
+        if not isinstance(state_hash, str):
+            raise ValueError("checkpoint state_sha256 必须是非空 SHA-256 字符串")
+        if state_hash:
+            state_hash = state_hash.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", state_hash):
+                raise ValueError("checkpoint state_sha256 必须是 64 位十六进制 SHA-256")
+            object.__setattr__(self, "state_sha256", state_hash)
+            if state_hash != self.calculate_state_sha256():
+                raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
 
     def _payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -170,11 +179,19 @@ class BacktestCheckpoint:
         data = json.dumps(self._payload(), ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
+    def require_sealed(self) -> None:
+        """Reject in-memory checkpoints that have not crossed a verified seal boundary."""
+        if not isinstance(self.state_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.state_sha256):
+            raise ValueError("backtest checkpoint 未封存：state_sha256 必须是 64 位十六进制 SHA-256")
+        if self.state_sha256 != self.calculate_state_sha256():
+            raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
+
     def sealed(self) -> "BacktestCheckpoint":
         return replace(self, state_sha256=self.calculate_state_sha256())
 
     def to_dict(self) -> dict[str, Any]:
-        sealed = self if self.state_sha256 else self.sealed()
+        self.require_sealed()
+        sealed = self
         payload = asdict(sealed)
         payload["as_of_date"] = sealed.as_of_date.isoformat()
         payload["next_expected_session"] = sealed.next_expected_session.isoformat()
@@ -206,6 +223,17 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
     missing = required.difference(value)
     if missing:
         raise ValueError("backtest checkpoint 缺少字段：" + ", ".join(sorted(missing)))
+    raw_state_hash = value["state_sha256"]
+    if not isinstance(raw_state_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw_state_hash.strip()):
+        raise ValueError("checkpoint state_sha256 必须是非空的 64 位十六进制 SHA-256")
+    raw_payload = dict(value)
+    raw_payload.pop("state_sha256", None)
+    canonical_payload = json.dumps(
+        raw_payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"),
+    )
+    observed_state_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    if observed_state_hash != raw_state_hash.strip().lower():
+        raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
     history = tuple(SignalHistoryBar(
         symbol=str(row["symbol"]), trade_date=row["trade_date"],
         close_cny=Decimal(str(row["close_cny"])),
@@ -248,7 +276,7 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
             None if value.get("benchmark_previous_close_cny") is None
             else Decimal(str(value["benchmark_previous_close_cny"]))
         ),
-        state_sha256=str(value["state_sha256"]),
+        state_sha256=raw_state_hash,
     )
 
 
@@ -261,6 +289,7 @@ def read_backtest_checkpoint(path: str | Path) -> BacktestCheckpoint:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"backtest checkpoint JSON 无法解析：{checkpoint_path}") from exc
     checkpoint = backtest_checkpoint_from_dict(payload)
+    checkpoint.require_sealed()
     if checkpoint.source_data_path:
         bound_path = Path(checkpoint.source_data_path)
         if not bound_path.is_file():

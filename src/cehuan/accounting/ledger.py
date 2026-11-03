@@ -114,7 +114,11 @@ class PortfolioLedger:
             phase = entry.phase.upper()
             if phase == "FILL":
                 family = "TRADE_FILL"
-            elif phase.startswith("DIVIDEND_") or phase == "DIVIDEND_PAYMENT":
+            elif (
+                phase.startswith("DIVIDEND_")
+                or phase in {"DIVIDEND_PAYMENT", "RECEIVABLE_SETTLEMENT"}
+                or phase.startswith("DIVIDEND_TAX_RECONCILIATION:")
+            ):
                 family = "CASH_DIVIDEND"
             elif phase.startswith("DISTRIBUTION_") or phase == "SHARE_DISTRIBUTION":
                 family = "SHARE_DISTRIBUTION"

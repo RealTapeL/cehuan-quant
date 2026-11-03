@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 
 from cehuan.backtest.engine import run_backtest
 from cehuan.backtest.engine import _require_code_change_open_eligibility
-from cehuan.backtest.checkpoint import backtest_checkpoint_from_dict
+from cehuan.backtest.checkpoint import backtest_checkpoint_from_dict, read_backtest_checkpoint
 from cehuan.accounting import ActionSource, CashDividendEvent, CodeChangeEvent
 from cehuan.config import load_config
 from cehuan.data.fee_schedule import calculate_scheduled_fees, map_fee_schedule_to_sessions, normalize_fee_schedule
@@ -122,10 +123,12 @@ def _open_calendar(start: date, days: int) -> pd.DataFrame:
 
 
 def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_signal(tmp_path):
+    import json
+
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     config["market"].update({"buy_lot_shares": 1, "sell_lot_shares": 1})
-    data = _bars(16).copy()
+    data = _bars(19).copy()
     data["is_listed"] = True
     data["is_suspended"] = False
     data["is_st"] = False
@@ -135,8 +138,9 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
     data["sell_step_shares"] = 1
     second_symbol_rows = data["symbol"] == "SZ000002"
     for offset, row_index in enumerate(data.index[second_symbol_rows]):
-        close = 30.0 + 0.50 * offset
-        previous = 30.0 + 0.50 * max(0, offset - 1)
+        close = 30.0 + 0.50 * min(offset, 12) + 2.50 * max(0, offset - 12)
+        previous_offset = max(0, offset - 1)
+        previous = 30.0 + 0.50 * min(previous_offset, 12) + 2.50 * max(0, previous_offset - 12)
         data.loc[row_index, ["open", "high", "low", "close", "adjusted_close"]] = [
             previous, max(previous, close) + 0.05, min(previous, close) - 0.05, close, close,
         ]
@@ -153,7 +157,7 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
     rename_mask = (data["symbol"] == "SZ000001") & (data["trade_date"] >= "2025-01-12")
     data.loc[rename_mask, "symbol"] = "SZ000003"
     data.loc[rename_mask, "name"] = "SZ000003"
-    calendar = _open_calendar(date(2025, 1, 1), 17)
+    calendar = _open_calendar(date(2025, 1, 1), 20)
     empty_identity = pd.DataFrame(columns=[
         "event_id", "old_symbol", "new_symbol", "effective_date", "share_ratio",
         "ratio_basis", "security_identity", "event_status", "evidence_type", "evidence_url", "evidence_summary",
@@ -165,44 +169,67 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
     dividend = CashDividendEvent(
         event_id="checkpoint-cross-window-dividend",
         symbol="SZ000003",
-        record_date="2025-01-13",
-        ex_date="2025-01-14",
-        payable_date="2025-01-14",
+        record_date="2025-01-12",
+        ex_date="2025-01-13",
+        payable_date="2025-01-13",
         gross_per_share_cny=Decimal("0.05"),
         known_at_utc="2025-01-01T08:00:00Z",
         source=_action_source(),
     )
     accounting_events = (dividend, code_change)
-    input_path = tmp_path / "window-1-bars.csv"
-    data.iloc[:13].to_csv(input_path, index=False)
     first_bars = data.loc[data["trade_date"] <= "2025-01-13"].copy()
+    input_path = tmp_path / "window-1-bars.csv"
+    first_bars.to_csv(input_path, index=False)
     continuous = run_backtest(
         data, 100_000, config, accounting_mode="ledger_v2",
         security_identity_events=empty_identity, corporate_actions=empty_actions,
         accounting_events=accounting_events,
-        dividend_tax_cny_by_event={dividend.event_id: Decimal("0")},
+        dividend_tax_treatment_by_event={dividend.event_id: "DEFERRED_BY_HOLDING_PERIOD"},
+        dividend_payment_withholding_per_share_cny_by_event={dividend.event_id: Decimal("0")},
         trading_calendar=calendar,
     )
     first = run_backtest(
         first_bars, 100_000, config, accounting_mode="ledger_v2",
         security_identity_events=empty_identity, corporate_actions=empty_actions,
         accounting_events=accounting_events,
-        dividend_tax_cny_by_event={dividend.event_id: Decimal("0")},
+        dividend_tax_treatment_by_event={dividend.event_id: "DEFERRED_BY_HOLDING_PERIOD"},
+        dividend_payment_withholding_per_share_cny_by_event={dividend.event_id: Decimal("0")},
         trading_calendar=calendar, source_data_path=input_path,
     )
-    checkpoint = backtest_checkpoint_from_dict(first["backtest_checkpoint"].to_dict())
+    checkpoint_path = tmp_path / "strategy-checkpoint.json"
+    checkpoint_path.write_text(
+        json.dumps(first["backtest_checkpoint"].to_dict(), default=str), encoding="utf-8",
+    )
+    checkpoint = read_backtest_checkpoint(checkpoint_path)
     assert checkpoint.as_of_date.isoformat() == "2025-01-13"
     assert checkpoint.next_expected_session.isoformat() == "2025-01-14"
     assert checkpoint.pending_targets
     assert ("SZ000003", 14) in checkpoint.transition_signal_ready_index
     assert checkpoint.previous_equity_cny > checkpoint.ledger_snapshot.cash_cny
+    assert checkpoint.ledger_snapshot.dividend_tax_records
+    assert first["equity_curve"].iloc[-1]["tax_review_status"] == "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX"
+    assert first["metrics"]["dividend_tax_review"]["nav_includes_unresolved_future_tax"] is False
+    assert first["metrics"]["dividend_tax_review"]["unresolved_record_count"] > 0
+
+    corrected_dividend = replace(dividend, gross_per_share_cny=Decimal("0.06"))
+    with pytest.raises(ValueError, match="公司行动事件或分红税务处理已变化"):
+        run_backtest(
+            data.loc[data["trade_date"] >= "2025-01-14"].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config,
+            accounting_mode="ledger_v2", security_identity_events=empty_identity,
+            corporate_actions=empty_actions, accounting_events=(corrected_dividend, code_change),
+            dividend_tax_treatment_by_event={dividend.event_id: "DEFERRED_BY_HOLDING_PERIOD"},
+            dividend_payment_withholding_per_share_cny_by_event={dividend.event_id: Decimal("0")},
+            backtest_checkpoint=checkpoint, trading_calendar=calendar,
+        )
 
     second = run_backtest(
         data.loc[data["trade_date"] >= "2025-01-14"].copy(),
         float(checkpoint.ledger_snapshot.cash_cny), config,
         accounting_mode="ledger_v2", security_identity_events=empty_identity,
         corporate_actions=empty_actions, accounting_events=accounting_events,
-        dividend_tax_cny_by_event={dividend.event_id: Decimal("0")},
+        dividend_tax_treatment_by_event={dividend.event_id: "DEFERRED_BY_HOLDING_PERIOD"},
+        dividend_payment_withholding_per_share_cny_by_event={dividend.event_id: Decimal("0")},
         backtest_checkpoint=checkpoint,
         trading_calendar=calendar,
     )
@@ -218,6 +245,19 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
     )
     assert second["accounting_journal"].to_dict("records") == continuous["accounting_journal"].to_dict("records")
     assert second["accounting_snapshot"] == continuous["accounting_snapshot"]
+    assert second["metrics"]["dividend_tax_review"]["unresolved_record_count"] > 0
+    assert second["metrics"]["dividend_tax_review"]["valuation_tax_scope"] == (
+        "GROSS_CASH_EXCLUDING_UNRESOLVED_FUTURE_DIVIDEND_TAX"
+    )
+    assert second["trades"]["side"].eq("SELL").any()
+    assert any(
+        item["sold_shares"] > 0
+        for item in second["metrics"]["dividend_tax_review"]["unresolved_records"]
+    )
+    assert all(
+        record["tax_status"] not in {"FINAL_TAX_MODELED", "RECONCILED"}
+        for record in second["metrics"]["dividend_tax_review"]["unresolved_records"]
+    )
     assert second["backtest_checkpoint"].global_session_index == continuous["backtest_checkpoint"].global_session_index
     assert second["accounting_snapshot"].receivables[0].status == "SETTLED"
     assert sum(
@@ -225,7 +265,7 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
         for entry in second["accounting_snapshot"].journal
     ) == 1
     assert not second["trades"].loc[
-        (second["trades"]["trade_date"] < "2025-01-15")
+        (second["trades"]["trade_date"] < "2025-01-14")
         & (second["trades"]["symbol"] == "SZ000003"),
         "side",
     ].eq("SELL").any()
@@ -254,7 +294,57 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
     with pytest.raises(ValueError, match="状态哈希不匹配"):
         backtest_checkpoint_from_dict(payload)
 
+    valid_payload = first["backtest_checkpoint"].to_dict()
+    invalid_hash_payloads = []
+    missing_hash = dict(valid_payload)
+    missing_hash.pop("state_sha256")
+    invalid_hash_payloads.append(missing_hash)
+    for invalid_hash in ("", None, "not-a-hash"):
+        invalid = dict(valid_payload)
+        invalid["state_sha256"] = invalid_hash
+        invalid_hash_payloads.append(invalid)
+    for invalid in invalid_hash_payloads:
+        with pytest.raises(ValueError, match="state_sha256"):
+            backtest_checkpoint_from_dict(invalid)
+
+    for field, value in (
+        ("previous_equity_cny", "123456"),
+        ("pending_targets", [["SZ000001", 0.25]]),
+    ):
+        invalid = dict(valid_payload)
+        invalid[field] = value
+        with pytest.raises(ValueError, match="状态哈希不匹配"):
+            backtest_checkpoint_from_dict(invalid)
+    invalid_cash = dict(valid_payload)
+    invalid_cash["ledger_snapshot"] = dict(valid_payload["ledger_snapshot"])
+    invalid_cash["ledger_snapshot"]["cash_cny"] = "1"
+    with pytest.raises(ValueError, match="状态哈希不匹配"):
+        backtest_checkpoint_from_dict(invalid_cash)
+    invalid_position = dict(valid_payload)
+    invalid_position["ledger_snapshot"] = dict(valid_payload["ledger_snapshot"])
+    invalid_position["ledger_snapshot"]["positions"] = [dict(row) for row in valid_payload["ledger_snapshot"]["positions"]]
+    assert invalid_position["ledger_snapshot"]["positions"]
+    invalid_position["ledger_snapshot"]["positions"][0]["total_shares"] += 1
+    with pytest.raises(ValueError, match="状态哈希不匹配"):
+        backtest_checkpoint_from_dict(invalid_position)
+    invalid_then_cleared = dict(valid_payload)
+    invalid_then_cleared["previous_equity_cny"] = "123456"
+    invalid_then_cleared["state_sha256"] = ""
+    with pytest.raises(ValueError, match="state_sha256"):
+        backtest_checkpoint_from_dict(invalid_then_cleared)
+
     checkpoint = first["backtest_checkpoint"]
+    unsealed = replace(checkpoint, state_sha256="")
+    with pytest.raises(ValueError, match="未封存"):
+        unsealed.to_dict()
+    with pytest.raises(ValueError, match="未封存"):
+        run_backtest(
+            data.loc[data["trade_date"] >= checkpoint.next_expected_session.isoformat()].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config, accounting_mode="ledger_v2",
+            security_identity_events=empty_identity, corporate_actions=empty_actions,
+            trading_calendar=calendar, backtest_checkpoint=unsealed,
+        )
+
     broken_calendar = calendar.loc[calendar["trade_date"] != checkpoint.next_expected_session.isoformat()]
     with pytest.raises(ValueError, match="交易日历"):
         run_backtest(
@@ -273,6 +363,50 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
             trading_calendar=calendar, backtest_checkpoint=checkpoint,
         )
     config["strategy"]["rebalance_sessions"] = 3
+
+    appended_calendar = pd.concat([
+        calendar,
+        pd.DataFrame([{
+            "trade_date": "2025-01-14", "is_open": True,
+            "source": "synthetic_calendar_future_extension",
+        }]),
+    ], ignore_index=True)
+    with pytest.raises(ValueError, match="完整交易日历版本已变化"):
+        run_backtest(
+            data.loc[data["trade_date"] >= checkpoint.next_expected_session.isoformat()].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config, accounting_mode="ledger_v2",
+            security_identity_events=empty_identity, corporate_actions=empty_actions,
+            trading_calendar=appended_calendar, backtest_checkpoint=checkpoint,
+        )
+
+    modified_history_calendar = calendar.copy()
+    modified_history_calendar.loc[0, "is_open"] = False
+    with pytest.raises(ValueError, match="完整交易日历版本已变化"):
+        run_backtest(
+            data.loc[data["trade_date"] >= checkpoint.next_expected_session.isoformat()].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config, accounting_mode="ledger_v2",
+            security_identity_events=empty_identity, corporate_actions=empty_actions,
+            trading_calendar=modified_history_calendar, backtest_checkpoint=checkpoint,
+        )
+
+    future_event = CashDividendEvent(
+        event_id="post-checkpoint-new-event",
+        symbol="SZ000001",
+        record_date="2025-01-09",
+        ex_date="2025-01-10",
+        payable_date="2025-01-10",
+        gross_per_share_cny=Decimal("0.01"),
+        known_at_utc="2025-01-07T18:00:00Z",
+        source=_action_source(),
+    )
+    with pytest.raises(ValueError, match="公司行动事件或分红税务处理已变化"):
+        run_backtest(
+            data.loc[data["trade_date"] >= checkpoint.next_expected_session.isoformat()].copy(),
+            float(checkpoint.ledger_snapshot.cash_cny), config, accounting_mode="ledger_v2",
+            security_identity_events=empty_identity, corporate_actions=empty_actions,
+            accounting_events=(future_event,), trading_calendar=calendar,
+            backtest_checkpoint=checkpoint,
+        )
     source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="历史行情文件已修改"):
         run_backtest(
@@ -281,6 +415,74 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
             security_identity_events=empty_identity, corporate_actions=empty_actions,
             trading_calendar=calendar, backtest_checkpoint=checkpoint,
         )
+
+
+def test_cli_rejects_checkpoint_with_empty_state_hash(tmp_path, monkeypatch, capsys):
+    import json
+
+    from cehuan.cli import main as cli_module
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    bars = _bars(10).copy()
+    bars["is_listed"] = True
+    bars["is_suspended"] = False
+    bars["is_st"] = False
+    bars_path = tmp_path / "bars.csv"
+    bars.to_csv(bars_path, index=False)
+    calendar = _open_calendar(date(2025, 1, 1), 11)
+    empty_identity = pd.DataFrame(columns=[
+        "event_id", "old_symbol", "new_symbol", "effective_date", "share_ratio",
+        "ratio_basis", "security_identity", "event_status", "evidence_type", "evidence_url", "evidence_summary",
+    ])
+    empty_actions = pd.DataFrame(columns=[
+        "event_id", "old_symbol", "old_last_trade_date", "delisting_date", "new_symbol",
+        "exchange_ratio", "cash_per_old_share_cny", "cash_settlement_date", "status", "source_url",
+    ])
+    first = run_backtest(
+        bars.iloc[:7], 100_000, config, accounting_mode="ledger_v2",
+        security_identity_events=empty_identity, corporate_actions=empty_actions,
+        trading_calendar=calendar,
+    )
+    checkpoint_payload = first["backtest_checkpoint"].to_dict()
+    checkpoint_payload["state_sha256"] = ""
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(json.dumps(checkpoint_payload, default=str), encoding="utf-8")
+    calendar_path = tmp_path / "calendar.csv"
+    calendar.to_csv(calendar_path, index=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[data]\nprovider='eastmoney'\nlarge_daily_price_change_warning=0.5\n"
+        "[strategy]\nname='cli-checkpoint-test'\nlookback_sessions=3\nrebalance_sessions=3\n"
+        "max_positions=1\nmax_position_weight=0.5\nmax_total_exposure=0.5\nmin_momentum=0.0\n"
+        "[market]\nexclude_st=true\nrequire_point_in_time_status=true\nbuy_lot_shares=1\n"
+        "sell_lot_shares=1\ndefault_price_limit_pct=0.1\nassume_price_limit_applies_when_unknown=true\n"
+        "price_tick_cny=0.01\n[costs]\ncommission_rate=0.0\nminimum_commission_cny=0.0\n"
+        "stamp_duty_sell_rate=0.0\ntransfer_fee_rate=0.0\nslippage_bps=0.0\n"
+        "[backtest]\nmax_stale_price_age_sessions=0\ndevelopment_fraction=0.6\nvalidation_fraction=0.2\n"
+        "rolling_window_sessions=6\nrolling_step_sessions=3\n[benchmark]\nsymbol=''\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_module, "REPO_ROOT", Path(__file__).resolve().parents[1])
+    cli_args = [
+        "backtest", "--data", str(bars_path), "--cash", "100000", "--config", str(config_path),
+        "--identity-events", str(Path(__file__).resolve().parents[1] / "examples/empty_security_identity_events.csv"),
+        "--corporate-actions", str(Path(__file__).resolve().parents[1] / "examples/empty_corporate_actions.csv"),
+        "--diagnostic", "--accounting-mode", "ledger_v2", "--backtest-checkpoint", str(checkpoint_path),
+        "--trading-calendar", str(calendar_path),
+    ]
+    result = cli_module.main(cli_args)
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "state_sha256" in captured.err
+
+    tampered_payload = first["backtest_checkpoint"].to_dict()
+    tampered_payload["previous_equity_cny"] = "123456"
+    checkpoint_path.write_text(json.dumps(tampered_payload, default=str), encoding="utf-8")
+    tampered_result = cli_module.main(cli_args)
+    tampered_output = capsys.readouterr()
+    assert tampered_result == 1
+    assert "状态哈希不匹配" in tampered_output.err
 
 
 def test_rule_schedule_asof_join_overwrites_bar_status_and_respects_effective_boundary():
