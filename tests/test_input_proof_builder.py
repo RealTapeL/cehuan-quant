@@ -309,6 +309,12 @@ def test_builder_reconstructs_checkpoint_hashes_and_leaves_missing_proofs_unveri
     assert report["normalized_inputs_binding_valid"] == "VERIFIED"
     assert report["source_content_review_status"] == "UNVERIFIED"
     assert report["known_at_evidence_status"] == "UNVERIFIED"
+    assert report["provided_input_artifact_hashes_valid"] == "VERIFIED"
+    assert report["source_provenance_evidence_file_hash_valid"] == "UNVERIFIED"
+    assert report["decision_cutoff_evidence_file_hash_valid"] == "UNVERIFIED"
+    assert report["input_file_hashes_valid"] == "UNVERIFIED"
+    assert report["input_files_binding_valid"] == "UNVERIFIED"
+    assert report["input_file_hashes_summary"]["overall_gate_unchanged"] is True
     assert report["can_continue"] is False
     comparison = audit_incremental_inputs(proof, proof)
     assert comparison["can_continue"] is False
@@ -540,6 +546,11 @@ def test_rebuild_cli_writes_expected_artifacts_without_mutating_checkpoint(tmp_p
     assert audit.returncode == 0, audit.stderr
     preflight = json.loads(audit_path.read_text(encoding="utf-8"))
     assert preflight["normalized_inputs_binding_valid"] == "VERIFIED"
+    assert preflight["provided_input_artifact_hashes_valid"] == "VERIFIED"
+    assert preflight["source_provenance_evidence_file_hash_valid"] == "UNVERIFIED"
+    assert preflight["decision_cutoff_evidence_file_hash_valid"] == "UNVERIFIED"
     assert preflight["input_file_hashes_valid"] == "UNVERIFIED"
+    assert preflight["input_files_binding_valid"] == "UNVERIFIED"
+    assert preflight["input_file_hashes_summary"]["overall_gate_unchanged"] is True
     assert preflight["can_continue"] is False
     assert preflight["engine_resume_supported"] is False

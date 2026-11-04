@@ -244,6 +244,14 @@ def _not_applicable_artifact(reason: str) -> dict[str, Any]:
     return {"path": None, "sha256": None, "not_applicable": True, "status": "VERIFIED", "detail": reason}
 
 
+def _audit_status(rows: list[Mapping[str, Any]]) -> str:
+    """Aggregate audit rows without treating missing evidence as a match."""
+    statuses = [str(row.get("status", "UNVERIFIED")) for row in rows]
+    if not statuses or "FAILED" in statuses:
+        return "FAILED" if "FAILED" in statuses else "UNVERIFIED"
+    return "UNVERIFIED" if "UNVERIFIED" in statuses else "VERIFIED"
+
+
 def _audit_claimed_proof_files(claimed: Any, claimed_path: Path) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(claimed, dict) or not isinstance(claimed.get("inputs"), dict):
         return "FAILED", [{"role": "claimed_proof", "status": "FAILED", "detail": "proof 缺少 inputs 对象"}]
@@ -1428,11 +1436,32 @@ def rebuild_checkpoint_input_proof(
     else:
         normalized_binding_status = "VERIFIED"
     file_audits = file_rows + proof_file_audit + claimed_file_audit
-    file_hash_status = (
-        "FAILED" if any(row.get("status") == "FAILED" for row in file_audits) else
-        "UNVERIFIED" if any(row.get("status") == "UNVERIFIED" for row in file_audits) else
-        "VERIFIED"
-    )
+    def is_cutoff_audit(row: Mapping[str, Any]) -> bool:
+        role = str(row.get("role", ""))
+        return row.get("input") == "cutoff_evidence" or any(
+            value in role for value in ("cutoff_evidence", "decision_cutoff_source")
+        )
+
+    def is_source_evidence_audit(row: Mapping[str, Any]) -> bool:
+        role = str(row.get("role", ""))
+        return row.get("input") == "provenance_registry" or role == "provenance_registry" or any(
+            role.startswith(f"{family}:")
+            for family in ("events", "rules", "fees", "identity_events", "corporate_actions")
+        )
+
+    cutoff_audits = [row for row in file_audits if is_cutoff_audit(row)]
+    source_evidence_audits = [row for row in file_audits if is_source_evidence_audit(row)]
+    provided_input_audits = [
+        row for row in file_audits
+        if not is_cutoff_audit(row) and not is_source_evidence_audit(row)
+    ]
+    provided_input_hash_status = _audit_status(provided_input_audits)
+    source_evidence_file_hash_status = _audit_status(source_evidence_audits)
+    cutoff_evidence_file_hash_status = _audit_status(cutoff_audits)
+    # Keep the legacy aggregate strict: required cutoff evidence remains part of
+    # the overall result. The component fields make a missing evidence file
+    # distinguishable from a hash mismatch in the market-data inputs.
+    file_hash_status = _audit_status(file_audits)
     canonical_status = (
         "FAILED" if generated_canonical_status == "FAILED" or claimed_canonical_status == "FAILED" else
         "UNVERIFIED" if generated_canonical_status == "UNVERIFIED" or claimed_canonical_status == "UNVERIFIED" else
@@ -1445,6 +1474,26 @@ def rebuild_checkpoint_input_proof(
         "checkpoint_binding_valid": checkpoint_binding_status,
         "input_file_hashes_valid": file_hash_status,
         "input_files_binding_valid": file_hash_status,
+        "provided_input_artifact_hashes_valid": provided_input_hash_status,
+        "source_provenance_evidence_file_hash_valid": source_evidence_file_hash_status,
+        "decision_cutoff_evidence_file_hash_valid": cutoff_evidence_file_hash_status,
+        "input_file_hashes_summary": {
+            "provided_input_artifacts": {
+                "status": provided_input_hash_status,
+                "checked_rows": len(provided_input_audits),
+            },
+            "source_provenance_evidence_files": {
+                "status": source_evidence_file_hash_status,
+                "checked_rows": len(source_evidence_audits),
+            },
+            "decision_cutoff_evidence": {
+                "status": cutoff_evidence_file_hash_status,
+                "checked_rows": len(cutoff_audits),
+                "reason": cutoff_status.get("reason"),
+            },
+            "overall_status": file_hash_status,
+            "overall_gate_unchanged": True,
+        },
         "canonical_payload_digest_valid": canonical_status,
         "normalized_inputs_binding_valid": normalized_binding_status,
         "can_continue": False,

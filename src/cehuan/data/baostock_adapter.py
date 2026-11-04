@@ -591,9 +591,10 @@ def normalize_baostock_history(
 ) -> tuple[pd.DataFrame, int]:
     """Map BaoStock raw fields and point-in-time flags to canonical daily bars.
 
-    `adjustflag=1` is retained as the feature price series; raw OHLC remains the
-    execution-price series. Suspended rows keep their carried prices and a zero
-    volume/amount when the vendor returns blanks for those fields.
+    `adjustflag=1` (BaoStock backward-adjusted / 后复权) is retained as the
+    feature price series; raw OHLC remains the execution-price series. Suspended
+    rows keep their carried prices and a zero volume/amount when the vendor
+    returns blanks for those fields.
     """
     required = {"date", "code", "open", "high", "low", "close", "volume", "amount", "tradestatus", "isST"}
     missing = required.difference(raw.columns)

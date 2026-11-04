@@ -14,7 +14,7 @@
 | 数据项 | 实测结果 | 缺口与适用边界 |
 |---|---|---|
 | 历史日线 | 4 只沪深股票各返回 4,080 行，日期 2010-01-04 至 2026-10-26；字段含 OHLC、成交量、成交额、`tradestatus`、`isST`。成交量按股、成交额按元映射。 | 是人工选定的四只代码，不是历史全市场池；早期退市和非当前证券不能据此代表总体。 |
-| 后复权与复权因子 | 每只样本都返回 `adjustflag=1` 价格序列和单独因子文件；因子条数依证券而异（17–22）。信号使用后复权收盘，模拟成交和估值使用原始 OHLC。 | 仍须保留快照版本；当前回测不核算现金分红、送转、配股和持仓股数变化。 |
+| 后复权与复权因子 | 4 只样本请求 `adjustflag=1` 后复权价格序列和单独因子文件；因子条数依证券而异（17–22）。信号使用后复权收盘，模拟成交和估值使用原始 OHLC。 | 后复权历史序列来自后来采集的快照，供应商 vintage 与历史可得时间仍未核实；当前回测不核算现金分红、送转、配股和持仓股数变化。 |
 | 交易日历 | 2010-01-01 至 2026-10-26 返回 6,143 个日历日，其中 4,080 个开市日；四只股票和沪深 300 的行情日期均通过日历校验。 | BaoStock 日历服务的持续更新和未来日期覆盖尚未建立定时监控。 |
 | 股票基础资料与市场覆盖 | 全量接口返回 9,022 条、含 5,564 条 `type=1` 股票记录；代码前缀实测为 `sh` 2,467 条、`sz` 3,097 条、`bj` 0 条；其中 1,200 条全部资产类型记录有非空退市日。2023–2025 年 727 份原始日期名单共 4,811,380 条，代码前缀为 `sh` 2,230,090 条、`sz` 2,581,290 条、其他前缀 0 条。 | 当前 BaoStock 快照只覆盖取得的沪深证券，北交所覆盖为 0；因此它不是完整 A 股全市场数据集。不能用当前北交所名单回填历史，完整全市场研究需先取得按历史日期可核验的北交所成员及行情来源。表中上市/退市日期可用于基础区间判断，不等于逐日挂牌状态和所有特殊证券事件。 |
 | 历史退市样本 | `SH600001` 基础资料记载退市日 2009-12-29；其历史日线查询在 2000-01-04 至 2009-12-29 返回 2,413 行，末日状态为 `tradestatus=0`。 | 这是单证券验证，不代表退市数据全覆盖。正式快照的四只样本都在 2010 年仍有行情。 |
@@ -33,7 +33,7 @@
 
 逐行机器可读证据保存在忽略目录 `data/private/audits/point-in-time-case-audit-202410-v1/case_audit.json`；腾讯行情副本及哈希在相邻目录 `price-anomaly-301551-202410-v1/`。以上是针对具体案例的抽查，不构成供应商整体完整性证明。
 
-BaoStock 官方 API 入口列有每日更新、历史 A 股 K 线和访问统计说明：[API 文档入口](https://www.baostock.com/api/)。官方证券基础资料文档列出上市日、退市日、类型和状态：[证券基本资料](https://www.baostock.com/mainContent?file=stockBasic.md)。官方复权说明提供复权因子查询及按原始日线构造复权价格的示例：[复权因子](https://www.baostock.com/mainContent?file=factorInfo.md)。官方[访问限制说明](https://www.baostock.com/blacklist)列出单日请求数和并发访问限制。包版本、Alpha 标记、免费数据描述及无发布 provenance 可在 [PyPI 项目页](https://pypi.org/project/baostock/)核对。
+BaoStock 官方 API 入口列有每日更新、历史 A 股 K 线和访问统计说明：[API 文档入口](https://www.baostock.com/api/)。官方 [Python API 文档](https://www.baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3)中 `query_history_k_data_plus()` 的 `adjustflag` 定义为 `1=后复权、2=前复权、3=不复权`。官方证券基础资料文档列出上市日、退市日、类型和状态：[证券基本资料](https://www.baostock.com/mainContent?file=stockBasic.md)。官方复权说明提供复权因子查询及按原始日线构造复权价格的示例：[复权因子](https://www.baostock.com/mainContent?file=factorInfo.md)。官方[访问限制说明](https://www.baostock.com/blacklist)列出单日请求数和并发访问限制。包版本、Alpha 标记、免费数据描述及无发布 provenance 可在 [PyPI 项目页](https://pypi.org/project/baostock/)核对。
 
 Tushare 官方接口分别列出股票基础信息、交易日历、停复牌、涨跌停价和历史 ST 数据：[股票基础信息](https://tushare.pro/document/1?doc_id=25)、[交易日历](https://tushare.pro/document/2?doc_id=26)、[每日停复牌](https://tushare.pro/document/2?doc_id=214)、[每日涨跌停价](https://tushare.pro/document/2?doc_id=183)、[历史 ST 名单](https://tushare.pro/document/2?doc_id=397)。当前官方权限表显示 `stock_basic` 和 `stk_limit` 的门槛为 2,000 积分起，`stock_st` 为 3,000 起；日线 `daily` 为 120 起，通用复权行情 `pro_bar` 为 2,000 起。积分只是接口最低权限门槛，实际频次随积分变化；本机未安装 Tushare 且没有可用 Token，因此未验证任何账户权限，也不据此推断用户拥有访问权。[Tushare 积分权限表](https://tushare.pro/document/1?doc_id=108)
 

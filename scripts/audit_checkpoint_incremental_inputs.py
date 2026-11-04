@@ -241,6 +241,51 @@ def main() -> int:
         else "VERIFIED" if all(item["status"] == "VERIFIED" for item in artifact_audit)
         else "UNVERIFIED"
     )
+    def is_cutoff_artifact(item: dict[str, str]) -> bool:
+        role = item.get("role", "")
+        return "cutoff_evidence" in role or "decision_cutoff_source" in role
+
+    def is_source_evidence_artifact(item: dict[str, str]) -> bool:
+        role = item.get("role", "")
+        return "provenance_registry" in role or any(
+            f":{family}:" in role or role.endswith(f":{family}")
+            for family in ("events", "rules", "fees", "identity_events", "corporate_actions")
+        )
+
+    cutoff_audit_rows = [item for item in artifact_audit if is_cutoff_artifact(item)]
+    source_evidence_audit_rows = [item for item in artifact_audit if is_source_evidence_artifact(item)]
+    provided_artifact_audit_rows = [
+        item for item in artifact_audit
+        if not is_cutoff_artifact(item) and not is_source_evidence_artifact(item)
+    ]
+
+    def aggregate_audit_status(rows: list[dict[str, str]]) -> str:
+        if any(item["status"] == "FAILED" for item in rows):
+            return "FAILED"
+        if not rows or any(item["status"] == "UNVERIFIED" for item in rows):
+            return "UNVERIFIED"
+        return "VERIFIED"
+
+    report["provided_input_artifact_hashes_valid"] = aggregate_audit_status(provided_artifact_audit_rows)
+    report["source_provenance_evidence_file_hash_valid"] = aggregate_audit_status(source_evidence_audit_rows)
+    report["decision_cutoff_evidence_file_hash_valid"] = aggregate_audit_status(cutoff_audit_rows)
+    report["input_file_hashes_summary"] = {
+        "provided_input_artifacts": {
+            "status": report["provided_input_artifact_hashes_valid"],
+            "checked_rows": len(provided_artifact_audit_rows),
+        },
+        "source_provenance_evidence_files": {
+            "status": report["source_provenance_evidence_file_hash_valid"],
+            "checked_rows": len(source_evidence_audit_rows),
+        },
+        "decision_cutoff_evidence": {
+            "status": report["decision_cutoff_evidence_file_hash_valid"],
+            "checked_rows": len(cutoff_audit_rows),
+            "reason": "缺少 cutoff evidence artifact" if report["decision_cutoff_evidence_file_hash_valid"] == "UNVERIFIED" else None,
+        },
+        "overall_status": report["input_file_hashes_valid"],
+        "overall_gate_unchanged": True,
+    }
     report["input_file_hash_audit"] = artifact_audit
     report["input_files_binding_valid"] = artifact_status
     rebuild_reports: list[dict[str, Any]] = []

@@ -301,6 +301,13 @@ def test_baostock_snapshot_is_chunked_and_resumable(tmp_path):
     assert (tmp_path / "resume-test" / "bars.csv").exists()
     manifest = json.loads((tmp_path / "resume-test" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["capture_policy_by_chunk"]["chunk-00001"]["minimum_interval_seconds"] == 1.0
+    assert manifest["field_mapping"]["signal_price"] == "adjustflag=1 back-adjusted close"
+    history_endpoints = [
+        request["endpoint"] for request in manifest["requests"]
+        if request["endpoint"].startswith("query_history_k_data_plus(")
+    ]
+    assert any(endpoint.endswith("adjustflag=1)") for endpoint in history_endpoints)
+    assert not any(endpoint.endswith("adjustflag=2)") for endpoint in history_endpoints)
 
 
 def test_baostock_final_manifest_keeps_each_new_chunk_request_log(tmp_path):

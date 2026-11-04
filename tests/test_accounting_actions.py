@@ -499,6 +499,54 @@ def test_rights_subscription_with_insufficient_cash_is_atomic_and_remains_unreso
     assert claim.final_allocated_shares is None
 
 
+def test_rights_partial_subscription_is_rejected_without_mutating_ledger():
+    event = _rights()
+    ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
+    ledger.record_rights_offering(event, as_of=event.record_date)
+    before_cash = ledger.cash_cny
+    before_journal = ledger.journal
+
+    with pytest.raises(ValueError, match="有效整数分配"):
+        ledger.decide_rights_offering(
+            event,
+            disposition="SUBSCRIBE",
+            as_of=event.subscription_start_date,
+            allocated_rights_shares=10,
+            allocation_evidence="synthetic partial subscription request",
+            subscription_fee_cny=Decimal("0.25"),
+        )
+
+    assert ledger.cash_cny == before_cash
+    assert ledger.journal == before_journal
+    assert ledger.claims[0].status == "RIGHTS_DISPOSITION_REQUIRED"
+
+
+def test_fractional_rights_require_evidenced_integer_allocation():
+    event = replace(_rights(), rights_per_old_share=Decimal("0.15"))
+    ledger = PortfolioLedger(Decimal("500"), positions=(_lot(shares=10, basis="100"),))
+    ledger.record_rights_offering(event, as_of=event.record_date)
+
+    with pytest.raises(ValueError, match="非整数时必须提供已核实的账户层股数"):
+        ledger.decide_rights_offering(
+            event, disposition="SUBSCRIBE", as_of=event.subscription_start_date,
+            subscription_fee_cny=Decimal("0.25"),
+        )
+
+    ledger.decide_rights_offering(
+        event,
+        disposition="SUBSCRIBE",
+        as_of=event.subscription_start_date,
+        allocated_rights_shares=1,
+        allocation_evidence="synthetic verified allocation fixture",
+        subscription_fee_cny=Decimal("0.25"),
+    )
+    claim = next(item for item in ledger.claims if item.event_id == event.event_id)
+    assert claim.exact_entitlement == Decimal("1.50")
+    assert claim.final_allocated_shares == 1
+    assert claim.cost_basis_cny == Decimal("5.25")
+    assert ledger.cash_cny == Decimal("494.75")
+
+
 def test_rights_claim_proxy_and_ledger_snapshot_resume_distinguish_registration_from_tradability():
     event = replace(_rights(), registration_date="2026-11-07")
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
