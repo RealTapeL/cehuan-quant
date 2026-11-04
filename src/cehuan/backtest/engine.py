@@ -1504,9 +1504,11 @@ def run_backtest(
                     })
             pending_targets = None
 
-        # Company-action accounting is applied after the simulated open fills:
-        # record-date entitlement reflects end-of-session holdings, accrual is
-        # recognized on ex-date, and payable cash is settled on its scheduled
+        # Research accounting convention: company-action entitlement snapshots
+        # follow same-day simulated open fills and therefore use end-of-session
+        # holdings. This is a reproducible model assumption, not confirmation of
+        # account-level depository treatment for every market/security/event.
+        # Accrual is recognized on ex-date and payable cash on its scheduled
         # date. Unknown receivable tax blocks NAV; unresolved future tax after
         # deferred-at-payment treatment is reported with an explicit gross scope.
         if execution_ledger is not None:

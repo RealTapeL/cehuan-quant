@@ -48,12 +48,16 @@ def _match_action_to_holding_windows(
     phase_dates: list[object],
     holding_windows: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Audit event timing against simulated holdings, including record-date sale rights.
+    """Match record-date events to the recorded end-of-day holding interval.
 
-    For A-share rights, a position acquired on the record date is not eligible,
-    while a position carried into the record date may remain eligible when sold
-    during that session. A phase after a qualifying record date remains attached
-    to the claim even if the ordinary shares have since been sold.
+    Candidate-generation convention for this audit: an ordinary A-share
+    holding interval is a possible record-date match when it includes the
+    record date, including an interval that starts with a record-date buy. A
+    position closed before the simulated end-of-day snapshot is not matched.
+    This does not confirm the depository's account-level entitlement: the
+    available exchange education page and settlement materials do not fully
+    align on same-day transaction treatment. Later event phases remain linked
+    only after a possible record-date match is established.
     """
     record_day = pd.to_datetime(record_date, errors="coerce")
     record_day = None if pd.isna(record_day) else record_day.date()
@@ -67,18 +71,10 @@ def _match_action_to_holding_windows(
     for holding in holding_windows.itertuples(index=False):
         start_day = pd.to_datetime(holding.holding_start_trade_date_at_open).date()
         held_through_day = pd.to_datetime(holding.held_at_end_of_day_through).date()
-        closure = str(getattr(holding, "closure", ""))
         exit_day_value = getattr(holding, "holding_end_trade_date_before_open", None)
         exit_day = None if pd.isna(exit_day_value) else pd.to_datetime(exit_day_value).date()
         interval_id = f"{holding.symbol}:{start_day}:{exit_day or held_through_day}"
-        # Acquired on record date does not qualify; selling on record date does.
-        entitled = record_day is not None and start_day < record_day <= held_through_day
-        entitled |= (
-            record_day is not None
-            and closure == "SOLD_AT_OPEN"
-            and exit_day == record_day
-            and start_day < record_day
-        )
+        entitled = record_day is not None and start_day <= record_day <= held_through_day
         if entitled:
             entitlement_matches.append(interval_id)
         if any(start_day <= day <= held_through_day for day in phases):
@@ -197,6 +193,104 @@ def _signal_inputs(
     }
 
 
+def _suspension_candidate_audit(
+    bars: pd.DataFrame,
+    ranked: pd.DataFrame,
+    trades: pd.DataFrame,
+    calendar: pd.DataFrame,
+    strategy: dict[str, Any],
+    symbol: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild one candidate's full row-based feature window and nearby ranks."""
+    symbol = str(symbol)
+    candidate_rows = ranked.loc[ranked["symbol"].astype(str).eq(symbol)]
+    if candidate_rows.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    sessions = sorted(pd.to_datetime(calendar.loc[
+        calendar["is_open"].astype(str).str.lower().isin(["true", "1"]), "trade_date"
+    ]).dt.strftime("%Y-%m-%d").unique())
+    lookback = int(strategy["lookback_sessions"])
+    history = bars.loc[bars["symbol"].astype(str).eq(symbol)].copy()
+    history["trade_date"] = history["trade_date"].astype(str)
+    history = history.sort_values("trade_date", kind="stable")
+    window_rows: list[dict[str, Any]] = []
+    neighbor_rows: list[dict[str, Any]] = []
+    for candidate in candidate_rows.sort_values("signal_date").itertuples(index=False):
+        signal_day = str(candidate.signal_date)
+        prior = history.loc[history["trade_date"].le(signal_day)]
+        if len(prior) <= lookback:
+            continue
+        window = prior.tail(lookback + 1).reset_index(drop=True)
+        session_pos = next((i for i, day in enumerate(sessions) if day == signal_day), None)
+        execution_day = sessions[session_pos + 1] if session_pos is not None and session_pos + 1 < len(sessions) else None
+        execution_rows = (
+            bars.loc[
+                bars["trade_date"].astype(str).eq(execution_day)
+                & bars["symbol"].astype(str).eq(symbol)
+            ] if execution_day else pd.DataFrame()
+        )
+        execution = execution_rows.iloc[0].to_dict() if len(execution_rows) == 1 else {}
+        execution_trades = trades.loc[
+            trades["trade_date"].astype(str).eq(execution_day)
+            & trades["symbol"].astype(str).eq(symbol)
+        ] if execution_day else pd.DataFrame()
+        target_row = {
+            "symbol": symbol,
+            "signal_date": signal_day,
+            "execution_date": execution_day,
+            "momentum": _as_float(candidate.momentum),
+            "rank": int(candidate.rank),
+            "selected_target": int(candidate.rank) <= int(strategy["max_positions"]),
+            "lookback_sessions": lookback,
+            "window_observations": len(window),
+            "execution_is_suspended": execution.get("is_suspended"),
+            "execution_open": execution.get("open"),
+            "execution_order_count": int(len(execution_trades)),
+            "execution_order_sides": ",".join(execution_trades["side"].astype(str).tolist()) if not execution_trades.empty else "NONE",
+            "execution_order_quantities": ",".join(execution_trades["quantity"].astype(str).tolist()) if not execution_trades.empty else "",
+            "window_suspended_observation_count": int(window["is_suspended"].fillna(False).astype(bool).sum()),
+            "window_zero_volume_observation_count": int(pd.to_numeric(window["volume_shares"], errors="coerce").fillna(-1).eq(0).sum()),
+            "window_status_source": ";".join(sorted(window["data_source"].dropna().astype(str).unique())) if "data_source" in window else "UNAVAILABLE",
+            "availability_note": "available_at is adapter-assigned close time; historical provider publication/vintage remains unverified",
+        }
+        for index, row in window.iterrows():
+            window_rows.append({
+                **target_row,
+                "observation_index": index,
+                "window_role": "LOOKBACK_BASE" if index == 0 else "SIGNAL_DATE" if index == len(window) - 1 else "LOOKBACK_OBSERVATION",
+                **row.to_dict(),
+            })
+        signal_neighbors = ranked.loc[
+            ranked["signal_date"].astype(str).eq(signal_day)
+            & ranked["rank"].between(max(1, int(candidate.rank) - 4), int(candidate.rank) + 5)
+        ].sort_values("rank")
+        for row in signal_neighbors.to_dict(orient="records"):
+            neighbor_execution_day = execution_day
+            neighbor_bar = bars.loc[
+                bars["trade_date"].astype(str).eq(neighbor_execution_day)
+                & bars["symbol"].astype(str).eq(str(row["symbol"]))
+            ] if neighbor_execution_day else pd.DataFrame()
+            neighbor_fills = trades.loc[
+                trades["trade_date"].astype(str).eq(neighbor_execution_day)
+                & trades["symbol"].astype(str).eq(str(row["symbol"]))
+            ] if neighbor_execution_day else pd.DataFrame()
+            neighbor_rows.append({
+                "signal_date": signal_day,
+                "execution_date": neighbor_execution_day,
+                "symbol": str(row["symbol"]),
+                "name": row.get("name"),
+                "rank": int(row["rank"]),
+                "momentum": _as_float(row.get("momentum")),
+                "selected_target": int(row["rank"]) <= int(strategy["max_positions"]),
+                "signal_day_is_suspended": row.get("is_suspended"),
+                "execution_bar_count": len(neighbor_bar),
+                "execution_is_suspended": neighbor_bar.iloc[0].get("is_suspended") if len(neighbor_bar) == 1 else None,
+                "execution_order_sides": ",".join(neighbor_fills["side"].astype(str).tolist()) if not neighbor_fills.empty else "NONE",
+                "execution_order_quantities": ",".join(neighbor_fills["quantity"].astype(str).tolist()) if not neighbor_fills.empty else "",
+            })
+    return pd.DataFrame(window_rows), pd.DataFrame(neighbor_rows)
+
+
 def _reconstruct_targets(
     trades: pd.DataFrame,
     candidates: pd.DataFrame,
@@ -240,15 +334,27 @@ def _reconstruct_targets(
             float(strategy["max_total_exposure"]) / len(selected),
         ) if not selected.empty else 0.0
         target_shares: dict[str, int] = {}
+        target_details: dict[str, dict[str, float | int]] = {}
         for item in selected.itertuples(index=False):
             bar = bars_by_day_symbol.loc[(execution_date, item.symbol)]
             if isinstance(bar, pd.DataFrame):
                 raise ValueError(f"成交日行情不唯一：{item.symbol} {execution_date}")
-            raw_target = int(open_value * weight / float(bar["open"]))
+            target_amount = open_value * weight
+            opening_price = float(bar["open"])
+            raw_target = int(target_amount / opening_price)
+            minimum = int(market["buy_lot_shares"])
+            step = int(market["buy_lot_shares"])
+            target_details[item.symbol] = {
+                "target_amount_cny": target_amount,
+                "execution_open_price_cny": opening_price,
+                "raw_target_shares_before_rounding": raw_target,
+                "buy_minimum_shares_from_config_fallback": minimum,
+                "buy_step_shares_from_config_fallback": step,
+            }
             target_shares[item.symbol] = _round_order_quantity(
                 raw_target,
-                int(market["buy_lot_shares"]),
-                int(market["buy_lot_shares"]),
+                minimum,
+                step,
             )
         day_actual = trades.loc[trades["trade_date"].astype(str).eq(execution_date)]
         actual_map = {
@@ -276,6 +382,18 @@ def _reconstruct_targets(
                     continue
                 side, expected_qty = "NONE", 0
             actual_qty = actual_map.get((symbol, side), 0)
+            if symbol in target_shares and target_qty == 0:
+                lifecycle = "ZERO_TARGET_REQUIRES_EXIT" if current_qty > 0 else "ZERO_TARGET_NO_POSITION_CASH_RETAINED"
+            elif side == "NONE":
+                lifecycle = "TARGET_MAINTAINED"
+            elif actual_qty == expected_qty and expected_qty > 0:
+                lifecycle = "ORDER_FILLED"
+            elif actual_qty > 0:
+                lifecycle = "ORDER_PARTIALLY_FILLED_OR_SPLIT_REVIEW"
+            elif expected_qty > 0:
+                lifecycle = "ORDER_MISSING_OR_BLOCKED_REVIEW"
+            else:
+                lifecycle = "NO_ORDER"
             rows.append({
                 "execution_date": execution_date,
                 "signal_date": signal_date,
@@ -286,17 +404,25 @@ def _reconstruct_targets(
                 "opening_cash_before_rebalance_cny": cash,
                 "opening_equity_reconstructed_cny": open_value,
                 "target_weight": weight if symbol in target_shares else 0.0,
+                "target_amount_cny": target_details.get(symbol, {}).get("target_amount_cny"),
+                "execution_open_price_cny": target_details.get(symbol, {}).get("execution_open_price_cny"),
+                "raw_target_shares_before_rounding": target_details.get(symbol, {}).get("raw_target_shares_before_rounding"),
+                "buy_minimum_shares_from_config_fallback": target_details.get(symbol, {}).get("buy_minimum_shares_from_config_fallback"),
+                "buy_step_shares_from_config_fallback": target_details.get(symbol, {}).get("buy_step_shares_from_config_fallback"),
                 "target_shares_after_100_share_fallback": target_qty,
                 "current_shares_before_rebalance": current_qty,
                 "expected_order_side": side,
                 "expected_order_quantity_after_fallback": expected_qty,
                 "actual_fill_quantity": actual_qty,
                 "target_fill_status": (
-                    "MATCHED_FILL" if actual_qty == expected_qty and expected_qty > 0
+                    "ZERO_TARGET_EXIT_MATCHED" if symbol in target_shares and target_qty == 0 and current_qty > 0 and actual_qty == expected_qty and expected_qty > 0
+                    else "ZERO_TARGET_EXIT_REVIEW_REQUIRED" if symbol in target_shares and target_qty == 0 and current_qty > 0
                     else "TARGET_ROUNDED_TO_ZERO" if symbol in target_shares and target_qty == 0
+                    else "MATCHED_FILL" if actual_qty == expected_qty and expected_qty > 0
                     else "NO_FILL_REVIEW_REQUIRED" if actual_qty != expected_qty
                     else "MATCHED_FILL"
                 ),
+                "target_lifecycle_status": lifecycle,
                 "market_rule_basis": "configs/default.toml fallback; 100-share lot; not historical board rules",
                 "cost_basis": "configs/default.toml flat assumptions; not historical or personal HTS fees",
                 "estimated_execution_impact_is_simulated": True,
@@ -646,6 +772,7 @@ def main() -> int:
     parser.add_argument("--candidate-pool", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--fetch-independent-sources", action="store_true")
+    parser.add_argument("--suspension-symbol", help="可选：重建该候选的完整动量窗口及相邻排名")
     parser.add_argument("--supplemental-filings", type=Path, help="私有 JSON 清单；仅归档并记录显式指定的官方公告")
     args = parser.parse_args()
 
@@ -756,6 +883,14 @@ def main() -> int:
         float(run_metrics["initial_cash_cny"]),
     )
     trade_targets.to_csv(out_dir / "candidate-target-and-fill-audit.csv", index=False)
+    suspension_window = pd.DataFrame()
+    suspension_neighbors = pd.DataFrame()
+    if args.suspension_symbol:
+        suspension_window, suspension_neighbors = _suspension_candidate_audit(
+            bars, ranked, trades, calendar, strategy, args.suspension_symbol,
+        )
+        suspension_window.to_csv(out_dir / "suspension-candidate-window.csv", index=False)
+        suspension_neighbors.to_csv(out_dir / "suspension-candidate-rank-neighbors.csv", index=False)
     source_symbols = sorted(trades["symbol"].astype(str).unique())
     selected_symbols = sorted(
         pd.read_csv(input_paths["candidate-pool-by-signal.csv"])
@@ -1031,7 +1166,28 @@ def main() -> int:
         "selected_target_unique_symbols": len(selected_symbols),
         "selected_target_slots": int(trade_targets.selected_target.sum()),
         "selected_targets_reconstructed_to_zero_shares": int(trade_targets.target_fill_status.eq("TARGET_ROUNDED_TO_ZERO").sum()),
-        "candidate_target_fill_mismatch_rows": int(trade_targets.target_fill_status.eq("NO_FILL_REVIEW_REQUIRED").sum()),
+        "target_lifecycle_status_counts": {
+            str(key): int(value) for key, value in trade_targets.target_lifecycle_status.value_counts(dropna=False).items()
+        },
+        "suspension_candidate_diagnostic": {
+            "symbol": args.suspension_symbol,
+            "window_rows": int(len(suspension_window)),
+            "window_total_suspended_rows_including_base": int(
+                suspension_window["is_suspended"].fillna(False).astype(bool).sum()
+            ) if not suspension_window.empty else None,
+            "suspended_observation_count": int(
+                suspension_window.loc[suspension_window.window_role.ne("LOOKBACK_BASE"), "is_suspended"].fillna(False).astype(bool).sum()
+            ) if not suspension_window.empty else None,
+            "neighbor_rows": int(len(suspension_neighbors)),
+        } if args.suspension_symbol else None,
+        "record_date_entitlement_audit": {
+            "matcher_policy": "POSSIBLE_END_OF_DAY_HOLDING_INTERVAL_INCLUDES_RECORD_DATE",
+            "same_day_trade_rule_status": "CONFLICTING_OFFICIAL_MATERIALS; candidate match is not account-level confirmation",
+            "ledger_v2_policy": "record-date event snapshots use the simulated end-of-day ledger after same-day fills",
+            "typed_accounting_events_in_frozen_run": run_metrics.get("accounting_event_ids", []),
+            "formal_entitlement_validation": "UNVERIFIED",
+        },
+        "candidate_target_fill_mismatch_rows": int(trade_targets.target_fill_status.astype(str).str.contains("REVIEW_REQUIRED").sum()),
         "notional_cny": float(pd.to_numeric(trades.notional_cny).sum()),
         "modeled_fees_cny": float(pd.to_numeric(trades.fees_cny).sum()),
         "modeled_execution_impact_cny": float(pd.to_numeric(trades.execution_impact_vs_reference_cny).sum()),
@@ -1083,7 +1239,9 @@ def main() -> int:
         f"- CNINFO 分红/送转接口：{dividend_match_summary.get('query_success_count', 0)}/{dividend_match_summary.get('query_count', 0)} 个选中目标查询成功，返回 {dividend_match_summary.get('returned_record_count', 0)} 条历史记录；查询范围不含全部公司行动。",
         f"- 候选池：3 个调仓日的候选排名和动量均由冻结行情与配置重建匹配；候选 CSV 不在此前文件清单中，原文件哈希未被旧清单锚定。",
         "- 松发股份（SH603268）官方公告记载其重大资产重组筹划及 2024-10-08 继续停牌，事件与第一轮高排名候选的动量观察窗重叠；文档日期不是精确首次公开时刻，且这不是该窗口内已确认的现金/股数账务事件。",
-        "- 公司行动：CNINFO 股息接口仅在记录日权益持仓和事件阶段均无命中时才记录未命中；登记日卖出仍可能保留已登记权益，买入登记日则不获得权益。该接口仍不代表其他公司行动不存在。",
+        "- 公司行动：本审计按模拟登记日收盘持仓区间生成‘可能匹配’，包含登记日买入且收盘仍持有的区间；登记日收盘前已平仓则不匹配。该口径是审计候选规则，不代表已验证中国结算的账户权益；官方投资者教育与历史结算材料对登记日当日成交的表述不完全一致，详见登记日权益更正说明。CNINFO 股息接口只覆盖查询范围，不证明其他公司行动不存在。",
+        f"- 目标生命周期：{summary['target_lifecycle_status_counts']}；零股目标与已有持仓清仓目标分别标注，交易单位来源仍为配置回退。",
+        f"- 停牌候选窗口：{summary['suspension_candidate_diagnostic']}；明细在 `suspension-candidate-window.csv` 和 `suspension-candidate-rank-neighbors.csv`（仅在指定 `--suspension-symbol` 时生成）。" if args.suspension_symbol else "",
         f"- 输入证据：核心行情、日历、配置、成交、账本、阻断单及 metrics 与此前清单 {sum(row['status'] == 'MATCHED_FROZEN_INVENTORY' for row in artifact_hash_checks.values())}/{len(expected_inventory_paths)} 项相符；候选池通过重建匹配但缺少旧哈希锚定。",
         "- 历史行情 vintage、历史决策时点可得性和公告来源人工签认仍未验证。正式基线 `NOT_READY`，增量续跑 `can_continue=false`。",
         "",

@@ -338,6 +338,84 @@ def test_distribution_record_date_snapshot_uses_close_holdings_after_same_day_sa
     assert ledger.cash_cny == Decimal("1000")
 
 
+@pytest.mark.parametrize("event_factory", [_dividend, _distribution, _rights])
+@pytest.mark.parametrize(
+    ("case", "opening_shares", "fills", "expected_entitled", "post_capture_fills"),
+    [
+        ("opening_holding", 100, (), 100, ()),
+        ("record_date_buy", 0, (("BUY", 100),), 100, ()),
+        ("record_date_partial_sale", 100, (("SELL", 40),), 60, ()),
+        ("record_date_full_sale", 100, (("SELL", 100),), 0, ()),
+        ("next_day_sale", 100, (), 100, (("SELL", 100),)),
+        ("multiple_fills", 100, (("BUY", 50), ("BUY", 50), ("SELL", 40)), 160, ()),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_record_date_entitlement_uses_end_of_day_shares_and_survives_restore(
+    event_factory, case, opening_shares, fills, expected_entitled, post_capture_fills,
+):
+    event = event_factory()
+    positions = (_lot(shares=opening_shares),) if opening_shares else ()
+    ledger = PortfolioLedger(Decimal("100000"), positions=positions)
+
+    for index, (side, quantity) in enumerate(fills):
+        ledger.apply_fill(TradeFill(
+            fill_id=f"{case}-record-{index}",
+            trade_date=event.record_date,
+            symbol=event.symbol,
+            side=side,
+            quantity=quantity,
+            price_cny=Decimal("10"),
+            sellable_from=date(2026, 10, 30) if side == "BUY" else None,
+        ))
+
+    cash_before_action = ledger.cash_cny
+    journal_count_before_action = len(ledger.snapshot().journal)
+    if isinstance(event, CashDividendEvent):
+        ledger.record_cash_dividend(event, as_of=event.record_date)
+    elif isinstance(event, ShareDistributionEvent):
+        ledger.record_share_distribution(event, as_of=event.record_date)
+    else:
+        ledger.record_rights_offering(event, as_of=event.record_date)
+
+    entitlement = next(
+        item for item in ledger.snapshot().entitlements if item.event_id == event.event_id
+    )
+    assert entitlement.total_shares == expected_entitled, case
+    assert ledger.cash_cny == cash_before_action, "登记日只锁定权益，不得提前记分红到账或配股缴款"
+    assert len(ledger.snapshot().journal) > journal_count_before_action
+    if isinstance(event, CashDividendEvent):
+        tax_lots = [
+            item for item in ledger.snapshot().dividend_tax_records
+            if item.event_id == event.event_id
+        ]
+        assert sum((item.gross_dividend_cny for item in tax_lots), Decimal("0")) == Decimal("0.50") * expected_entitled
+    elif isinstance(event, ShareDistributionEvent):
+        claim = next(item for item in ledger.snapshot().claims if item.event_id == event.event_id)
+        assert claim.exact_entitlement == Decimal("0.3") * expected_entitled
+        assert claim.final_allocated_shares == expected_entitled * 3 // 10
+    else:
+        claim = next(item for item in ledger.snapshot().claims if item.event_id == event.event_id)
+        assert claim.exact_entitlement == Decimal("0.2") * expected_entitled
+
+    # Backtest checkpoints carry the LedgerSnapshot, including entitlement lots.
+    resumed = PortfolioLedger.from_snapshot(ledger.snapshot())
+    for index, (side, quantity) in enumerate(post_capture_fills):
+        resumed.apply_fill(TradeFill(
+            fill_id=f"{case}-after-record-{index}",
+            trade_date=date(2026, 10, 30),
+            symbol=event.symbol,
+            side=side,
+            quantity=quantity,
+            price_cny=Decimal("10"),
+        ))
+    resumed_entitlement = next(
+        item for item in resumed.snapshot().entitlements if item.event_id == event.event_id
+    )
+    assert resumed_entitlement.total_shares == expected_entitled, case
+    assert resumed_entitlement == entitlement
+
+
 def test_distribution_without_record_date_holding_creates_no_trade_or_phantom_position():
     ledger = PortfolioLedger(Decimal("500"))
     event = _distribution()
