@@ -74,6 +74,7 @@ def accounting_events_digest(
     dividend_tax_cny_by_event: Mapping[str, Any] | None = None,
     dividend_tax_treatment_by_event: Mapping[str, str] | None = None,
     dividend_payment_withholding_per_share_cny_by_event: Mapping[str, Any] | None = None,
+    rights_offering_decisions_by_event: Mapping[str, Any] | None = None,
 ) -> str:
     """Hash the event and tax inputs with the exact checkpoint-v1 JSON format."""
     payload = {
@@ -88,6 +89,12 @@ def accounting_events_digest(
             for event_id, amount in sorted((dividend_payment_withholding_per_share_cny_by_event or {}).items())
         },
     }
+    decisions = rights_offering_decisions_by_event or {}
+    if decisions:
+        payload["rights_offering_decisions_by_event"] = {
+            event_id: asdict(decision) if hasattr(decision, "__dataclass_fields__") else dict(decision)
+            for event_id, decision in sorted(decisions.items())
+        }
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"),
     ).encode("utf-8")

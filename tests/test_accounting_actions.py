@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
@@ -475,6 +476,91 @@ def test_rights_subscription_is_cash_out_then_separate_untradable_claim_then_lot
         {"SH600000": _price("9.1666667", event.tradable_date.isoformat())},
     )
     assert nav.status == "VALUED"
+
+
+def test_rights_subscription_with_insufficient_cash_is_atomic_and_remains_unresolved():
+    event = _rights()
+    ledger = PortfolioLedger(Decimal("100"), positions=(_lot(),))
+    ledger.record_rights_offering(event, as_of=event.record_date)
+    before_journal = ledger.journal
+
+    with pytest.raises(ValueError, match="配股认购后现金不足"):
+        ledger.decide_rights_offering(
+            event,
+            disposition="SUBSCRIBE",
+            as_of=event.subscription_start_date,
+            subscription_fee_cny=Decimal("0.25"),
+        )
+
+    assert ledger.cash_cny == Decimal("100")
+    assert ledger.journal == before_journal
+    claim = next(item for item in ledger.claims if item.event_id == event.event_id)
+    assert claim.status == "RIGHTS_DISPOSITION_REQUIRED"
+    assert claim.final_allocated_shares is None
+
+
+def test_rights_claim_proxy_and_ledger_snapshot_resume_distinguish_registration_from_tradability():
+    event = replace(_rights(), registration_date="2026-11-07")
+    ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
+    ledger.record_rights_offering(event, as_of=event.record_date)
+    ledger.mark_rights_offering_claim(
+        event,
+        as_of=event.record_date,
+        underlying_close_cny=Decimal("10"),
+        price_source="synthetic close",
+        price_source_sha256="d" * 64,
+        price_date=event.record_date,
+        is_suspended=False,
+    )
+    claim = ledger.claims[0]
+    assert claim.valuation_cny == Decimal("100.0")
+    assert claim.valuation_source.startswith("RIGHTS_INTRINSIC_CLOSE_PROXY:")
+    assert ledger.mark_to_market(
+        event.record_date, {"SH600000": _price("10", event.record_date.isoformat())}
+    ).claims_value_cny == Decimal("100.0")
+
+    ledger.decide_rights_offering(
+        event, disposition="SUBSCRIBE", as_of=event.subscription_start_date,
+        subscription_fee_cny=Decimal("0.25"),
+    )
+    ledger.mark_rights_offering_claim(
+        event,
+        as_of=event.subscription_start_date,
+        underlying_close_cny=Decimal("11"),
+        price_source="synthetic close",
+        price_source_sha256="d" * 64,
+        price_date=event.subscription_start_date,
+        is_suspended=False,
+    )
+    snapshot = ledger.snapshot(as_of_date=event.subscription_start_date)
+    restored = PortfolioLedger.from_snapshot(snapshot)
+    assert restored.cash_cny == Decimal("399.75")
+    assert restored.claims[0].status == "SUBSCRIBED_PENDING_ALLOTMENT"
+    assert restored.claims[0].next_phase_date == event.registration_date
+
+    restored.allot_rights_shares(event, as_of=event.registration_date)
+    new_lot = next(item for item in restored.positions if item.source_event_id == event.event_id)
+    assert new_lot.total_shares == 20
+    assert new_lot.acquired_on == event.registration_date
+    assert new_lot.sellable_on(date(2026, 11, 9)) == 0
+    assert new_lot.sellable_on(event.tradable_date) == 20
+
+
+def test_rights_close_proxy_refuses_unknown_or_suspended_market_state():
+    event = _rights()
+    ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
+    ledger.record_rights_offering(event, as_of=event.record_date)
+    for suspended in (None, True):
+        with pytest.raises(ValueError, match="停牌状态未知或已停牌"):
+            ledger.mark_rights_offering_claim(
+                event,
+                as_of=event.record_date,
+                underlying_close_cny=Decimal("10"),
+                price_source="synthetic close",
+                price_source_sha256="d" * 64,
+                price_date=event.record_date,
+                is_suspended=suspended,
+            )
 
 
 def test_code_change_migrates_each_lot_without_cash_or_trade_and_rejects_merger_ratio():

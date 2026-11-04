@@ -17,7 +17,9 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cehuan.accounting.events import CashDividendEvent, CodeChangeEvent, ShareDistributionEvent
+from cehuan.accounting.events import (
+    CashDividendEvent, CodeChangeEvent, RightsOfferingEvent, ShareDistributionEvent,
+)
 from cehuan.backtest.checkpoint import BacktestCheckpoint
 from cehuan.backtest.event_scheduler import AccountingEventSchedule
 from cehuan.backtest.input_hashes import (
@@ -53,6 +55,9 @@ PROVENANCE_COLUMNS = (
     "input_type", "row_id", "canonical_row_sha256", "source_id", "source_file_path",
     "source_file_sha256", "known_at_utc", "known_at_evidence", "review_status",
     "reviewed_by", "reviewed_at",
+)
+PROVENANCE_OPTIONAL_COLUMNS = (
+    "source_role", "source_url", "source_title", "evidence_location",
 )
 
 
@@ -91,7 +96,9 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _read_provenance_registry(path: Path | None) -> tuple[dict[tuple[str, str], dict[str, str]], dict[str, Any]]:
+def _read_provenance_registry(
+    path: Path | None,
+) -> tuple[dict[tuple[str, str, str], dict[str, str]], dict[str, Any]]:
     if path is None:
         return {}, {"status": "UNVERIFIED", "reason": "未提供来源与时点登记表", "rows": 0}
     if not path.is_file():
@@ -103,16 +110,27 @@ def _read_provenance_registry(path: Path | None) -> tuple[dict[tuple[str, str], 
     missing = sorted(set(PROVENANCE_COLUMNS).difference(frame.columns))
     if missing:
         return {}, {"status": "FAILED", "reason": "登记表缺字段: " + ", ".join(missing), "rows": int(len(frame))}
-    frame = frame[list(PROVENANCE_COLUMNS)].copy()
-    for column in PROVENANCE_COLUMNS:
+    for column in PROVENANCE_OPTIONAL_COLUMNS:
+        if column not in frame:
+            frame[column] = ""
+    registry_columns = (*PROVENANCE_COLUMNS, *PROVENANCE_OPTIONAL_COLUMNS)
+    frame = frame[list(registry_columns)].copy()
+    for column in registry_columns:
         frame[column] = frame[column].astype("string").fillna("").str.strip()
-    if frame.duplicated(["input_type", "row_id"]).any():
-        return {}, {"status": "FAILED", "reason": "(input_type, row_id) 必须唯一", "rows": int(len(frame))}
+    frame.loc[frame["source_role"].eq(""), "source_role"] = "primary"
+    if frame.duplicated(["input_type", "row_id", "source_role"]).any():
+        return {}, {
+            "status": "FAILED", "reason": "(input_type, row_id, source_role) 必须唯一",
+            "rows": int(len(frame)),
+        }
     rows = {
-        (str(row.input_type).upper(), str(row.row_id)): row._asdict()
+        (str(row.input_type).upper(), str(row.row_id), str(row.source_role)): row._asdict()
         for row in frame.itertuples(index=False)
     }
-    return rows, {"status": "VERIFIED", "reason": None, "rows": int(len(frame)), "sha256": sha256_file(path)}
+    return rows, {
+        "status": "VERIFIED", "reason": None, "rows": int(len(frame)),
+        "source_roles": int(frame["source_role"].nunique()), "sha256": sha256_file(path),
+    }
 
 
 def _aware_utc(value: Any) -> str | None:
@@ -137,41 +155,56 @@ def _reviewed(entry: Mapping[str, Any]) -> bool:
 
 
 def _registry_match(
-    registry: Mapping[tuple[str, str], dict[str, str]],
+    registry: Mapping[tuple[str, str, str], dict[str, str]],
     input_type: str,
     row_id: str,
     canonical_sha256: str,
     expected_source_sha256: str | None,
     registry_path: Path | None,
     expected_known_at_utc: str | None = None,
+    *,
+    source_role: str = "primary",
+    expected_source_url: str | None = None,
 ) -> dict[str, Any]:
-    entry = registry.get((input_type.upper(), row_id))
+    entry = registry.get((input_type.upper(), row_id, source_role))
     if entry is None:
-        return {"row_status": "UNVERIFIED", "known_at_status": "UNVERIFIED", "review_status": "UNVERIFIED"}
-    issues: list[str] = []
+        return {
+            "source_role": source_role,
+            "row_status": "UNVERIFIED", "known_at_status": "UNVERIFIED", "review_status": "UNVERIFIED",
+            "issues": ["来源与时点登记表没有该事件/来源角色"],
+        }
+    failures: list[str] = []
+    gaps: list[str] = []
     if not str(entry.get("source_id", "")).strip():
-        issues.append("source_id 不能为空")
+        gaps.append("source_id 不能为空")
+    declared_url = str(entry.get("source_url", "")).strip()
+    if expected_source_url and not declared_url:
+        gaps.append("source_url 不能为空")
+    elif expected_source_url and declared_url != expected_source_url:
+        failures.append("登记来源 URL 与事件输入不一致")
     if entry["canonical_row_sha256"].lower() != canonical_sha256:
-        issues.append("canonical_row_sha256 不匹配")
+        failures.append("canonical_row_sha256 不匹配")
     declared_source = entry["source_file_sha256"].lower()
-    if len(declared_source) != 64 or any(ch not in "0123456789abcdef" for ch in declared_source):
-        issues.append("source_file_sha256 格式无效")
+    if not declared_source:
+        gaps.append("source_file_sha256 缺失")
+    elif len(declared_source) != 64 or any(ch not in "0123456789abcdef" for ch in declared_source):
+        failures.append("source_file_sha256 格式无效")
     source_path_value = entry["source_file_path"]
     source_path = _resolve(source_path_value, registry_path.parent if registry_path else None) if source_path_value else None
     observed_source = None
     if source_path is None or not source_path.is_file():
-        issues.append("来源原件缺失")
+        gaps.append("来源原件缺失")
     else:
         observed_source = sha256_file(source_path)
-        if observed_source != declared_source:
-            issues.append("来源原件 SHA-256 不匹配")
+        if declared_source and observed_source != declared_source:
+            failures.append("来源原件 SHA-256 不匹配")
     if expected_source_sha256 and declared_source != expected_source_sha256.lower():
-        issues.append("登记表来源散列与输入行来源散列不一致")
-    row_status = "FAILED" if issues else "VERIFIED"
+        failures.append("登记表来源散列与输入行来源散列不一致")
+    row_status = "FAILED" if failures else "UNVERIFIED" if gaps else "VERIFIED"
     known_at = _aware_utc(entry.get("known_at_utc"))
     expected_known_at = _aware_utc(expected_known_at_utc)
     if expected_known_at is not None and known_at is not None and expected_known_at != known_at:
-        issues.append("known_at_utc 与实际输入不一致")
+        failures.append("known_at_utc 与实际输入不一致")
         row_status = "FAILED"
     known_at_status = (
         "VERIFIED" if row_status == "VERIFIED" and known_at and entry.get("known_at_evidence") and _reviewed(entry) else
@@ -181,14 +214,21 @@ def _registry_match(
         "FAILED" if row_status == "FAILED" else "UNVERIFIED"
     )
     return {
+        "source_role": source_role,
         "row_status": row_status,
         "known_at_status": known_at_status,
         "review_status": review_status,
         "known_at_utc": known_at if known_at_status == "VERIFIED" else None,
+        "known_at_evidence": entry.get("known_at_evidence") or None,
         "source_id": entry.get("source_id") or None,
+        "source_url": declared_url or None,
+        "source_title": entry.get("source_title") or None,
+        "evidence_location": entry.get("evidence_location") or None,
+        "reviewed_by": entry.get("reviewed_by") or None,
+        "reviewed_at": entry.get("reviewed_at") or None,
         "source_file_path": str(source_path) if source_path else None,
         "source_file_sha256": observed_source,
-        "issues": issues,
+        "issues": [*failures, *gaps],
     }
 
 
@@ -273,6 +313,45 @@ def _audit_claimed_proof_files(claimed: Any, claimed_path: Path) -> tuple[str, l
                 "role": f"{family}:{row_id}", "status": "VERIFIED" if observed == str(expected).lower() else "FAILED",
                 "path": str(path), "declared_sha256": expected, "observed_sha256": observed,
             })
+    for family in ("identity_events", "corporate_actions"):
+        rows = inputs.get(family, [])
+        if not isinstance(rows, list):
+            audits.append({"role": family, "status": "UNVERIFIED", "detail": "事件来源证明清单缺失"})
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                audits.append({"role": family, "status": "FAILED", "detail": "事件来源证明行必须是对象"})
+                continue
+            event_id = str(row.get("event_id", "unknown"))
+            sources = row.get("sources")
+            if not isinstance(sources, list) or not sources:
+                audits.append({
+                    "role": f"{family}:{event_id}", "status": "UNVERIFIED",
+                    "detail": "非空事件缺少来源文件列表",
+                })
+                continue
+            for source in sources:
+                if not isinstance(source, dict):
+                    audits.append({
+                        "role": f"{family}:{event_id}", "status": "FAILED",
+                        "detail": "事件来源记录必须是对象",
+                    })
+                    continue
+                role = f"{family}:{event_id}:{source.get('source_role', 'unknown')}"
+                path_value = source.get("source_path")
+                expected = source.get("source_sha256")
+                if not path_value or not expected:
+                    audits.append({"role": role, "status": "UNVERIFIED", "detail": "来源路径或 SHA-256 缺失"})
+                    continue
+                path = _resolve(path_value, claimed_path.parent)
+                if not path.is_file():
+                    audits.append({"role": role, "status": "UNVERIFIED", "detail": f"来源文件缺失: {path}"})
+                    continue
+                observed = sha256_file(path)
+                audits.append({
+                    "role": role, "status": "VERIFIED" if observed == str(expected).lower() else "FAILED",
+                    "path": str(path), "declared_sha256": expected, "observed_sha256": observed,
+                })
     if any(item["status"] == "FAILED" for item in audits):
         status = "FAILED"
     elif not audits or any(item["status"] == "UNVERIFIED" for item in audits):
@@ -299,7 +378,7 @@ def _audit_canonical_rows(proof: Any) -> tuple[str, list[dict[str, Any]]]:
         })
     else:
         audits.append({"role": "proof_payload", "status": "VERIFIED", "sha256": observed_proof_digest})
-    for family in ("events", "rules", "fees"):
+    for family in ("events", "rules", "fees", "identity_events", "corporate_actions"):
         rows = proof["inputs"].get(family)
         if not isinstance(rows, list):
             audits.append({"role": family, "status": "UNVERIFIED", "detail": "规范行清单缺失"})
@@ -314,7 +393,7 @@ def _audit_canonical_rows(proof: Any) -> tuple[str, list[dict[str, Any]]]:
             observed = canonical_payload_digest(content)
             mismatches = [
                 key for key, value in row.items()
-                if key not in {"canonical_content", "content_sha256", "source_path"}
+                if key not in {"canonical_content", "content_sha256", "source_path", "sources", "source_status"}
                 and content.get(key) != value
             ]
             if expected != observed or mismatches:
@@ -365,7 +444,7 @@ def _compare_artifact_declarations(
 def _schedule_proof_rows(
     frame: pd.DataFrame,
     input_type: str,
-    registry: Mapping[tuple[str, str], dict[str, str]],
+    registry: Mapping[tuple[str, str, str], dict[str, str]],
     registry_path: Path | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     output: list[dict[str, Any]] = []
@@ -400,7 +479,7 @@ def _schedule_proof_rows(
 def _accounting_event_rows(
     bundle: AccountingEventBundle | None,
     schedule: AccountingEventSchedule | None,
-    registry: Mapping[tuple[str, str], dict[str, str]],
+    registry: Mapping[tuple[str, str, str], dict[str, str]],
     registry_path: Path | None,
     source_base_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -425,6 +504,10 @@ def _accounting_event_rows(
             event_type = "SHARE_DISTRIBUTION"
             impact = event.record_date
             symbol = event.symbol
+        elif isinstance(event, RightsOfferingEvent):
+            event_type = "RIGHTS_OFFERING"
+            impact = event.record_date
+            symbol = event.symbol
         else:  # pragma: no cover - scheduler rejects unsupported types
             continue
         source = event.source
@@ -447,6 +530,11 @@ def _accounting_event_rows(
                 else str(schedule.dividend_payment_withholding_per_share_cny[event.event_id])
             ),
         })
+        if isinstance(event, RightsOfferingEvent) and bundle is not None:
+            decision = bundle.rights_offering_decisions_by_event.get(event.event_id)
+            canonical_content["rights_offering_decision"] = (
+                None if decision is None else _json_safe(asdict(decision))
+            )
         source_row = source_by_id.get(event.event_id, {})
         archive_value = source_row.get("source_archive_file")
         archive_path = _resolve(archive_value, source_base_dir) if archive_value else None
@@ -483,6 +571,156 @@ def _accounting_event_rows(
         output.append(proof_row)
         audits.append({"input_type": "ACCOUNTING_EVENT", "row_id": event.event_id, **provenance})
     return output, audits
+
+
+def _identity_and_corporate_event_rows(
+    identity_events: pd.DataFrame,
+    corporate_actions: pd.DataFrame,
+    registry: Mapping[tuple[str, str, str], dict[str, str]],
+    registry_path: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind each normalized identity/action row to its required source archives.
+
+    A merger event has two independently checked source roles: the implementation
+    result notice and the old security's last-trading notice.
+    """
+    identity_rows: list[dict[str, Any]] = []
+    corporate_rows: list[dict[str, Any]] = []
+    audits: list[dict[str, Any]] = []
+
+    def build_row(
+        *, family: str, input_type: str, raw: Mapping[str, Any], source_specs: list[dict[str, Any]],
+        output: list[dict[str, Any]],
+    ) -> None:
+        canonical_row = _json_safe(dict(raw))
+        event_id = str(canonical_row["event_id"])
+        row_id = f"{family}:{event_id}"
+        event_type = str(canonical_row["event_type"])
+        impact_date = str(
+            canonical_row.get("effective_date")
+            or canonical_row.get("record_date")
+            or canonical_row.get("old_last_trade_date")
+        )
+        canonical_content = {
+            "row_id": row_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "first_impact_date": impact_date,
+            "normalized_event": canonical_row,
+        }
+        canonical_sha = canonical_payload_digest(canonical_content)
+        source_proofs: list[dict[str, Any]] = []
+        row_statuses: list[str] = []
+        known_statuses: list[str] = []
+        review_statuses: list[str] = []
+        for spec in source_specs:
+            matched = _registry_match(
+                registry,
+                input_type,
+                row_id,
+                canonical_sha,
+                spec.get("expected_sha256"),
+                registry_path,
+                source_role=spec["source_role"],
+                expected_source_url=spec.get("source_url"),
+            )
+            # The declaration in the event table is itself checked against the
+            # registry. These fields remain separate from machine file hashing.
+            for field, expected in (("source_title", spec.get("source_title")),
+                                    ("evidence_location", spec.get("evidence_location"))):
+                declared = matched.get(field)
+                if expected and not declared:
+                    matched.setdefault("issues", []).append(f"登记 {field} 缺失")
+                    if matched.get("row_status") != "FAILED":
+                        matched["row_status"] = "UNVERIFIED"
+                        matched["known_at_status"] = "UNVERIFIED"
+                        matched["review_status"] = "UNVERIFIED"
+                elif expected and declared != expected:
+                    matched.setdefault("issues", []).append(f"登记 {field} 与事件输入不一致")
+                    matched["row_status"] = "FAILED"
+                    matched["known_at_status"] = "FAILED"
+                    matched["review_status"] = "FAILED"
+            source_proof = {
+                "source_role": spec["source_role"],
+                "source_id": matched.get("source_id"),
+                "source_url": spec.get("source_url"),
+                "source_title": spec.get("source_title") or matched.get("source_title"),
+                "evidence_location": spec.get("evidence_location") or matched.get("evidence_location"),
+                "source_path": matched.get("source_file_path"),
+                "source_sha256": matched.get("source_file_sha256"),
+                "declared_source_sha256": spec.get("expected_sha256"),
+                "canonical_row_sha256": canonical_sha,
+                "row_status": matched.get("row_status", "UNVERIFIED"),
+                "known_at_status": matched.get("known_at_status", "UNVERIFIED"),
+                "known_at_utc": matched.get("known_at_utc"),
+                "known_at_evidence": matched.get("known_at_evidence"),
+                "review_status": matched.get("review_status", "UNVERIFIED"),
+                "reviewed_by": matched.get("reviewed_by"),
+                "reviewed_at": matched.get("reviewed_at"),
+                "issues": matched.get("issues", []),
+            }
+            source_proofs.append(source_proof)
+            row_statuses.append(source_proof["row_status"])
+            known_statuses.append(source_proof["known_at_status"])
+            review_statuses.append(source_proof["review_status"])
+            audits.append({
+                "input_type": input_type,
+                "row_id": row_id,
+                **source_proof,
+            })
+        overall_status = (
+            "FAILED" if "FAILED" in row_statuses else
+            "UNVERIFIED" if not row_statuses or "UNVERIFIED" in row_statuses else "VERIFIED"
+        )
+        output.append({
+            "row_id": row_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "first_impact_date": impact_date,
+            "canonical_content": canonical_content,
+            "content_sha256": canonical_sha,
+            "sources": source_proofs,
+            "source_status": overall_status,
+        })
+
+    for raw in identity_events.to_dict(orient="records"):
+        row = _json_safe(raw)
+        build_row(
+            family="security_identity",
+            input_type="SECURITY_IDENTITY_EVENT",
+            raw=row,
+            source_specs=[{
+                "source_role": "identity_notice",
+                "source_url": row.get("evidence_url"),
+            }],
+            output=identity_rows,
+        )
+
+    for raw in corporate_actions.to_dict(orient="records"):
+        row = _json_safe(raw)
+        build_row(
+            family="corporate_action",
+            input_type="CORPORATE_ACTION",
+            raw=row,
+            source_specs=[
+                {
+                    "source_role": "implementation_notice",
+                    "source_url": row.get("evidence_url"),
+                    "source_title": row.get("evidence_title"),
+                    "evidence_location": row.get("evidence_page_reference"),
+                    "expected_sha256": row.get("evidence_sha256"),
+                },
+                {
+                    "source_role": "old_last_trade_notice",
+                    "source_url": row.get("old_last_trade_evidence_url"),
+                    "source_title": row.get("old_last_trade_evidence_title"),
+                    "evidence_location": row.get("old_last_trade_evidence_page_reference"),
+                    "expected_sha256": row.get("old_last_trade_evidence_sha256"),
+                },
+            ],
+            output=corporate_rows,
+        )
+    return identity_rows, corporate_rows, audits
 
 
 def _rebuild_chain(
@@ -861,12 +1099,14 @@ def rebuild_checkpoint_input_proof(
                 withholding = accounting_bundle.dividend_payment_withholding_per_share_cny_by_event
             event_schedule = AccountingEventSchedule.build(
                 event_list, session_dates, tax_cny, tax_treatment, withholding,
+                accounting_bundle.rights_offering_decisions_by_event if accounting_bundle else None,
             )
             observed["accounting_events_sha256"] = accounting_events_digest(
                 event_list,
                 event_schedule.dividend_tax_cny,
                 event_schedule.dividend_tax_treatment,
                 event_schedule.dividend_payment_withholding_per_share_cny,
+                accounting_bundle.rights_offering_decisions_by_event if accounting_bundle else None,
             )
             normalized_components["accounting_events"] = observed["accounting_events_sha256"]
             adapters["accounting_events"] = (
@@ -899,6 +1139,10 @@ def rebuild_checkpoint_input_proof(
         accounting_file.parent if accounting_file else None,
     )
     provenance_audits.extend(audits)
+    identity_proof_rows, corporate_proof_rows, event_source_audits = _identity_and_corporate_event_rows(
+        identity_events, corporate_actions, registry, registry_file,
+    )
+    provenance_audits.extend(event_source_audits)
     report["provenance_rows"] = provenance_audits
 
     all_review_statuses = [row.get("review_status", "UNVERIFIED") for row in provenance_audits]
@@ -911,8 +1155,20 @@ def rebuild_checkpoint_input_proof(
         row.get("input") == "accounting_events" and row.get("status") == "FAILED"
         for row in report["issues"]
     )
-    identity_source_status = "VERIFIED" if identity_events.empty else "UNVERIFIED"
-    corporate_source_status = "VERIFIED" if corporate_actions.empty else "UNVERIFIED"
+    def event_family_status(rows: list[dict[str, Any]]) -> str:
+        statuses = [str(row.get("source_status", "UNVERIFIED")) for row in rows]
+        reviews = [
+            str(source.get("review_status", "UNVERIFIED"))
+            for row in rows for source in row.get("sources", [])
+        ]
+        if "FAILED" in statuses or "FAILED" in reviews:
+            return "FAILED"
+        if any(status != "VERIFIED" for status in statuses) or not reviews or any(status != "VERIFIED" for status in reviews):
+            return "UNVERIFIED"
+        return "VERIFIED"
+
+    identity_source_status = event_family_status(identity_proof_rows)
+    corporate_source_status = event_family_status(corporate_proof_rows)
     source_review_by_family = {
         "accounting_events_rules_fees": (
             "FAILED" if "FAILED" in all_review_statuses or accounting_parse_failed else
@@ -930,7 +1186,7 @@ def rebuild_checkpoint_input_proof(
     known_at_status = (
         "FAILED" if "FAILED" in all_known_statuses or cutoff_status["status"] == "FAILED" else
         "VERIFIED" if all_known_statuses and all(value == "VERIFIED" for value in all_known_statuses)
-        and cutoff_status["status"] == "VERIFIED" and identity_events.empty and corporate_actions.empty else "UNVERIFIED"
+        and cutoff_status["status"] == "VERIFIED" else "UNVERIFIED"
     )
 
     input_hash_results = []
@@ -966,6 +1222,7 @@ def rebuild_checkpoint_input_proof(
     input_hashes = {field: observed.get(field) for field in CHECKPOINT_INPUT_FIELDS}
     cutoff_is_verified = cutoff_status["status"] == "VERIFIED"
     checkpoint_proof: dict[str, Any] = {
+        "checkpoint_schema_version": checkpoint.schema_version,
         "state_sha256": checkpoint.state_sha256,
         "as_of_date": checkpoint.as_of_date.isoformat(),
         "next_expected_session": checkpoint.next_expected_session.isoformat(),
@@ -1016,6 +1273,8 @@ def rebuild_checkpoint_input_proof(
             observed.get("data_chain_sha256") if chain_status["status"] == "VERIFIED" else None
         ),
         "events": event_rows,
+        "identity_events": identity_proof_rows,
+        "corporate_actions": corporate_proof_rows,
         "calendar": calendar_rows,
         "rules": rules_rows,
         "fees": fees_rows,
@@ -1059,16 +1318,25 @@ def rebuild_checkpoint_input_proof(
             claimed_inputs = claimed.get("inputs", {}) if isinstance(claimed, dict) else {}
             compare_keys = (
                 "strategy_config_sha256", "historical_bars_prefix_sha256", "events", "calendar",
-                "rules", "fees", "normalized_input_digests",
+                "rules", "fees", "identity_events", "corporate_actions", "normalized_input_digests",
             )
             def semantic_rows(source_inputs: Mapping[str, Any], family: str) -> Any:
                 rows = source_inputs.get(family)
                 if not isinstance(rows, list):
                     return rows
-                identity_key = "event_id" if family == "events" else "row_id"
+
+                identity_key = "event_id" if family in {"events", "identity_events", "corporate_actions"} else "row_id"
+
+                def strip_paths(value: Any) -> Any:
+                    if isinstance(value, dict):
+                        return {key: strip_paths(item) for key, item in value.items() if key != "source_path"}
+                    if isinstance(value, list):
+                        return [strip_paths(item) for item in value]
+                    return value
+
                 return sorted(
                     [
-                        {key: value for key, value in row.items() if key != "source_path"}
+                        strip_paths(row)
                         for row in rows if isinstance(row, dict)
                     ],
                     key=lambda row: str(row.get(identity_key, "")),
@@ -1076,8 +1344,9 @@ def rebuild_checkpoint_input_proof(
 
             differences = []
             for key in compare_keys:
-                left = semantic_rows(claimed_inputs, key) if key in {"events", "rules", "fees"} else claimed_inputs.get(key)
-                right = semantic_rows(inputs, key) if key in {"events", "rules", "fees"} else inputs.get(key)
+                row_families = {"events", "rules", "fees", "identity_events", "corporate_actions"}
+                left = semantic_rows(claimed_inputs, key) if key in row_families else claimed_inputs.get(key)
+                right = semantic_rows(inputs, key) if key in row_families else inputs.get(key)
                 if json.dumps(left, sort_keys=True, default=str) != json.dumps(right, sort_keys=True, default=str):
                     differences.append(key)
             claimed_checkpoint = claimed.get("checkpoint", {}) if isinstance(claimed, dict) else {}
@@ -1172,6 +1441,7 @@ def rebuild_checkpoint_input_proof(
     if checkpoint_claim_status == "FAILED":
         checkpoint_binding_status = "FAILED"
     report.update({
+        "checkpoint_schema_version": checkpoint.schema_version,
         "checkpoint_binding_valid": checkpoint_binding_status,
         "input_file_hashes_valid": file_hash_status,
         "input_files_binding_valid": file_hash_status,

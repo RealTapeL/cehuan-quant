@@ -3,15 +3,21 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
+import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from cehuan.backtest.engine import run_backtest
+from cehuan.backtest.engine import run_backtest, _accounting_price_evidence_sha256
 from cehuan.backtest.engine import _require_code_change_open_eligibility
 from cehuan.backtest.checkpoint import backtest_checkpoint_from_dict, read_backtest_checkpoint
-from cehuan.accounting import ActionSource, CashDividendEvent, CodeChangeEvent
+from cehuan.backtest.event_scheduler import AccountingEventSchedule
+from cehuan.accounting import (
+    ActionSource, CashDividendEvent, CodeChangeEvent, PortfolioLedger,
+    RightsOfferingDecision, RightsOfferingEvent, TradeFill,
+)
 from cehuan.config import load_config
 from cehuan.data.fee_schedule import calculate_scheduled_fees, map_fee_schedule_to_sessions, normalize_fee_schedule
 from cehuan.data.market_rules import attach_market_rule_schedule, normalize_market_rule_schedule
@@ -120,6 +126,68 @@ def _open_calendar(start: date, days: int) -> pd.DataFrame:
         "is_open": True,
         "source": "synthetic_calendar_not_market_evidence",
     })
+
+
+def _rights_event(start: date) -> RightsOfferingEvent:
+    return RightsOfferingEvent(
+        event_id="synthetic-rights-001",
+        symbol="SZ000001",
+        record_date=start,
+        subscription_start_date=start + timedelta(days=1),
+        subscription_end_date=start + timedelta(days=2),
+        registration_date=start + timedelta(days=4),
+        tradable_date=start + timedelta(days=6),
+        rights_per_old_share=Decimal("0.2"),
+        subscription_price_cny=Decimal("5"),
+        known_at_utc="2024-12-31T00:00:00Z",
+        source=ActionSource(
+            source_id="synthetic-rights-source",
+            url="https://example.invalid/rights.pdf",
+            sha256="c" * 64,
+            title="Synthetic rights notice",
+            page_reference="p.1",
+            reviewed_by="synthetic-test",
+            reviewed_at="2026-11-03",
+        ),
+    )
+
+
+def test_rights_schedule_indexes_lifecycle_across_input_windows():
+    start = date(2025, 1, 2)
+    event = _rights_event(start)
+    decision = RightsOfferingDecision(
+        event_id=event.event_id,
+        disposition="SUBSCRIBE",
+        decision_date=event.subscription_start_date,
+        subscription_fee_cny=Decimal("0.25"),
+    )
+    first = AccountingEventSchedule.build(
+        [event], [start, event.subscription_start_date],
+        rights_offering_decisions={event.event_id: decision},
+    )
+    assert first.rights_records[start] == (event,)
+    assert first.rights_decisions[event.subscription_start_date] == ((event, decision),)
+    assert first.rights_registrations == {}
+
+    second = AccountingEventSchedule.build(
+        [event], [event.subscription_end_date, event.registration_date, event.tradable_date],
+        rights_offering_decisions={event.event_id: decision},
+    )
+    assert second.rights_records == {}
+    assert second.rights_registrations[event.registration_date] == (event,)
+    assert second.rights_tradabilities[event.tradable_date] == (event,)
+
+    undisposed = AccountingEventSchedule.build([event], [start, event.subscription_start_date])
+    assert undisposed.rights_records[start] == (event,)
+    assert undisposed.rights_decisions == {}
+    assert undisposed.rights_decisions_by_event == {}
+    manual = RightsOfferingDecision(event_id=event.event_id, disposition="MANUAL_REVIEW")
+    manual_schedule = AccountingEventSchedule.build(
+        [event], [start, event.subscription_start_date],
+        rights_offering_decisions={event.event_id: manual},
+    )
+    assert manual_schedule.rights_decisions == {}
+    assert manual_schedule.rights_decisions_by_event == {event.event_id: manual}
 
 
 def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_signal(tmp_path):
@@ -312,6 +380,8 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
         backtest_checkpoint_from_dict(payload)
 
     valid_payload = first["backtest_checkpoint"].to_dict()
+    assert valid_payload["schema_version"] == 2
+    assert isinstance(valid_payload["pending_targets_active"], bool)
     invalid_hash_payloads = []
     missing_hash = dict(valid_payload)
     missing_hash.pop("state_sha256")
@@ -327,11 +397,25 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
     for field, value in (
         ("previous_equity_cny", "123456"),
         ("pending_targets", [["SZ000001", 0.25]]),
+        ("pending_targets_active", not valid_payload["pending_targets_active"]),
     ):
         invalid = dict(valid_payload)
         invalid[field] = value
         with pytest.raises(ValueError, match="状态哈希不匹配"):
             backtest_checkpoint_from_dict(invalid)
+    missing_active = dict(valid_payload)
+    missing_active.pop("pending_targets_active")
+    with pytest.raises(ValueError, match="缺少字段.*pending_targets_active"):
+        backtest_checkpoint_from_dict(missing_active)
+    unknown_version = dict(valid_payload)
+    unknown_version["schema_version"] = 99
+    unknown_payload = dict(unknown_version)
+    unknown_payload.pop("state_sha256")
+    unknown_version["state_sha256"] = hashlib.sha256(json.dumps(
+        unknown_payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError, match="不支持的 backtest checkpoint schema_version=99"):
+        backtest_checkpoint_from_dict(unknown_version)
     invalid_cash = dict(valid_payload)
     invalid_cash["ledger_snapshot"] = dict(valid_payload["ledger_snapshot"])
     invalid_cash["ledger_snapshot"]["cash_cny"] = "1"
@@ -860,7 +944,13 @@ def test_distribution_window_can_end_before_registration_and_preserves_pending_r
     mark = result["accounting_journal"].loc[
         result["accounting_journal"]["entry_type"] == "SHARE_DISTRIBUTION_RIGHT_MARK"
     ].iloc[-1]
-    assert mark["details"]["price_source_sha256"] == result["metrics"]["accounting_valuation_inputs_sha256"]
+    quote = data.loc[
+        (data["trade_date"] == mark["booking_date"])
+        & (data["symbol"] == event.symbol)
+    ].iloc[0]
+    assert mark["details"]["price_source_sha256"] == _accounting_price_evidence_sha256(
+        event.symbol, mark["booking_date"], quote,
+    )
 
     alternate_data_source = data.copy()
     alternate_data_source["data_source"] = "synthetic_alternate_price_provider"
@@ -875,6 +965,10 @@ def test_distribution_window_can_end_before_registration_and_preserves_pending_r
     )
     assert alternate["metrics"]["accounting_valuation_inputs_sha256"] != result["metrics"]["accounting_valuation_inputs_sha256"]
     assert alternate["metrics"]["data_version_sha256"] != result["metrics"]["data_version_sha256"]
+    alternate_mark = alternate["accounting_journal"].loc[
+        alternate["accounting_journal"]["entry_type"] == "SHARE_DISTRIBUTION_RIGHT_MARK"
+    ].iloc[-1]
+    assert alternate_mark["details"]["price_source_sha256"] != mark["details"]["price_source_sha256"]
 
 
 def test_pre_window_distribution_requires_validated_opening_rights_and_resumes():
@@ -946,6 +1040,374 @@ def test_pre_window_distribution_requires_validated_opening_rights_and_resumes()
     assert new_lot.total_shares == 30
     assert new_lot.sellable_on(pd.Timestamp(dates[7]).date()) == 0
     assert new_lot.sellable_on(pd.Timestamp(dates[8]).date()) == 30
+
+
+def test_rights_offering_full_strategy_checkpoint_matches_continuous_run():
+    from cehuan.accounting import PositionLot
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 99, "max_positions": 1})
+    config["market"].update({"buy_lot_shares": 100, "sell_lot_shares": 100})
+    data = _bars(days=10).loc[lambda frame: frame["symbol"] == "SZ000001"].copy().reset_index(drop=True)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    data["buy_min_shares"] = 100
+    data["buy_step_shares"] = 100
+    data["sell_min_shares"] = 100
+    data["sell_step_shares"] = 100
+    dates = [date.fromisoformat(value) for value in data["trade_date"].tolist()]
+    event = RightsOfferingEvent(
+        event_id="full-vs-checkpoint-rights",
+        symbol="SZ000001",
+        record_date=dates[3],
+        subscription_start_date=dates[4],
+        subscription_end_date=dates[5],
+        registration_date=dates[7],
+        tradable_date=dates[9],
+        rights_per_old_share=Decimal("0.2"),
+        subscription_price_cny=Decimal("5"),
+        known_at_utc="2024-12-20T00:00:00Z",
+        source=_action_source(),
+    )
+    decision = RightsOfferingDecision(
+        event_id=event.event_id,
+        disposition="SUBSCRIBE",
+        decision_date=dates[4],
+        subscription_fee_cny=Decimal("0.25"),
+        allocated_rights_shares=2,
+        allocation_evidence="synthetic exact integer entitlement",
+    )
+    opening_ledger = PortfolioLedger(
+        Decimal("20"),
+        portfolio_id="rights-checkpoint-test",
+        positions=(PositionLot(
+            lot_id="opening-rights-test-lot",
+            symbol=event.symbol,
+            total_shares=10,
+            sellable_shares=10,
+            cost_basis_cny=Decimal("100"),
+            acquired_on="2024-12-01",
+            sellable_from="2024-12-02",
+        ),),
+    )
+    opening_snapshot = opening_ledger.snapshot(as_of_date="2024-12-31")
+    calendar = _open_calendar(date(2025, 1, 1), 12)
+    common = {
+        "security_identity_events": pd.DataFrame(),
+        "corporate_actions": pd.DataFrame(),
+        "accounting_mode": "ledger_v2",
+        "accounting_events": (event,),
+        "rights_offering_decisions_by_event": {event.event_id: decision},
+        "trading_calendar": calendar,
+    }
+
+    continuous = run_backtest(
+        data, float(opening_snapshot.cash_cny), config,
+        opening_accounting_snapshot=opening_snapshot, **common,
+    )
+    first = run_backtest(
+        data.iloc[:5].copy(), float(opening_snapshot.cash_cny), config,
+        opening_accounting_snapshot=opening_snapshot, **common,
+    )
+    checkpoint = first["backtest_checkpoint"]
+    assert checkpoint.as_of_date == dates[4]
+    opening_claim = next(item for item in checkpoint.ledger_snapshot.claims if item.event_id == event.event_id)
+    assert opening_claim.status == "SUBSCRIBED_PENDING_ALLOTMENT"
+    assert opening_claim.next_phase_date == event.registration_date
+    opening_entitlement = next(
+        item for item in checkpoint.ledger_snapshot.entitlements if item.event_id == event.event_id
+    )
+    assert opening_entitlement.total_shares == 10
+    assert not any(lot.symbol == event.symbol for lot in checkpoint.ledger_snapshot.positions)
+    subscription_entry = next(
+        item for item in checkpoint.ledger_snapshot.journal
+        if item.event_id == event.event_id and item.entry_type == "RIGHTS_SUBSCRIBED"
+    )
+    assert subscription_entry.cash_delta_cny == Decimal("-10.25")
+
+    changed_decision = replace(decision, subscription_fee_cny=Decimal("0.26"))
+    with pytest.raises(ValueError, match="公司行动事件或分红税务处理已变化"):
+        run_backtest(
+            data.iloc[5:].copy(), float(checkpoint.ledger_snapshot.cash_cny), config,
+            backtest_checkpoint=checkpoint,
+            **{**common, "rights_offering_decisions_by_event": {event.event_id: changed_decision}},
+        )
+
+    second = run_backtest(
+        data.iloc[5:].copy(), float(checkpoint.ledger_snapshot.cash_cny), config,
+        backtest_checkpoint=checkpoint, **common,
+    )
+    stitched_equity = pd.concat([first["equity_curve"], second["equity_curve"]], ignore_index=True)
+    pd.testing.assert_frame_equal(
+        stitched_equity.reset_index(drop=True), continuous["equity_curve"].reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+    )
+    stitched_trades = pd.concat([first["trades"], second["trades"]], ignore_index=True)
+    pd.testing.assert_frame_equal(
+        stitched_trades.reset_index(drop=True), continuous["trades"].reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+    )
+    assert second["accounting_journal"].to_dict("records") == continuous["accounting_journal"].to_dict("records")
+    assert second["accounting_snapshot"] == continuous["accounting_snapshot"]
+    final_snapshot = second["accounting_snapshot"]
+    allotment = next(item for item in final_snapshot.positions if item.source_event_id == event.event_id)
+    assert allotment.total_shares == 2
+    assert allotment.cost_basis_cny == Decimal("10.25")
+    assert allotment.acquired_on == event.registration_date
+    assert allotment.sellable_on(event.registration_date) == 0
+    assert allotment.sellable_on(event.tradable_date) == 2
+    registration_entry = next(
+        item for item in final_snapshot.journal
+        if item.event_id == event.event_id and item.entry_type == "RIGHTS_SHARES_REGISTERED"
+    )
+    assert registration_entry.booking_date == event.registration_date
+    assert registration_entry.position_deltas == ((event.symbol, 2),)
+    assert not any(
+        item.event_id == event.event_id and item.entry_type in {"BUY", "SELL"}
+        for item in final_snapshot.journal
+    )
+
+
+def test_rights_checkpoint_resume_before_decision_and_after_registration():
+    from cehuan.accounting import PositionLot
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 99, "max_positions": 1})
+    config["market"].update({"buy_lot_shares": 100, "sell_lot_shares": 100})
+    data = _bars(days=10).loc[lambda frame: frame["symbol"] == "SZ000001"].copy().reset_index(drop=True)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    for column in ("buy_min_shares", "buy_step_shares", "sell_min_shares", "sell_step_shares"):
+        data[column] = 100
+    dates = [date.fromisoformat(value) for value in data["trade_date"].tolist()]
+    prior_close = float(data.loc[3, "close"])
+    lower_limit = round(prior_close * (1 - float(data.loc[4, "price_limit_pct"])), 2)
+    data.loc[4, ["open", "high", "low", "close", "adjusted_close"]] = [
+        lower_limit, lower_limit + 0.05, lower_limit, lower_limit, lower_limit,
+    ]
+    event = RightsOfferingEvent(
+        event_id="rights-checkpoint-boundary-cases",
+        symbol="SZ000001",
+        record_date=dates[4],
+        subscription_start_date=dates[5],
+        subscription_end_date=dates[6],
+        registration_date=dates[8],
+        tradable_date=dates[9],
+        rights_per_old_share=Decimal("0.2"),
+        subscription_price_cny=Decimal("5"),
+        known_at_utc="2024-12-20T00:00:00Z",
+        source=_action_source(),
+    )
+    decision = RightsOfferingDecision(
+        event_id=event.event_id,
+        disposition="SUBSCRIBE",
+        decision_date=dates[5],
+        subscription_fee_cny=Decimal("0.25"),
+        allocated_rights_shares=20,
+        allocation_evidence="synthetic exact integer entitlement",
+    )
+    opening_ledger = PortfolioLedger(
+        Decimal("200"),
+        portfolio_id="rights-checkpoint-boundary-test",
+        positions=(PositionLot(
+            lot_id="opening-rights-boundary-lot",
+            symbol=event.symbol,
+            total_shares=100,
+            sellable_shares=100,
+            cost_basis_cny=Decimal("1000"),
+            acquired_on="2024-12-01",
+            sellable_from="2024-12-02",
+        ),),
+    )
+    opening_snapshot = opening_ledger.snapshot(as_of_date="2024-12-31")
+    calendar = _open_calendar(date(2025, 1, 1), 12)
+    common = {
+        "security_identity_events": pd.DataFrame(),
+        "corporate_actions": pd.DataFrame(),
+        "accounting_mode": "ledger_v2",
+        "accounting_events": (event,),
+        "rights_offering_decisions_by_event": {event.event_id: decision},
+        "trading_calendar": calendar,
+    }
+    continuous = run_backtest(
+        data, float(opening_snapshot.cash_cny), config,
+        opening_accounting_snapshot=opening_snapshot, **common,
+    )
+
+    def assert_split_matches_continuous(split_index: int):
+        first = run_backtest(
+            data.iloc[:split_index + 1].copy(), float(opening_snapshot.cash_cny), config,
+            opening_accounting_snapshot=opening_snapshot, **common,
+        )
+        checkpoint = first["backtest_checkpoint"]
+        assert checkpoint.schema_version == 2
+        second = run_backtest(
+            data.iloc[split_index + 1:].copy(), float(checkpoint.ledger_snapshot.cash_cny), config,
+            backtest_checkpoint=checkpoint, **common,
+        )
+        stitched_equity = pd.concat([first["equity_curve"], second["equity_curve"]], ignore_index=True)
+        pd.testing.assert_frame_equal(
+            stitched_equity.reset_index(drop=True), continuous["equity_curve"].reset_index(drop=True),
+            check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+        )
+        stitched_trades = pd.concat([first["trades"], second["trades"]], ignore_index=True)
+        pd.testing.assert_frame_equal(
+            stitched_trades.reset_index(drop=True), continuous["trades"].reset_index(drop=True),
+            check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+        )
+        assert second["accounting_journal"].to_dict("records") == continuous["accounting_journal"].to_dict("records")
+        assert second["accounting_snapshot"] == continuous["accounting_snapshot"]
+        return first, checkpoint, second
+
+    # The record date has completed, but the subscription decision is still in the future.
+    before_decision, decision_checkpoint, _ = assert_split_matches_continuous(4)
+    assert decision_checkpoint.pending_targets == ()
+    assert decision_checkpoint.pending_targets_active is False
+    with pytest.raises(ValueError, match="无待执行信号时不能包含 pending_targets"):
+        replace(decision_checkpoint, pending_targets=((event.symbol, 0.1),))
+    pending = next(
+        item for item in decision_checkpoint.ledger_snapshot.claims if item.event_id == event.event_id
+    )
+    assert pending.status == "RIGHTS_DISPOSITION_REQUIRED"
+    assert pending.next_phase_date == event.subscription_start_date
+    assert not any(
+        item.event_id == event.event_id and item.entry_type == "RIGHTS_SUBSCRIBED"
+        for item in decision_checkpoint.ledger_snapshot.journal
+    )
+
+    # An empty target map is distinct from the absence of a pending signal:
+    # when active, it is an explicit liquidation target and must survive I/O.
+    active_empty_target = replace(
+        decision_checkpoint,
+        pending_targets_active=True,
+        state_sha256="",
+    ).sealed()
+    round_tripped = backtest_checkpoint_from_dict(active_empty_target.to_dict())
+    assert round_tripped.pending_targets == ()
+    assert round_tripped.pending_targets_active is True
+    liquidation = run_backtest(
+        data.iloc[5:].copy(), float(active_empty_target.ledger_snapshot.cash_cny), config,
+        backtest_checkpoint=active_empty_target, **common,
+    )
+    assert liquidation["trades"]["side"].tolist() == ["SELL"]
+    assert int(liquidation["trades"].iloc[0]["quantity"]) == 100
+
+    # Existing v1 checkpoints did not carry the state bit. Their state hash
+    # and JSON format remain unchanged; restoration infers empty-target state
+    # from the frozen signal schedule.
+    legacy_v1 = replace(
+        decision_checkpoint,
+        schema_version=1,
+        pending_targets_active=None,
+        state_sha256="",
+    ).sealed()
+    legacy_round_trip = backtest_checkpoint_from_dict(legacy_v1.to_dict())
+    assert legacy_round_trip.schema_version == 1
+    assert legacy_round_trip.pending_targets_active is None
+    legacy_second = run_backtest(
+        data.iloc[5:].copy(), float(legacy_round_trip.ledger_snapshot.cash_cny), config,
+        backtest_checkpoint=legacy_round_trip, **common,
+    )
+    assert legacy_second["trades"].empty
+
+    empty_opening = PortfolioLedger(
+        Decimal("100"), portfolio_id="rights-empty-entitlement-test",
+    ).snapshot(as_of_date="2024-12-31")
+    empty_continuous = run_backtest(
+        data, 100, config, opening_accounting_snapshot=empty_opening, **common,
+    )
+    empty_first = run_backtest(
+        data.iloc[:5].copy(), 100, config, opening_accounting_snapshot=empty_opening, **common,
+    )
+    empty_checkpoint = empty_first["backtest_checkpoint"]
+    empty_claim = next(
+        item for item in empty_checkpoint.ledger_snapshot.claims if item.event_id == event.event_id
+    )
+    assert empty_claim.status == "CANCELLED"
+    assert empty_claim.next_phase_date is None
+    empty_second = run_backtest(
+        data.iloc[5:].copy(), float(empty_checkpoint.ledger_snapshot.cash_cny), config,
+        backtest_checkpoint=empty_checkpoint, **common,
+    )
+    assert empty_second["accounting_snapshot"] == empty_continuous["accounting_snapshot"]
+    assert empty_second["trades"].empty
+
+    # Registration is complete, while the new lot remains unsellable until the next phase.
+    _, registration_checkpoint, after_registration = assert_split_matches_continuous(8)
+    registered_claim = next(
+        item for item in registration_checkpoint.ledger_snapshot.claims if item.event_id == event.event_id
+    )
+    assert registered_claim.status == "SETTLED"
+    registered_lot = next(
+        item for item in registration_checkpoint.ledger_snapshot.positions
+        if item.source_event_id == event.event_id
+    )
+    assert registered_lot.total_shares == 20
+    assert registered_lot.sellable_on(event.registration_date) == 0
+    assert registered_lot.sellable_on(event.tradable_date) == 20
+    assert after_registration["accounting_snapshot"] == continuous["accounting_snapshot"]
+
+
+def test_legacy_v1_empty_pending_target_uses_frozen_rebalance_schedule(tmp_path):
+    from cehuan.accounting import PositionLot
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 1, "max_positions": 1})
+    data = _bars(days=7).loc[lambda frame: frame["symbol"] == "SZ000001"].copy().reset_index(drop=True)
+    data["is_listed"] = True
+    data["is_suspended"] = False
+    data["is_st"] = False
+    data.loc[4, "is_st"] = True
+    dates = [date.fromisoformat(value) for value in data["trade_date"].tolist()]
+    opening = PortfolioLedger(
+        Decimal("200"), portfolio_id="legacy-empty-target-test", positions=(PositionLot(
+            lot_id="legacy-empty-target-lot", symbol="SZ000001", total_shares=100,
+            sellable_shares=100, cost_basis_cny=Decimal("1000"),
+            acquired_on="2024-12-01", sellable_from="2024-12-02",
+        ),),
+    ).snapshot(as_of_date="2024-12-31")
+    calendar = _open_calendar(date(2025, 1, 1), 10)
+    common = {
+        "security_identity_events": pd.DataFrame(),
+        "corporate_actions": pd.DataFrame(),
+        "accounting_mode": "ledger_v2",
+        "trading_calendar": calendar,
+    }
+    continuous = run_backtest(
+        data, 200, config, opening_accounting_snapshot=opening, **common,
+    )
+    first = run_backtest(
+        data.iloc[:5].copy(), 200, config, opening_accounting_snapshot=opening, **common,
+    )
+    checkpoint = first["backtest_checkpoint"]
+    assert checkpoint.pending_targets == ()
+    assert checkpoint.pending_targets_active is True
+    legacy_checkpoint = replace(
+        checkpoint, schema_version=1, pending_targets_active=None, state_sha256="",
+    ).sealed()
+    legacy_path = tmp_path / "legacy-v1-checkpoint.json"
+    legacy_path.write_text(json.dumps(legacy_checkpoint.to_dict(), default=str), encoding="utf-8")
+    original_legacy_sha = hashlib.sha256(legacy_path.read_bytes()).hexdigest()
+    legacy_checkpoint = read_backtest_checkpoint(legacy_path)
+    assert legacy_checkpoint.schema_version == 1
+    assert hashlib.sha256(legacy_path.read_bytes()).hexdigest() == original_legacy_sha
+    second = run_backtest(
+        data.iloc[5:].copy(), float(legacy_checkpoint.ledger_snapshot.cash_cny), config,
+        backtest_checkpoint=legacy_checkpoint, **common,
+    )
+    assert second["trades"]["side"].iloc[0] == "SELL"
+    stitched = pd.concat([first["trades"], second["trades"]], ignore_index=True)
+    pd.testing.assert_frame_equal(
+        stitched.reset_index(drop=True), continuous["trades"].reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+    )
+    stitched_equity = pd.concat([first["equity_curve"], second["equity_curve"]], ignore_index=True)
+    pd.testing.assert_frame_equal(
+        stitched_equity.reset_index(drop=True), continuous["equity_curve"].reset_index(drop=True),
+        check_dtype=False, check_exact=False, rtol=0, atol=1e-8,
+    )
 
 
 def test_pre_window_snapshot_json_round_trip_and_snapshot_date_validation():

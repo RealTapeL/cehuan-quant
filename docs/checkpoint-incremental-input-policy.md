@@ -6,6 +6,8 @@
 
 这条边界刻意保守：新公告可能是更正，也可能改变 checkpoint 前已经建立的持仓权利、税务批次或价格处理。仅凭事件生效日期在未来，不能证明它不会回溯影响历史。
 
+完整策略 checkpoint schema v2 显式保存 `pending_targets_active`：空目标表可以表示下一交易日按零仓位调仓；`false` 则表示没有待执行信号。schema v1 不含该位，读取旧 checkpoint 时按其已绑定策略配置和全局交易日序号重建；输入不满足原调仓日程时，空目标按“无待执行信号”恢复。v1 的状态哈希和 JSON 字段保持原样。输入摘要仍使用下文标记的 `checkpoint-v1` 口径，这与 checkpoint 状态 schema 版本是两件事。
+
 ## 只读预检器（研究用，不放行续跑）
 
 `src/cehuan/backtest/incremental_inputs.py` 提供第一版兼容性预检。它比较两份显式输入证明，并报告候选追加、历史变化、阻断原因和可能受影响日期。它**不会**修改 checkpoint，也不会改变 `run_backtest()` 当前的完整输入哈希校验；报告中的 `can_continue` 和 `engine_resume_supported` 始终为 `false`。
@@ -134,7 +136,7 @@ uv run python scripts/rebuild_checkpoint_input_proof.py \
 
 适配器和哈希边界：
 
-- 共享函数位于 `src/cehuan/backtest/input_hashes.py`，标记为 `checkpoint-v1`。它们保留原回测的 JSON/CSV/pandas 哈希序列化，不改变旧 checkpoint 的解释方式。未来若修改字段范围或规范化算法，必须升版，不能重算后静默复用 v1。
+- 共享函数位于 `src/cehuan/backtest/input_hashes.py`，标记为 `checkpoint-v1`。它们保留原回测的 JSON/CSV/pandas 哈希序列化，不改变旧 checkpoint 的解释方式。配股决策只有在非空时才增加独立 payload 字段；无配股决策的旧摘要序列化保持兼容。未来若修改字段范围或规范化算法，必须升版，不能重算后静默复用 v1。
 - 配置走 `load_config()` 与 checkpoint 既有配置摘要；行情走 `read_bars()`，按 `BAR_COLUMNS` 计算窗口摘要；日历、规则、费率及身份/公司行动表各自调用项目规范化器；账务事件走 `read_accounting_event_csv()` 和 `AccountingEventSchedule.build()`，再按 checkpoint v1 事件加税务字段摘要。
 - 若 checkpoint 绑定的公司行动/税务摘要不是空事件摘要，必须传入当时使用的 `--accounting-events` CSV；不提供时，空事件重建会与 checkpoint 不符并阻断绑定。
 - `--history-manifest` 必须列出形成 checkpoint `data_chain_sha256` 的**全部**窗口，按执行顺序排列。示例：
@@ -153,12 +155,12 @@ uv run python scripts/rebuild_checkpoint_input_proof.py \
 - 市场规则、费率及事件的 `canonical_row_sha256` 由独立 provenance CSV 按稳定 `row_id` 对应。登记表字段：
 
   ```text
-  input_type,row_id,canonical_row_sha256,source_id,source_file_path,source_file_sha256,known_at_utc,known_at_evidence,review_status,reviewed_by,reviewed_at
+  input_type,row_id,canonical_row_sha256,source_id,source_file_path,source_file_sha256,known_at_utc,known_at_evidence,review_status,reviewed_by,reviewed_at,source_role,source_url,source_title,evidence_location
   ```
 
-  `MARKET_RULE` 的 `row_id` 格式为 `rule:<symbol>:<valid_from>`；`FEE` 为 `fee:<market>:<valid_from>`；`ACCOUNTING_EVENT` 使用事件 `event_id`。来源原件路径可相对 registry 文件，SHA-256 会实读复算。`known_at_utc` 必须有时区；仅日期将保持 `UNVERIFIED`。这张表只能证明登记的映射、文件字节和复核字段彼此一致，不会判断公告解读是否正确。
-- 当前证券身份事件和合并公司行动 CSV 没有与原件归档路径一一绑定的统一审核输入，因此其底层来源内容/首次可得时点不会被报告成已验证；若这些表非空，对应状态保持 `UNVERIFIED`。CSV 自身的字节哈希和规范化摘要仍会单独核对。
-- checkpoint v1 只有日期，没有精确决策截止时间。只有独立 cutoff 记录与 checkpoint `state_sha256` 绑定，且来源文件、UTC 时间及审核字段通过校验，才将截止时点列为 `VERIFIED`。记录格式为 `schema_version=1`，字段至少包括 `checkpoint_state_sha256`、`decision_cutoff_utc`、`source_id`、`source_file_path`、`source_file_sha256`、`review_status`、`reviewed_by`、`reviewed_at`。没有证据时不推断盘前/盘后时间。
+  `MARKET_RULE` 的 `row_id` 格式为 `rule:<symbol>:<valid_from>`；`FEE` 为 `fee:<market>:<valid_from>`；`ACCOUNTING_EVENT` 使用事件 `event_id`。证券身份和合并公司行动使用 `security_identity:<event_id>`、`corporate_action:<event_id>` 绑定经对应适配器规范化的行。来源键为 `(input_type,row_id,source_role)`，省略 `source_role` 的旧表按 `primary` 读取。身份事件要求 `identity_notice`；合并事件分别要求 `implementation_notice` 与 `old_last_trade_notice`，不得用一份公告冒充两个角色。来源路径可相对 registry 文件，SHA-256 会实读复算；URL、标题、页码/段落、来源哈希、复核字段及 `known_at_utc` 分别核对。`known_at_utc` 必须有时区；仅日期将保持 `UNVERIFIED`。这张表证明文件、规范行、登记映射和复核字段相互绑定，不会自动判断公告解释是否正确。
+- 对身份事件和合并公司行动，`canonical_row_sha256` 是适配器规范化事件行及稳定事件键的摘要；每个必需来源角色都独立绑定一个归档文件。一个来源角色缺失或 `known_at` 不完整会使该事件来源状态为 `UNVERIFIED`；明确的哈希、URL、规范行冲突为 `FAILED`。证明文件哈希通过不等于事件账务已被核实，也不代表实际账户获配、到账或税务事实。
+- 当前完整策略 checkpoint schema v1/v2 都只有日期，没有精确决策截止时间。只有独立 cutoff 记录与 checkpoint `state_sha256` 绑定，且来源文件、UTC 时间及审核字段通过校验，才将截止时点列为 `VERIFIED`。记录格式为 `schema_version=1`，字段至少包括 `checkpoint_state_sha256`、`decision_cutoff_utc`、`source_id`、`source_file_path`、`source_file_sha256`、`review_status`、`reviewed_by`、`reviewed_at`。没有证据时不推断盘前/盘后时间。
 
 报告把四个层次和证据状态分开：
 

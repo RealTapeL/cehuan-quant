@@ -88,11 +88,16 @@ class BacktestCheckpoint:
     source_data_path: str | None = None
     benchmark_symbol: str | None = None
     benchmark_previous_close_cny: Decimal | None = None
+    pending_targets_active: bool | None = None
     state_sha256: str = ""
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(f"不支持的 backtest checkpoint schema_version={self.schema_version}")
+        if self.schema_version == 1 and self.pending_targets_active is not None:
+            raise ValueError("checkpoint v1 不支持 pending_targets_active")
+        if self.schema_version == 2 and not isinstance(self.pending_targets_active, bool):
+            raise ValueError("checkpoint v2 必须明确 pending_targets_active")
         if not str(self.strategy_id).strip():
             raise ValueError("backtest checkpoint strategy_id 不能为空")
         as_of = calendar_date(self.as_of_date, "checkpoint.as_of_date")
@@ -110,6 +115,8 @@ class BacktestCheckpoint:
             raise ValueError("checkpoint pending_targets 包含无效标的或权重")
         if len({symbol for symbol, _ in pending}) != len(pending):
             raise ValueError("checkpoint pending_targets 存在重复证券")
+        if self.schema_version == 2 and not self.pending_targets_active and pending:
+            raise ValueError("checkpoint v2 无待执行信号时不能包含 pending_targets")
         transition = tuple(sorted((str(symbol).strip().upper(), int(index)) for symbol, index in self.transition_signal_ready_index))
         if any(not symbol or index < 0 for symbol, index in transition):
             raise ValueError("checkpoint transition signal state 无效")
@@ -173,6 +180,11 @@ class BacktestCheckpoint:
     def _payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("state_sha256", None)
+        # Preserve the exact v1 digest and JSON contract. V2 adds an explicit
+        # bit because an empty target map means "liquidate all", while no
+        # pending signal means "do nothing".
+        if self.schema_version == 1:
+            payload.pop("pending_targets_active", None)
         return payload
 
     def calculate_state_sha256(self) -> str:
@@ -193,6 +205,8 @@ class BacktestCheckpoint:
         self.require_sealed()
         sealed = self
         payload = asdict(sealed)
+        if sealed.schema_version == 1:
+            payload.pop("pending_targets_active", None)
         payload["as_of_date"] = sealed.as_of_date.isoformat()
         payload["next_expected_session"] = sealed.next_expected_session.isoformat()
         payload["previous_equity_cny"] = str(sealed.previous_equity_cny)
@@ -220,6 +234,8 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
         "calendar_sha256", "calendar_prefix_sha256", "last_window_data_sha256", "last_window_bars_sha256",
         "data_chain_sha256", "state_sha256",
     }
+    if value.get("schema_version") == 2:
+        required.add("pending_targets_active")
     missing = required.difference(value)
     if missing:
         raise ValueError("backtest checkpoint 缺少字段：" + ", ".join(sorted(missing)))
@@ -276,6 +292,7 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
             None if value.get("benchmark_previous_close_cny") is None
             else Decimal(str(value["benchmark_previous_close_cny"]))
         ),
+        pending_targets_active=value.get("pending_targets_active"),
         state_sha256=raw_state_hash,
     )
 

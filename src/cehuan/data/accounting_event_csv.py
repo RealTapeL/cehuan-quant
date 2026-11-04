@@ -10,7 +10,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from cehuan.accounting.events import ActionSource, CashDividendEvent, CodeChangeEvent, ShareDistributionEvent
+from cehuan.accounting.events import (
+    ActionSource, CashDividendEvent, CodeChangeEvent, RightsOfferingDecision,
+    RightsOfferingEvent, ShareDistributionEvent,
+)
 from cehuan.accounting.models import decimal_value
 
 
@@ -22,9 +25,16 @@ ACCOUNTING_EVENT_CSV_COLUMNS = [
     "source_sha256", "source_title", "source_page_reference", "source_archive_file",
     "review_status", "reviewed_by", "reviewed_at", "tax_treatment",
     "payment_withholding_per_share_cny",
+    "subscription_start_date", "subscription_end_date", "subscription_price_cny",
+    "decision_policy", "decision_date", "subscription_fee_cny", "allocated_rights_shares",
+    "allocation_evidence",
 ]
-OPTIONAL_COMPATIBILITY_COLUMNS = ("tax_treatment", "payment_withholding_per_share_cny")
-ACCOUNTING_EVENT_TYPES = {"CASH_DIVIDEND", "CODE_CHANGE_1_TO_1", "SHARE_DISTRIBUTION"}
+OPTIONAL_COMPATIBILITY_COLUMNS = (
+    "tax_treatment", "payment_withholding_per_share_cny", "subscription_start_date",
+    "subscription_end_date", "subscription_price_cny", "decision_policy", "decision_date",
+    "subscription_fee_cny", "allocated_rights_shares", "allocation_evidence",
+)
+ACCOUNTING_EVENT_TYPES = {"CASH_DIVIDEND", "CODE_CHANGE_1_TO_1", "SHARE_DISTRIBUTION", "RIGHTS_OFFERING"}
 SOURCE_REVIEW_COLUMNS = (
     "source_id", "source_url", "source_sha256", "source_title", "source_page_reference",
     "source_archive_file", "review_status", "reviewed_by", "reviewed_at",
@@ -33,10 +43,11 @@ SOURCE_REVIEW_COLUMNS = (
 
 @dataclass(frozen=True)
 class AccountingEventBundle:
-    events: tuple[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent, ...]
+    events: tuple[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent | RightsOfferingEvent, ...]
     dividend_tax_cny_by_event: dict[str, Decimal | None]
     dividend_tax_treatment_by_event: dict[str, str]
     dividend_payment_withholding_per_share_cny_by_event: dict[str, Decimal]
+    rights_offering_decisions_by_event: dict[str, RightsOfferingDecision]
     source_audit: pd.DataFrame
     source_csv_sha256: str
 
@@ -67,7 +78,7 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
     for column in frame.columns:
         frame[column] = frame[column].map(_text)
     if frame.empty:
-        return AccountingEventBundle((), {}, {}, {}, pd.DataFrame(columns=[
+        return AccountingEventBundle((), {}, {}, {}, {}, pd.DataFrame(columns=[
             "event_id", "event_type", "source_id", "source_archive_file",
             "declared_sha256", "observed_sha256", "review_status", "reviewed_by", "reviewed_at",
         ]), hashlib.sha256(raw_bytes).hexdigest())
@@ -79,14 +90,15 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
     unknown_types = sorted(set(frame["event_type"]).difference(ACCOUNTING_EVENT_TYPES))
     if unknown_types:
         raise ValueError(
-            "当前 CSV 适配器只支持 CASH_DIVIDEND/CODE_CHANGE_1_TO_1/SHARE_DISTRIBUTION："
+            "当前 CSV 适配器只支持 CASH_DIVIDEND/CODE_CHANGE_1_TO_1/SHARE_DISTRIBUTION/RIGHTS_OFFERING："
             + ", ".join(unknown_types)
         )
 
-    events: list[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent] = []
+    events: list[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent | RightsOfferingEvent] = []
     taxes: dict[str, Decimal | None] = {}
     treatments: dict[str, str] = {}
     payment_withholdings: dict[str, Decimal] = {}
+    rights_decisions: dict[str, RightsOfferingDecision] = {}
     audits: list[dict[str, object]] = []
     for row in frame.to_dict(orient="records"):
         event_id = row["event_id"]
@@ -122,6 +134,9 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
             if any(row[column] for column in (
                 "old_symbol", "new_symbol", "effective_date", "registration_date", "tradable_date",
                 "security_identity", "share_ratio", "fractional_share_method",
+                "subscription_start_date", "subscription_end_date", "subscription_price_cny",
+                "decision_policy", "decision_date", "subscription_fee_cny", "allocated_rights_shares",
+                "allocation_evidence",
             )):
                 raise ValueError(f"{event_id} 分红行包含代码变更专属字段")
             for column in ("symbol", "record_date", "ex_date", "payable_date", "gross_per_share_cny"):
@@ -169,6 +184,9 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
             if any(row[column] for column in (
                 "symbol", "record_date", "ex_date", "payable_date", "gross_per_share_cny", "tax_cny",
                 "tax_treatment", "payment_withholding_per_share_cny",
+                "subscription_start_date", "subscription_end_date", "subscription_price_cny",
+                "decision_policy", "decision_date", "subscription_fee_cny", "allocated_rights_shares",
+                "allocation_evidence",
             )):
                 raise ValueError(f"{event_id} 代码变更行包含非代码变更字段")
             for column in ("old_symbol", "new_symbol", "effective_date", "security_identity", "share_ratio"):
@@ -186,11 +204,14 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
                 known_at_utc=row["known_at_utc"],
                 source=action_source,
             )
-        else:
+        elif row["event_type"] == "SHARE_DISTRIBUTION":
             if any(row[column] for column in (
                 "ex_date", "payable_date", "gross_per_share_cny", "old_symbol", "new_symbol",
                 "security_identity", "tax_cny",
                 "tax_treatment", "payment_withholding_per_share_cny",
+                "subscription_start_date", "subscription_end_date", "subscription_price_cny",
+                "decision_policy", "decision_date", "subscription_fee_cny", "allocated_rights_shares",
+                "allocation_evidence",
             )):
                 raise ValueError(f"{event_id} 送转行包含分红或代码变更专属字段")
             for column in (
@@ -211,6 +232,48 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
                 known_at_utc=row["known_at_utc"],
                 source=action_source,
             )
+        else:
+            if any(row[column] for column in (
+                "ex_date", "payable_date", "gross_per_share_cny", "old_symbol", "new_symbol",
+                "effective_date", "security_identity", "fractional_share_method", "tax_cny",
+                "tax_treatment", "payment_withholding_per_share_cny",
+            )):
+                raise ValueError(f"{event_id} 配股行包含分红、送转或代码变更专属字段")
+            for column in (
+                "symbol", "record_date", "subscription_start_date", "subscription_end_date",
+                "registration_date", "tradable_date", "share_ratio", "subscription_price_cny",
+            ):
+                if not row[column]:
+                    raise ValueError(f"{event_id} 配股行缺少 {column}")
+            event = RightsOfferingEvent(
+                event_id=event_id,
+                symbol=row["symbol"],
+                record_date=row["record_date"],
+                subscription_start_date=row["subscription_start_date"],
+                subscription_end_date=row["subscription_end_date"],
+                registration_date=row["registration_date"],
+                tradable_date=row["tradable_date"],
+                rights_per_old_share=Decimal(row["share_ratio"]),
+                subscription_price_cny=Decimal(row["subscription_price_cny"]),
+                known_at_utc=row["known_at_utc"],
+                source=action_source,
+            )
+            policy = row["decision_policy"].upper()
+            if policy:
+                if policy not in {"SUBSCRIBE", "DECLINE", "MANUAL_REVIEW"}:
+                    raise ValueError(f"{event_id} decision_policy 未知：{policy}")
+                rights_decisions[event_id] = RightsOfferingDecision(
+                    event_id=event_id,
+                    disposition=policy,
+                    decision_date=row["decision_date"] or None,
+                    subscription_fee_cny=(Decimal(row["subscription_fee_cny"]) if row["subscription_fee_cny"] else None),
+                    allocated_rights_shares=(int(row["allocated_rights_shares"]) if row["allocated_rights_shares"] else None),
+                    allocation_evidence=row["allocation_evidence"] or None,
+                )
+            elif any(row[column] for column in (
+                "decision_date", "subscription_fee_cny", "allocated_rights_shares", "allocation_evidence",
+            )):
+                raise ValueError(f"{event_id} 配股决策字段有值但 decision_policy 为空")
         events.append(event)
         audits.append({
             "event_id": event_id,
@@ -231,6 +294,7 @@ def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
         dividend_tax_cny_by_event=taxes,
         dividend_tax_treatment_by_event=treatments,
         dividend_payment_withholding_per_share_cny_by_event=payment_withholdings,
+        rights_offering_decisions_by_event=rights_decisions,
         source_audit=pd.DataFrame(audits),
         source_csv_sha256=hashlib.sha256(raw_bytes).hexdigest(),
     )

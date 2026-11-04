@@ -195,6 +195,7 @@ class RightsOfferingEvent:
     subscription_price_cny: Decimal
     known_at_utc: datetime | str
     source: ActionSource
+    registration_date: date | str | None = None
 
     def __post_init__(self) -> None:
         event_id = str(self.event_id).strip()
@@ -204,8 +205,14 @@ class RightsOfferingEvent:
         start = calendar_date(self.subscription_start_date, "subscription_start_date")
         end = calendar_date(self.subscription_end_date, "subscription_end_date")
         tradable = calendar_date(self.tradable_date, "tradable_date")
-        if not record <= start <= end <= tradable:
-            raise ValueError("配股日期必须满足 record <= subscription_start <= subscription_end <= tradable")
+        registration = calendar_date(
+            self.registration_date if self.registration_date is not None else tradable,
+            "registration_date",
+        )
+        if not record <= start <= end < registration <= tradable:
+            raise ValueError(
+                "配股日期必须满足 record <= subscription_start <= subscription_end < registration <= tradable"
+            )
         known_at = _aware_instant(self.known_at_utc, "known_at_utc")
         _require_known_by(known_at, record, time(15, 0), "配股方案")
         if not isinstance(self.source, ActionSource):
@@ -219,10 +226,55 @@ class RightsOfferingEvent:
         object.__setattr__(self, "record_date", record)
         object.__setattr__(self, "subscription_start_date", start)
         object.__setattr__(self, "subscription_end_date", end)
+        object.__setattr__(self, "registration_date", registration)
         object.__setattr__(self, "tradable_date", tradable)
         object.__setattr__(self, "rights_per_old_share", ratio)
         object.__setattr__(self, "subscription_price_cny", price)
         object.__setattr__(self, "known_at_utc", known_at)
+
+
+@dataclass(frozen=True)
+class RightsOfferingDecision:
+    """Frozen research-account disposition for one rights-offering event."""
+
+    event_id: str
+    disposition: Literal["SUBSCRIBE", "DECLINE", "MANUAL_REVIEW"]
+    decision_date: date | str | None = None
+    subscription_fee_cny: Decimal | int | str | None = None
+    allocated_rights_shares: int | None = None
+    allocation_evidence: str | None = None
+
+    def __post_init__(self) -> None:
+        event_id = str(self.event_id).strip()
+        disposition = str(self.disposition).strip().upper()
+        if not event_id:
+            raise ValueError("配股决策 event_id 不能为空")
+        if disposition not in {"SUBSCRIBE", "DECLINE", "MANUAL_REVIEW"}:
+            raise ValueError("配股决策必须是 SUBSCRIBE/DECLINE/MANUAL_REVIEW")
+        decision_date = calendar_date(self.decision_date, "decision_date", optional=True)
+        fee = (
+            None if self.subscription_fee_cny is None
+            else decimal_value(self.subscription_fee_cny, "subscription_fee_cny", nonnegative=True)
+        )
+        if disposition == "SUBSCRIBE":
+            if decision_date is None or fee is None:
+                raise ValueError("SUBSCRIBE 决策必须提供 decision_date 和已明确的 subscription_fee_cny")
+        elif disposition == "DECLINE" and decision_date is None:
+            raise ValueError("DECLINE 决策必须提供 decision_date")
+        if self.allocated_rights_shares is not None and (
+            isinstance(self.allocated_rights_shares, bool)
+            or not isinstance(self.allocated_rights_shares, int)
+            or self.allocated_rights_shares <= 0
+        ):
+            raise ValueError("allocated_rights_shares 必须是正整数股数")
+        evidence = str(self.allocation_evidence).strip() if self.allocation_evidence else None
+        if self.allocated_rights_shares is not None and not evidence:
+            raise ValueError("显式获配股数必须登记 allocation_evidence")
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "disposition", disposition)
+        object.__setattr__(self, "decision_date", decision_date)
+        object.__setattr__(self, "subscription_fee_cny", fee)
+        object.__setattr__(self, "allocation_evidence", evidence)
 
 
 @dataclass(frozen=True)

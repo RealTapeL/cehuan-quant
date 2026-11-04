@@ -8,11 +8,17 @@ from datetime import date
 from decimal import Decimal
 from typing import Iterable, Mapping
 
-from cehuan.accounting.events import CashDividendEvent, CodeChangeEvent, ShareDistributionEvent
+from cehuan.accounting.events import (
+    CashDividendEvent,
+    CodeChangeEvent,
+    RightsOfferingDecision,
+    RightsOfferingEvent,
+    ShareDistributionEvent,
+)
 from cehuan.accounting.models import decimal_value
 
 
-SupportedAccountingEvent = CashDividendEvent | CodeChangeEvent | ShareDistributionEvent
+SupportedAccountingEvent = CashDividendEvent | CodeChangeEvent | ShareDistributionEvent | RightsOfferingEvent
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,11 @@ class AccountingEventSchedule:
     distribution_effective: Mapping[date, tuple[ShareDistributionEvent, ...]]
     distribution_registrations: Mapping[date, tuple[ShareDistributionEvent, ...]]
     distribution_tradabilities: Mapping[date, tuple[ShareDistributionEvent, ...]]
+    rights_records: Mapping[date, tuple[RightsOfferingEvent, ...]]
+    rights_registrations: Mapping[date, tuple[RightsOfferingEvent, ...]]
+    rights_tradabilities: Mapping[date, tuple[RightsOfferingEvent, ...]]
+    rights_decisions: Mapping[date, tuple[tuple[RightsOfferingEvent, RightsOfferingDecision], ...]]
+    rights_decisions_by_event: Mapping[str, RightsOfferingDecision]
     dividend_tax_cny: Mapping[str, Decimal | int | str | None]
     dividend_tax_treatment: Mapping[str, str]
     dividend_payment_withholding_per_share_cny: Mapping[str, Decimal | int | str | None]
@@ -47,6 +58,7 @@ class AccountingEventSchedule:
         dividend_tax_cny: Mapping[str, Decimal | int | str | None] | None = None,
         dividend_tax_treatment: Mapping[str, str] | None = None,
         dividend_payment_withholding_per_share_cny: Mapping[str, Decimal | int | str | None] | None = None,
+        rights_offering_decisions: Mapping[str, RightsOfferingDecision] | None = None,
     ) -> "AccountingEventSchedule":
         sessions = frozenset(session_dates)
         code_changes: dict[date, list[CodeChangeEvent]] = defaultdict(list)
@@ -57,6 +69,10 @@ class AccountingEventSchedule:
         distribution_effective: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
         distribution_registrations: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
         distribution_tradabilities: dict[date, list[ShareDistributionEvent]] = defaultdict(list)
+        rights_records: dict[date, list[RightsOfferingEvent]] = defaultdict(list)
+        rights_registrations: dict[date, list[RightsOfferingEvent]] = defaultdict(list)
+        rights_tradabilities: dict[date, list[RightsOfferingEvent]] = defaultdict(list)
+        rights_decisions: dict[date, list[tuple[RightsOfferingEvent, RightsOfferingDecision]]] = defaultdict(list)
         if not sessions:
             raise ValueError("公司行动调度至少需要一个输入交易日")
         window_start, window_end = min(sessions), max(sessions)
@@ -73,10 +89,13 @@ class AccountingEventSchedule:
 
         for event in events:
             if not isinstance(event, (CashDividendEvent, CodeChangeEvent, ShareDistributionEvent)):
-                raise TypeError(
-                    "当前 ledger-v2 事件调度器只接受 CashDividendEvent/CodeChangeEvent/"
-                    f"ShareDistributionEvent；收到 {type(event).__name__}"
-                )
+                if isinstance(event, RightsOfferingEvent):
+                    pass
+                else:
+                    raise TypeError(
+                        "当前 ledger-v2 事件调度器只接受 CashDividendEvent/CodeChangeEvent/"
+                        f"ShareDistributionEvent/RightsOfferingEvent；收到 {type(event).__name__}"
+                    )
             if event.event_id in event_ids:
                 raise ValueError(f"账务事件 event_id 重复：{event.event_id}")
             event_ids.add(event.event_id)
@@ -103,6 +122,12 @@ class AccountingEventSchedule:
                         label,
                         event,
                     )
+                continue
+
+            if isinstance(event, RightsOfferingEvent):
+                schedule_phase(rights_records, event.record_date, "配股登记日", event)
+                schedule_phase(rights_registrations, event.registration_date, "配股股份登记日", event)
+                schedule_phase(rights_tradabilities, event.tradable_date, "配股可流通日", event)
                 continue
 
             dividend_ids.add(event.event_id)
@@ -155,6 +180,32 @@ class AccountingEventSchedule:
                 raise ValueError(f"{event_id} 需要账户证据时不能同时声明最终税额")
             treatments[event_id] = treatment
 
+        rights_event_by_id = {
+            event.event_id: event for event in event_rows if isinstance(event, RightsOfferingEvent)
+        }
+        decision_rows = dict(rights_offering_decisions or {})
+        unknown_decisions = set(decision_rows).difference(rights_event_by_id)
+        if unknown_decisions:
+            raise ValueError("配股决策表含未知 event_id：" + ", ".join(sorted(unknown_decisions)))
+        for event_id, decision in decision_rows.items():
+            event = rights_event_by_id[event_id]
+            if not isinstance(decision, RightsOfferingDecision) or decision.event_id != event_id:
+                raise ValueError(f"配股 {event_id} 决策必须是匹配 event_id 的 RightsOfferingDecision")
+            if decision.disposition == "SUBSCRIBE":
+                if not event.subscription_start_date <= decision.decision_date <= event.subscription_end_date:
+                    raise ValueError(f"配股 {event_id} SUBSCRIBE 决策日期不在认购期内")
+            elif decision.disposition == "DECLINE":
+                if decision.decision_date < event.subscription_end_date:
+                    raise ValueError(f"配股 {event_id} 只能在认购期结束日或之后确认放弃")
+            elif decision.decision_date is not None:
+                raise ValueError(f"配股 {event_id} MANUAL_REVIEW 不应自动带有执行日期")
+            if decision.decision_date is not None:
+                if window_start <= decision.decision_date <= window_end and decision.decision_date not in sessions:
+                    raise ValueError(
+                        f"账务事件 {event_id} 的配股决策日落在输入区间内但缺少交易日：{decision.decision_date}"
+                    )
+                rights_decisions[decision.decision_date].append((event, decision))
+
         def freeze(mapping: dict[date, list[object]]) -> dict[date, tuple]:
             return {day: tuple(sorted(rows, key=lambda event: event.event_id)) for day, rows in mapping.items()}
 
@@ -168,6 +219,14 @@ class AccountingEventSchedule:
             distribution_effective=freeze(distribution_effective),
             distribution_registrations=freeze(distribution_registrations),
             distribution_tradabilities=freeze(distribution_tradabilities),
+            rights_records=freeze(rights_records),
+            rights_registrations=freeze(rights_registrations),
+            rights_tradabilities=freeze(rights_tradabilities),
+            rights_decisions={
+                day: tuple(sorted(rows, key=lambda pair: pair[0].event_id))
+                for day, rows in rights_decisions.items()
+            },
+            rights_decisions_by_event=decision_rows,
             dividend_tax_cny=taxes,
             dividend_tax_treatment=treatments,
             dividend_payment_withholding_per_share_cny=payment_withholdings,

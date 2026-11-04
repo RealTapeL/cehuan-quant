@@ -44,7 +44,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="使用策环现有适配器重建 checkpoint 输入证明；只读，不运行回测或改写 checkpoint",
     )
-    parser.add_argument("--checkpoint", required=True, help="已封存的 backtest checkpoint v1 JSON")
+    parser.add_argument("--checkpoint", required=True, help="已封存的 backtest checkpoint v1/v2 JSON")
     parser.add_argument("--config", help="实际使用的 TOML 配置；默认 configs/default.toml")
     parser.add_argument("--bars", help="checkpoint 最后窗口的规范行情 CSV；缺省取 checkpoint.source_data_path")
     parser.add_argument("--calendar", required=True, help="实际使用的完整交易日历 CSV")

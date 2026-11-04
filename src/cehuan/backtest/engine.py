@@ -24,6 +24,8 @@ from cehuan.accounting import (
     LedgerSnapshot,
     PortfolioLedger,
     PriceMark,
+    RightsOfferingDecision,
+    RightsOfferingEvent,
     ShareDistributionEvent,
     TradeFill,
 )
@@ -104,6 +106,29 @@ def _sha256_path(path: str | Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _accounting_price_evidence_sha256(symbol: str, trade_date: str, row: pd.Series) -> str:
+    """Hash the canonical quote evidence used by one accounting valuation.
+
+    This is deliberately row-scoped so a continuous run and a checkpointed
+    run produce the same ledger evidence for the same symbol/date quote.
+    The complete input files and windows remain bound by the experiment and
+    checkpoint data hashes.
+    """
+    close = Decimal(str(float(row["close"]))).normalize()
+    suspended = row.get("is_suspended")
+    payload = {
+        "schema": "accounting-price-evidence-v1",
+        "trade_date": pd.Timestamp(trade_date).date().isoformat(),
+        "symbol": str(symbol),
+        "close_cny": format(close, "f"),
+        "is_suspended": None if pd.isna(suspended) else bool(suspended),
+        "data_source": str(row.get("data_source", "normalized_input_bars")),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _fees(notional: float, side: str, costs: dict[str, Any]) -> float:
@@ -317,6 +342,7 @@ def run_backtest(
     dividend_tax_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
     dividend_tax_treatment_by_event: Mapping[str, str] | None = None,
     dividend_payment_withholding_per_share_cny_by_event: Mapping[str, Decimal | int | str | None] | None = None,
+    rights_offering_decisions_by_event: Mapping[str, RightsOfferingDecision] | None = None,
     opening_accounting_snapshot: LedgerSnapshot | None = None,
     backtest_checkpoint: BacktestCheckpoint | None = None,
     trading_calendar: pd.DataFrame | None = None,
@@ -341,6 +367,7 @@ def run_backtest(
     if accounting_mode != "ledger_v2" and (
         accounting_events or dividend_tax_cny_by_event or dividend_tax_treatment_by_event
         or dividend_payment_withholding_per_share_cny_by_event
+        or rights_offering_decisions_by_event
     ):
         raise ValueError("显式账务事件与分红税费仅支持 ledger_v2 的非正式研究诊断")
     if opening_accounting_snapshot is not None and accounting_mode != "ledger_v2":
@@ -525,6 +552,7 @@ def run_backtest(
         dividend_tax_cny_by_event,
         dividend_tax_treatment_by_event,
         dividend_payment_withholding_per_share_cny_by_event,
+        rights_offering_decisions_by_event,
     )
     normalized_calendar = normalize_trading_calendar(trading_calendar) if trading_calendar is not None else None
     normalized_calendar_sha256 = (
@@ -708,12 +736,14 @@ def run_backtest(
         dividend_tax_cny_by_event,
         dividend_tax_treatment_by_event,
         dividend_payment_withholding_per_share_cny_by_event,
+        rights_offering_decisions_by_event,
     )
     accounting_events_sha256 = accounting_events_digest(
         accounting_event_list,
         event_schedule.dividend_tax_cny,
         event_schedule.dividend_tax_treatment,
         event_schedule.dividend_payment_withholding_per_share_cny,
+        event_schedule.rights_decisions_by_event,
     )
     if backtest_checkpoint is not None and backtest_checkpoint.accounting_events_sha256 != accounting_events_sha256:
         raise ValueError("checkpoint 绑定的公司行动事件或分红税务处理已变化；请从受影响日期重新计算")
@@ -767,6 +797,15 @@ def run_backtest(
             ):
                 raise ValueError(
                     f"现金分红 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照"
+                )
+            if isinstance(event, RightsOfferingEvent) and event.record_date < start_day and any(
+                phase >= start_day for phase in (
+                    event.subscription_start_date, event.subscription_end_date,
+                    event.registration_date, event.tradable_date,
+                )
+            ):
+                raise ValueError(
+                    f"配股 {event.event_id} ({event.symbol}) 缺少覆盖登记日 {event.record_date} 的期初权益快照"
                 )
     if opening_accounting_snapshot is not None:
         entitlement_by_id = {item.event_id: item for item in opening_accounting_snapshot.entitlements}
@@ -831,6 +870,48 @@ def run_backtest(
                             raise ValueError(
                                 f"现金分红 {event.event_id} 已在窗口前除息，但缺少期初应收款"
                             )
+            elif isinstance(event, RightsOfferingEvent) and event.record_date < start_day and any(
+                phase >= start_day for phase in (
+                    event.subscription_start_date, event.subscription_end_date,
+                    event.registration_date, event.tradable_date,
+                )
+            ):
+                entitlement = entitlement_by_id.get(event.event_id)
+                claim = claim_by_id.get(event.event_id)
+                if entitlement is None or entitlement.captured_on != event.record_date or entitlement.symbol != event.symbol:
+                    raise ValueError(f"配股 {event.event_id} 缺少期初登记日权益快照")
+                if claim is None or claim.claim_id != f"rights:{event.event_id}":
+                    raise ValueError(f"配股 {event.event_id} 缺少期初配股权利账目")
+                if claim.exact_entitlement != Decimal(entitlement.total_shares) * event.rights_per_old_share:
+                    raise ValueError(f"配股 {event.event_id} 期初精确权利数量与事件比例不匹配")
+                if claim.source_id != event.source.source_id or claim.source_sha256 != event.source.sha256:
+                    raise ValueError(f"配股 {event.event_id} 期初来源与本次事件不匹配")
+                decision = (rights_offering_decisions_by_event or {}).get(event.event_id)
+                snapshot_day = opening_accounting_snapshot.as_of_date
+                decision_applied = bool(
+                    decision and decision.decision_date is not None and decision.decision_date <= snapshot_day
+                )
+                expected_status = "RIGHTS_DISPOSITION_REQUIRED"
+                if entitlement.total_shares == 0:
+                    expected_status = "CANCELLED"
+                elif decision_applied and decision.disposition == "DECLINE":
+                    expected_status = "CANCELLED"
+                elif decision_applied and decision.disposition == "SUBSCRIBE":
+                    expected_status = "SETTLED" if event.registration_date <= snapshot_day else "SUBSCRIBED_PENDING_ALLOTMENT"
+                if claim.status != expected_status:
+                    raise ValueError(
+                        f"配股 {event.event_id} 期初状态与已发生阶段不匹配："
+                        f"expected={expected_status}, actual={claim.status}"
+                    )
+                expected_next_phase = (
+                    None if expected_status in {"CANCELLED", "SETTLED"}
+                    else event.registration_date if expected_status == "SUBSCRIBED_PENDING_ALLOTMENT"
+                    else event.subscription_start_date if snapshot_day < event.subscription_start_date
+                    else event.subscription_end_date if snapshot_day < event.subscription_end_date
+                    else event.registration_date
+                )
+                if claim.next_phase_date != expected_next_phase:
+                    raise ValueError(f"配股 {event.event_id} 期初下一阶段日期不匹配")
         if opening_accounting_snapshot is not None:
             for event in accounting_event_list:
                 if isinstance(event, CodeChangeEvent) and event.effective_date < start_day:
@@ -881,7 +962,30 @@ def run_backtest(
             as_of=action_day,
             underlying_close_cny=Decimal(str(float(row["close"]))),
             price_source=str(row.get("data_source", "normalized_input_bars")),
-            price_source_sha256=accounting_valuation_inputs_sha256,
+            price_source_sha256=_accounting_price_evidence_sha256(event.symbol, action_day.isoformat(), row),
+            price_date=action_day,
+            is_suspended=False,
+        )
+
+    def mark_rights_claim_at_close(
+        event: RightsOfferingEvent,
+        action_day: date,
+        day_frame: pd.DataFrame,
+    ) -> None:
+        if execution_ledger is None:
+            raise ValueError("配股权利估值仅支持 ledger_v2")
+        row = day_frame.loc[event.symbol] if event.symbol in day_frame.index else None
+        if row is None or pd.isna(row.get("close")) or float(row["close"]) <= 0:
+            raise ValueError(f"配股权利 {event.event_id} 在 {action_day} 缺少有效底层收盘价")
+        suspended = row.get("is_suspended")
+        if pd.isna(suspended) or bool(suspended):
+            raise ValueError(f"配股权利 {event.event_id} 在 {action_day} 停牌状态未知或已停牌，不能估值")
+        execution_ledger.mark_rights_offering_claim(
+            event,
+            as_of=action_day,
+            underlying_close_cny=Decimal(str(float(row["close"]))),
+            price_source=str(row.get("data_source", "normalized_input_bars")),
+            price_source_sha256=_accounting_price_evidence_sha256(event.symbol, action_day.isoformat(), row),
             price_date=action_day,
             is_suspended=False,
         )
@@ -922,9 +1026,20 @@ def run_backtest(
                     raise ValueError(f"期初待登记权利 {claim.event_id} 缺少对应送转事件")
                 active_distribution_claims[event.event_id] = event
 
-    pending_targets: dict[str, float] | None = (
-        dict(backtest_checkpoint.pending_targets) if backtest_checkpoint is not None else None
-    )
+    pending_targets: dict[str, float] | None = None
+    if backtest_checkpoint is not None:
+        targets_active = backtest_checkpoint.pending_targets_active
+        if targets_active is None:
+            # Legacy v1 checkpoints did not distinguish an empty liquidation
+            # target from the absence of a pending signal. Reconstruct that
+            # bit from the frozen strategy schedule; non-empty targets are
+            # unambiguously active.
+            targets_active = bool(backtest_checkpoint.pending_targets) or (
+                backtest_checkpoint.global_session_index >= lookback
+                and (backtest_checkpoint.global_session_index - lookback) % rebalance_sessions == 0
+            )
+        if targets_active:
+            pending_targets = dict(backtest_checkpoint.pending_targets)
     transition_signal_ready_index: dict[str, int] = (
         dict(backtest_checkpoint.transition_signal_ready_index) if backtest_checkpoint is not None else {}
     )
@@ -1052,6 +1167,34 @@ def run_backtest(
                 "trade_date": day_date,
                 "event_id": event.event_id,
                 "event_type": "SHARE_DISTRIBUTION_TRADABLE",
+                "symbol": event.symbol,
+                "tradable_date": event.tradable_date.isoformat(),
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        for event in event_schedule.rights_registrations.get(pd.Timestamp(date).date(), ()):
+            if execution_ledger is None:
+                raise ValueError("配股股份登记仅支持 ledger_v2")
+            claim = next((item for item in execution_ledger.claims if item.claim_id == f"rights:{event.event_id}"), None)
+            if claim is None or claim.status in {"CANCELLED", "RIGHTS_DISPOSITION_REQUIRED"}:
+                continue
+            execution_ledger.allot_rights_shares(event, as_of=event.registration_date)
+            sync_projection_from_ledger()
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "RIGHTS_SHARES_REGISTERED",
+                "symbol": event.symbol,
+                "registration_date": event.registration_date.isoformat(),
+                "tradable_date": event.tradable_date.isoformat(),
+                "accounting_source": "typed_accounting_event_ledger_v2",
+            })
+
+        for event in event_schedule.rights_tradabilities.get(pd.Timestamp(date).date(), ()):
+            security_events.append({
+                "trade_date": day_date,
+                "event_id": event.event_id,
+                "event_type": "RIGHTS_SHARES_TRADABLE",
                 "symbol": event.symbol,
                 "tradable_date": event.tradable_date.isoformat(),
                 "accounting_source": "typed_accounting_event_ledger_v2",
@@ -1371,6 +1514,54 @@ def run_backtest(
                 execution_ledger.record_share_distribution(event, as_of=event.record_date)
             for event in event_schedule.dividend_records.get(action_day, ()):
                 execution_ledger.record_cash_dividend(event, as_of=event.record_date)
+            for event in event_schedule.rights_records.get(action_day, ()):
+                execution_ledger.record_rights_offering(event, as_of=event.record_date)
+                security_events.append({
+                    "trade_date": day_date,
+                    "event_id": event.event_id,
+                    "event_type": "RIGHTS_ENTITLEMENT_RECORDED",
+                    "symbol": event.symbol,
+                    "eligible_shares": sum(
+                        item.quantity for item in next(
+                            entitlement for entitlement in execution_ledger.snapshot().entitlements
+                            if entitlement.event_id == event.event_id
+                        ).lots
+                    ),
+                    "subscription_start_date": event.subscription_start_date.isoformat(),
+                    "registration_date": event.registration_date.isoformat(),
+                    "tradable_date": event.tradable_date.isoformat(),
+                    "trade_or_commission_created": False,
+                })
+            for event, decision in event_schedule.rights_decisions.get(action_day, ()):
+                claim = next((item for item in execution_ledger.claims if item.claim_id == f"rights:{event.event_id}"), None)
+                if claim is None or claim.status == "CANCELLED":
+                    continue
+                if decision.disposition == "MANUAL_REVIEW":
+                    continue
+                execution_ledger.decide_rights_offering(
+                    event,
+                    disposition=decision.disposition,
+                    as_of=decision.decision_date,
+                    allocated_rights_shares=decision.allocated_rights_shares,
+                    allocation_evidence=decision.allocation_evidence,
+                    subscription_fee_cny=decision.subscription_fee_cny or Decimal("0"),
+                )
+                sync_projection_from_ledger()
+                security_events.append({
+                    "trade_date": day_date,
+                    "event_id": event.event_id,
+                    "event_type": f"RIGHTS_{decision.disposition}",
+                    "symbol": event.symbol,
+                    "decision_date": decision.decision_date.isoformat(),
+                    "cash_cny": str(execution_ledger.cash_cny),
+                    "trade_or_commission_created": False,
+                })
+            for event in event_by_id.values():
+                if not isinstance(event, RightsOfferingEvent) or not event.record_date <= action_day < event.registration_date:
+                    continue
+                claim = next((item for item in execution_ledger.claims if item.claim_id == f"rights:{event.event_id}"), None)
+                if claim is not None and claim.status in {"RIGHTS_DISPOSITION_REQUIRED", "SUBSCRIBED_PENDING_ALLOTMENT"}:
+                    mark_rights_claim_at_close(event, action_day, day)
             for pending_event in tuple(active_distribution_claims.values()):
                 if not pending_event.effective_date <= action_day < pending_event.registration_date:
                     continue
@@ -1593,25 +1784,13 @@ def run_backtest(
         ).hexdigest()
     accounting_event_data_sha256 = None
     if accounting_event_list:
-        event_payload = json.dumps(
-            {
-                "events": [asdict(event) for event in sorted(accounting_event_list, key=lambda item: item.event_id)],
-                "dividend_tax_cny_by_event": {
-                    event_id: None if amount is None else str(amount)
-                    for event_id, amount in sorted(event_schedule.dividend_tax_cny.items())
-                },
-                "dividend_tax_treatment_by_event": dict(sorted(event_schedule.dividend_tax_treatment.items())),
-                "dividend_payment_withholding_per_share_cny_by_event": {
-                    event_id: None if amount is None else str(amount)
-                    for event_id, amount in sorted(event_schedule.dividend_payment_withholding_per_share_cny.items())
-                },
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        accounting_event_data_sha256 = hashlib.sha256(event_payload).hexdigest()
+        accounting_event_data_sha256 = accounting_events_digest(
+            accounting_event_list,
+            event_schedule.dividend_tax_cny,
+            event_schedule.dividend_tax_treatment,
+            event_schedule.dividend_payment_withholding_per_share_cny,
+            event_schedule.rights_decisions_by_event,
+        )
         data_digest = hashlib.sha256(
             f"{data_digest}:{accounting_event_data_sha256}".encode("utf-8")
         ).hexdigest()
@@ -1740,13 +1919,14 @@ def run_backtest(
             benchmark_data_digest,
         )
         strategy_checkpoint = BacktestCheckpoint(
-            schema_version=1,
+            schema_version=2,
             strategy_id=str(strategy["name"]),
             as_of_date=last_date,
             next_expected_session=future_open_dates.iloc[0],
             global_session_index=global_session_start + len(dates) - 1,
             trade_count=trade_sequence_start + len(trades),
             pending_targets=tuple(sorted((pending_targets or {}).items())),
+            pending_targets_active=pending_targets is not None,
             transition_signal_ready_index=tuple(sorted(transition_signal_ready_index.items())),
             signal_history=tuple(history_rows),
             signal_price_modes=tuple(sorted(signal_modes.items())),
@@ -1863,7 +2043,7 @@ def run_backtest(
             strategy_checkpoint.next_expected_session.isoformat() if strategy_checkpoint else None
         ),
         "backtest_continuation_scope": (
-            "full_rule_based_strategy_checkpoint_v1" if strategy_checkpoint
+            f"full_rule_based_strategy_checkpoint_v{strategy_checkpoint.schema_version}" if strategy_checkpoint
             else "ledger_snapshot_only" if opening_accounting_snapshot is not None
             else "single_window_no_continuation"
         ),

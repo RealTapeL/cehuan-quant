@@ -921,6 +921,10 @@ def main(argv: list[str] | None = None) -> int:
                     accounting_event_bundle.dividend_payment_withholding_per_share_cny_by_event
                     if accounting_event_bundle else None
                 ),
+                rights_offering_decisions_by_event=(
+                    accounting_event_bundle.rights_offering_decisions_by_event
+                    if accounting_event_bundle else None
+                ),
                 opening_accounting_snapshot=opening_snapshot,
                 backtest_checkpoint=backtest_checkpoint,
                 trading_calendar=trading_calendar,

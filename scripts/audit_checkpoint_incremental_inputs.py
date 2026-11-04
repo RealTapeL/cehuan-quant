@@ -179,7 +179,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="生成 checkpoint 增量输入的只读兼容性预检报告；不会放行回测续跑",
     )
-    parser.add_argument("--checkpoint", required=True, help="已经封存并校验的 checkpoint v1 JSON")
+    parser.add_argument("--checkpoint", required=True, help="已经封存并校验的 checkpoint v1/v2 JSON")
     parser.add_argument("--baseline-proof", required=True, help="保存 checkpoint 历史输入前缀及截止时点证据的 JSON")
     parser.add_argument("--candidate-proof", required=True, help="候选新增输入及其来源证明 JSON")
     parser.add_argument("--baseline-rebuild-report", help="可选：与 baseline proof 同次生成的规范化重建报告")

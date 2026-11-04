@@ -128,3 +128,56 @@ def test_accounting_event_csv_reads_deferred_dividend_payment_withholding_policy
     pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
     with pytest.raises(ValueError, match="要求 tax_cny 留空"):
         read_accounting_event_csv(event_csv)
+
+
+def test_accounting_event_csv_reads_rights_offering_and_frozen_disposition(tmp_path):
+    archive = tmp_path / "rights-notice.pdf"
+    archive.write_bytes(b"synthetic rights notice")
+    row = _event_row(archive)
+    row.update({
+        "event_id": "rights-001",
+        "event_type": "RIGHTS_OFFERING",
+        "symbol": "SH600000",
+        "record_date": "2025-01-02",
+        "registration_date": "2025-01-08",
+        "tradable_date": "2025-01-10",
+        "share_ratio": "0.2",
+        "subscription_start_date": "2025-01-03",
+        "subscription_end_date": "2025-01-06",
+        "subscription_price_cny": "5.00",
+        "decision_policy": "SUBSCRIBE",
+        "decision_date": "2025-01-03",
+        "subscription_fee_cny": "0.25",
+        "allocated_rights_shares": "",
+        "allocation_evidence": "",
+        "ex_date": "",
+        "payable_date": "",
+        "gross_per_share_cny": "",
+        "old_symbol": "",
+        "new_symbol": "",
+        "effective_date": "",
+        "security_identity": "",
+        "fractional_share_method": "",
+        "tax_cny": "",
+        "tax_treatment": "",
+        "payment_withholding_per_share_cny": "",
+    })
+    event_csv = tmp_path / "events.csv"
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+
+    bundle = read_accounting_event_csv(event_csv)
+
+    event = bundle.events[0]
+    assert event.event_id == "rights-001"
+    assert event.registration_date.isoformat() == "2025-01-08"
+    assert event.tradable_date.isoformat() == "2025-01-10"
+    assert event.rights_per_old_share == Decimal("0.2")
+    decision = bundle.rights_offering_decisions_by_event["rights-001"]
+    assert decision.disposition == "SUBSCRIBE"
+    assert decision.decision_date.isoformat() == "2025-01-03"
+    assert decision.subscription_fee_cny == Decimal("0.25")
+
+    row["subscription_fee_cny"] = ""
+    pd.DataFrame([row], columns=ACCOUNTING_EVENT_CSV_COLUMNS).to_csv(event_csv, index=False)
+    with pytest.raises(ValueError, match="必须提供 decision_date 和已明确的 subscription_fee_cny"):
+        read_accounting_event_csv(event_csv)

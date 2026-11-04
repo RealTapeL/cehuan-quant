@@ -710,6 +710,9 @@ class PortfolioLedger:
                 valuation_source=None,
                 status="RIGHTS_DISPOSITION_REQUIRED" if exact_rights else "CANCELLED",
                 acquired_on=event.record_date,
+                next_phase_date=event.subscription_start_date if exact_rights else None,
+                source_id=event.source.source_id,
+                source_sha256=event.source.sha256,
             )
             return (candidate._entry(
                 operation_key, event.event_id, "RIGHTS_RECORD", event.record_date,
@@ -1276,6 +1279,109 @@ class PortfolioLedger:
 
         return self._apply_once(event.event_id, f"DISTRIBUTION_MARK:{day.isoformat()}", payload, mutate)
 
+    def mark_rights_offering_claim(
+        self,
+        event: RightsOfferingEvent,
+        *,
+        as_of: date | str,
+        underlying_close_cny: Decimal | int | str,
+        price_source: str,
+        price_source_sha256: str,
+        price_date: date | str,
+        is_suspended: bool | None,
+    ) -> tuple[LedgerEntry, ...]:
+        """Mark an open research right with an explicitly non-market proxy.
+
+        Before subscription, the proxy is intrinsic value only. After a frozen
+        subscription, it values the pending shares at the underlying close.
+        This is a research estimate, never an actual right trade price.
+        """
+        day = calendar_date(as_of, "as_of")
+        if not event.record_date <= day < event.registration_date:
+            raise ValueError("配股权利估值只能在登记日至新股登记日前处理")
+        claim_id = f"rights:{event.event_id}"
+        claim = next((item for item in self.claims if item.claim_id == claim_id), None)
+        if claim is None or claim.status not in {
+            "RIGHTS_DISPOSITION_REQUIRED", "SUBSCRIBED_PENDING_ALLOTMENT",
+        }:
+            raise ValueError(f"配股权利 {claim_id} 不处于可估值状态")
+        price = decimal_value(underlying_close_cny, "underlying_close_cny", nonnegative=True)
+        if price <= 0:
+            raise ValueError("配股权利估值所用收盘价必须大于 0")
+        source = str(price_source).strip()
+        if not source:
+            raise ValueError("配股权利估值必须绑定底层收盘价来源")
+        source_hash = str(price_source_sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+            raise ValueError("配股权利估值必须绑定底层行情 SHA-256")
+        quote_date = calendar_date(price_date, "price_date")
+        if quote_date != day:
+            raise ValueError("配股权利估值必须使用估值日对应的收盘价")
+        if is_suspended is not False:
+            raise ValueError("底层证券停牌状态未知或已停牌，不能使用收盘价代理估值")
+        exact_rights = claim.exact_entitlement or Decimal("0")
+        if claim.status == "SUBSCRIBED_PENDING_ALLOTMENT":
+            if claim.final_allocated_shares is None:
+                raise ValueError("已认购配股的最终股数未确认，不能估值待登记股份")
+            value = price * claim.final_allocated_shares
+            method = "UNDERLYING_CLOSE_PENDING_SHARES_PROXY"
+        else:
+            value = max(Decimal("0"), price - event.subscription_price_cny) * exact_rights
+            method = "RIGHTS_INTRINSIC_CLOSE_PROXY"
+        payload = {
+            "event_id": event.event_id,
+            "claim_id": claim_id,
+            "as_of": day.isoformat(),
+            "underlying_close_cny": str(price),
+            "valuation_cny": str(value),
+            "valuation_method": method,
+            "price_source": source,
+            "price_source_sha256": source_hash,
+            "price_date": quote_date.isoformat(),
+            "is_suspended": False,
+            "action_source_sha256": event.source.sha256,
+        }
+
+        def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            current = candidate._claims[claim_id]
+            if current.status == "SUBSCRIBED_PENDING_ALLOTMENT":
+                next_phase_date = event.registration_date
+            elif day < event.subscription_start_date:
+                next_phase_date = event.subscription_start_date
+            elif day < event.subscription_end_date:
+                next_phase_date = event.subscription_end_date
+            else:
+                next_phase_date = event.registration_date
+            candidate._claims[claim_id] = replace(
+                current,
+                valuation_cny=value,
+                valuation_source=f"{method}:{source}:{source_hash}",
+                valuation_as_of=day,
+                next_phase_date=next_phase_date,
+            )
+            return (candidate._entry(
+                operation_key, event.event_id, "RIGHTS_MARK", day,
+                "RIGHTS_OFFERING_CLAIM_MARK", Decimal("0"), (), {
+                    "claim_id": claim_id,
+                    "exact_rights": exact_rights,
+                    "allocated_rights_shares": current.final_allocated_shares,
+                    "subscription_price_cny": event.subscription_price_cny,
+                    "underlying_close_cny": price,
+                    "valuation_cny": value,
+                    "valuation_method": method,
+                    "price_source": source,
+                    "price_source_sha256": source_hash,
+                    "underlying_symbol": event.symbol,
+                    "price_date": quote_date.isoformat(),
+                    "is_suspended": False,
+                    "is_actual_right_trade_price": False,
+                    "next_phase_date": event.registration_date.isoformat(),
+                    **self._source_details(event.source),
+                },
+            ),)
+
+        return self._apply_once(event.event_id, f"RIGHTS_MARK:{day.isoformat()}", payload, mutate)
+
     def register_share_distribution(
         self,
         event: ShareDistributionEvent,
@@ -1429,7 +1535,7 @@ class PortfolioLedger:
             if claim is None or claim.status != "RIGHTS_DISPOSITION_REQUIRED":
                 raise ValueError(f"配股权利 {claim_id} 不在待处置状态")
             if disposition == "DECLINE":
-                candidate._claims[claim_id] = replace(claim, status="CANCELLED")
+                candidate._claims[claim_id] = replace(claim, status="CANCELLED", next_phase_date=None)
                 entry_type = "RIGHTS_DECLINED"
                 cash_delta = Decimal("0")
                 details = {
@@ -1446,6 +1552,7 @@ class PortfolioLedger:
                     final_allocated_shares=allocated_rights_shares,
                     cost_basis_cny=notional,
                     status="SUBSCRIBED_PENDING_ALLOTMENT",
+                    next_phase_date=event.registration_date,
                 )
                 entry_type = "RIGHTS_SUBSCRIBED"
                 cash_delta = -notional
@@ -1478,8 +1585,8 @@ class PortfolioLedger:
         if not isinstance(event, RightsOfferingEvent):
             raise TypeError("allot_rights_shares 只接受 RightsOfferingEvent")
         day = calendar_date(as_of, "as_of")
-        if day != event.tradable_date:
-            raise ValueError("配股新股只能在公告的可流通日登记")
+        if day != event.registration_date:
+            raise ValueError("配股新股只能在公告的股份登记日登记")
         claim_id = f"rights:{event.event_id}"
         claim = self._claims.get(claim_id)
         if claim is None:
@@ -1515,7 +1622,7 @@ class PortfolioLedger:
                 total_shares=shares,
                 sellable_shares=0,
                 cost_basis_cny=current_claim.cost_basis_cny,
-                acquired_on=event.tradable_date,
+                acquired_on=event.registration_date,
                 sellable_from=event.tradable_date,
                 source_event_id=event.event_id,
             )
@@ -1523,10 +1630,11 @@ class PortfolioLedger:
                 current_claim,
                 final_allocated_shares=shares,
                 status="SETTLED",
+                next_phase_date=None,
             )
             return (candidate._entry(
-                operation_key, event.event_id, "RIGHTS_ALLOTMENT", event.tradable_date,
-                "RIGHTS_SHARES_ALLOTTED", Decimal("0"), ((event.symbol, shares),), {
+                operation_key, event.event_id, "RIGHTS_ALLOTMENT", event.registration_date,
+                "RIGHTS_SHARES_REGISTERED", Decimal("0"), ((event.symbol, shares),), {
                     "claim_id": claim_id,
                     "lot_id": lot_id,
                     "shares": shares,
