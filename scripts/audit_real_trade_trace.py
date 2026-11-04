@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from cehuan.data.canonical import read_bars
+from cehuan.data.canonical import parse_optional_bool, read_bars
 from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 
 
@@ -35,6 +35,56 @@ def _as_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _suspension_state_counts(values: pd.Series) -> dict[str, int]:
+    """Count tri-state suspension observations without treating unknown as false."""
+    states = parse_optional_bool(pd.Series(values, copy=False))
+    suspended = int(states.eq(True).fillna(False).sum())
+    not_suspended = int(states.eq(False).fillna(False).sum())
+    unknown = int(states.isna().sum())
+    total = int(len(states))
+    if suspended + not_suspended + unknown != total:
+        raise AssertionError("停牌三态计数未能覆盖全部观察行")
+    return {
+        "total_rows": total,
+        "suspended_rows": suspended,
+        "not_suspended_rows": not_suspended,
+        "unknown_rows": unknown,
+    }
+
+
+def _session_window_audit(
+    window: pd.DataFrame,
+    sessions: list[str],
+    signal_day: str,
+    lookback: int,
+    symbol_history: pd.DataFrame,
+) -> dict[str, Any]:
+    expected = [day for day in sessions if day <= signal_day][-lookback - 1:]
+    actual = window["trade_date"].astype(str).tolist()
+    counts = symbol_history["trade_date"].astype(str).value_counts()
+    duplicates = sorted(day for day in set(actual) if int(counts.get(day, 0)) > 1)
+    actual_set = set(actual)
+    missing = [day for day in expected if day not in actual_set]
+    off_calendar = [day for day in actual if day not in set(sessions)]
+    exact = actual == expected and not duplicates and not off_calendar
+    return {
+        "expected_open_session_count": len(expected),
+        "expected_open_session_dates": expected,
+        "actual_bar_row_count": len(actual),
+        "actual_bar_dates": actual,
+        "missing_open_session_dates": missing,
+        "off_calendar_bar_dates": sorted(set(off_calendar)),
+        "duplicate_symbol_date_rows": sum(max(0, int(counts.get(day, 0)) - 1) for day in set(actual)),
+        "duplicate_symbol_dates": duplicates,
+        "window_alignment_status": "MATCHED_EXACT_SESSION_WINDOW" if exact else "MISMATCH_ROW_WINDOW_VS_OPEN_SESSIONS",
+        "provider_source_values": sorted(symbol_history.loc[
+            symbol_history["trade_date"].astype(str).isin(actual), "data_source"
+        ].dropna().astype(str).unique()) if "data_source" in symbol_history else [],
+        "project_forward_fill_detected": False,
+        "provider_raw_response_vintage": "UNVERIFIED_NOT_ARCHIVED_WITH_CANONICAL_BARS",
+    }
 
 
 def _round_order_quantity(quantity: int, minimum: int, step: int) -> int:
@@ -159,7 +209,7 @@ def _signal_inputs(
             "signal_price_start": None,
             "signal_price_end": None,
             "recomputed_momentum": None,
-            "signal_window_suspended_count": None,
+            "signal_window_suspension_state_counts": None,
         }
     current = current_matches.iloc[-1]
     if len(signal_rows) <= lookback:
@@ -170,7 +220,7 @@ def _signal_inputs(
             "signal_price_start": None,
             "signal_price_end": _as_float(current.get("adjusted_close")),
             "recomputed_momentum": None,
-            "signal_window_suspended_count": int(signal_rows["is_suspended"].fillna(False).astype(bool).sum()),
+            "signal_window_suspension_state_counts": _suspension_state_counts(signal_rows["is_suspended"]),
         }
     base = signal_rows.iloc[-lookback - 1]
     end_price = _as_float(current.get("adjusted_close"))
@@ -189,14 +239,16 @@ def _signal_inputs(
         "signal_price_start": start_price,
         "signal_price_end": end_price,
         "recomputed_momentum": momentum,
-        "signal_window_suspended_count": int(window["is_suspended"].fillna(False).astype(bool).sum()),
+        "signal_window_suspension_state_counts": _suspension_state_counts(window["is_suspended"]),
     }
 
 
 def _suspension_candidate_audit(
     bars: pd.DataFrame,
     ranked: pd.DataFrame,
-    trades: pd.DataFrame,
+    fills: pd.DataFrame,
+    blocked_attempts: pd.DataFrame,
+    target_audit: pd.DataFrame,
     calendar: pd.DataFrame,
     strategy: dict[str, Any],
     symbol: str,
@@ -221,6 +273,11 @@ def _suspension_candidate_audit(
         if len(prior) <= lookback:
             continue
         window = prior.tail(lookback + 1).reset_index(drop=True)
+        calendar_audit = _session_window_audit(window, sessions, signal_day, lookback, history)
+        state_counts = _suspension_state_counts(window["is_suspended"])
+        return_state_counts = _suspension_state_counts(
+            window.loc[window.index != 0, "is_suspended"]
+        )
         session_pos = next((i for i, day in enumerate(sessions) if day == signal_day), None)
         execution_day = sessions[session_pos + 1] if session_pos is not None and session_pos + 1 < len(sessions) else None
         execution_rows = (
@@ -230,10 +287,14 @@ def _suspension_candidate_audit(
             ] if execution_day else pd.DataFrame()
         )
         execution = execution_rows.iloc[0].to_dict() if len(execution_rows) == 1 else {}
-        execution_trades = trades.loc[
-            trades["trade_date"].astype(str).eq(execution_day)
-            & trades["symbol"].astype(str).eq(symbol)
+        execution_fills = fills.loc[
+            fills["trade_date"].astype(str).eq(execution_day)
+            & fills["symbol"].astype(str).eq(symbol)
         ] if execution_day else pd.DataFrame()
+        execution_blocked = blocked_attempts.loc[
+            blocked_attempts["trade_date"].astype(str).eq(execution_day)
+            & blocked_attempts["symbol"].astype(str).eq(symbol)
+        ] if execution_day and {"trade_date", "symbol"}.issubset(blocked_attempts.columns) else pd.DataFrame()
         target_row = {
             "symbol": symbol,
             "signal_date": signal_day,
@@ -245,10 +306,21 @@ def _suspension_candidate_audit(
             "window_observations": len(window),
             "execution_is_suspended": execution.get("is_suspended"),
             "execution_open": execution.get("open"),
-            "execution_order_count": int(len(execution_trades)),
-            "execution_order_sides": ",".join(execution_trades["side"].astype(str).tolist()) if not execution_trades.empty else "NONE",
-            "execution_order_quantities": ",".join(execution_trades["quantity"].astype(str).tolist()) if not execution_trades.empty else "",
-            "window_suspended_observation_count": int(window["is_suspended"].fillna(False).astype(bool).sum()),
+            "execution_fill_record_count": int(len(execution_fills)),
+            "execution_fill_sides": ",".join(execution_fills["side"].astype(str).tolist()) if not execution_fills.empty else "NONE_RECORDED",
+            "execution_fill_quantities": ",".join(execution_fills["quantity"].astype(str).tolist()) if not execution_fills.empty else "",
+            "execution_blocked_simulation_attempt_count": int(len(execution_blocked)),
+            "execution_blocked_simulation_attempt_reasons": ",".join(execution_blocked.get("reason", pd.Series(dtype=str)).astype(str).tolist()),
+            "order_evidence_status": "UNKNOWN_NO_COMPLETE_ORDER_LOG",
+            "fill_file_semantics": "trades.csv rows are simulated fill records; not a complete order log",
+            "blocked_file_semantics": "blocked_orders.csv rows are recorded simulator-blocked attempts; not submitted broker orders",
+            "window_suspended_observation_count": state_counts["suspended_rows"],
+            "window_not_suspended_observation_count": state_counts["not_suspended_rows"],
+            "window_unknown_suspension_observation_count": state_counts["unknown_rows"],
+            "return_suspended_observation_count_excluding_base": return_state_counts["suspended_rows"],
+            "return_not_suspended_observation_count_excluding_base": return_state_counts["not_suspended_rows"],
+            "return_unknown_suspension_observation_count_excluding_base": return_state_counts["unknown_rows"],
+            **calendar_audit,
             "window_zero_volume_observation_count": int(pd.to_numeric(window["volume_shares"], errors="coerce").fillna(-1).eq(0).sum()),
             "window_status_source": ";".join(sorted(window["data_source"].dropna().astype(str).unique())) if "data_source" in window else "UNAVAILABLE",
             "availability_note": "available_at is adapter-assigned close time; historical provider publication/vintage remains unverified",
@@ -258,6 +330,8 @@ def _suspension_candidate_audit(
                 **target_row,
                 "observation_index": index,
                 "window_role": "LOOKBACK_BASE" if index == 0 else "SIGNAL_DATE" if index == len(window) - 1 else "LOOKBACK_OBSERVATION",
+                "calendar_is_open": row["trade_date"] in set(sessions),
+                "symbol_date_row_count": int(history["trade_date"].astype(str).eq(str(row["trade_date"])).sum()),
                 **row.to_dict(),
             })
         signal_neighbors = ranked.loc[
@@ -270,10 +344,19 @@ def _suspension_candidate_audit(
                 bars["trade_date"].astype(str).eq(neighbor_execution_day)
                 & bars["symbol"].astype(str).eq(str(row["symbol"]))
             ] if neighbor_execution_day else pd.DataFrame()
-            neighbor_fills = trades.loc[
-                trades["trade_date"].astype(str).eq(neighbor_execution_day)
-                & trades["symbol"].astype(str).eq(str(row["symbol"]))
+            neighbor_fills = fills.loc[
+                fills["trade_date"].astype(str).eq(neighbor_execution_day)
+                & fills["symbol"].astype(str).eq(str(row["symbol"]))
             ] if neighbor_execution_day else pd.DataFrame()
+            neighbor_blocked = blocked_attempts.loc[
+                blocked_attempts["trade_date"].astype(str).eq(neighbor_execution_day)
+                & blocked_attempts["symbol"].astype(str).eq(str(row["symbol"]))
+            ] if neighbor_execution_day and {"trade_date", "symbol"}.issubset(blocked_attempts.columns) else pd.DataFrame()
+            target_matches = target_audit.loc[
+                target_audit["execution_date"].astype(str).eq(str(neighbor_execution_day))
+                & target_audit["symbol"].astype(str).eq(str(row["symbol"]))
+            ] if neighbor_execution_day and not target_audit.empty else pd.DataFrame()
+            target_details = target_matches.iloc[0].to_dict() if len(target_matches) == 1 else {}
             neighbor_rows.append({
                 "signal_date": signal_day,
                 "execution_date": neighbor_execution_day,
@@ -285,14 +368,31 @@ def _suspension_candidate_audit(
                 "signal_day_is_suspended": row.get("is_suspended"),
                 "execution_bar_count": len(neighbor_bar),
                 "execution_is_suspended": neighbor_bar.iloc[0].get("is_suspended") if len(neighbor_bar) == 1 else None,
-                "execution_order_sides": ",".join(neighbor_fills["side"].astype(str).tolist()) if not neighbor_fills.empty else "NONE",
-                "execution_order_quantities": ",".join(neighbor_fills["quantity"].astype(str).tolist()) if not neighbor_fills.empty else "",
+                "execution_fill_record_count": int(len(neighbor_fills)),
+                "execution_fill_sides": ",".join(neighbor_fills["side"].astype(str).tolist()) if not neighbor_fills.empty else "NONE_RECORDED",
+                "execution_fill_quantities": ",".join(neighbor_fills["quantity"].astype(str).tolist()) if not neighbor_fills.empty else "",
+                "execution_blocked_simulation_attempt_count": int(len(neighbor_blocked)),
+                "execution_blocked_simulation_attempt_reasons": ",".join(neighbor_blocked.get("reason", pd.Series(dtype=str)).astype(str).tolist()),
+                "order_evidence_status": "UNKNOWN_NO_COMPLETE_ORDER_LOG",
+                "target_audit_status": "MATCHED_RECONSTRUCTION" if target_details else "NO_UNIQUE_TARGET_ROW",
+                "target_weight": target_details.get("target_weight"),
+                "target_amount_cny": target_details.get("target_amount_cny"),
+                "execution_open_price_cny": target_details.get("execution_open_price_cny"),
+                "raw_target_shares_before_rounding": target_details.get("raw_target_shares_before_rounding"),
+                "target_shares_after_fallback": target_details.get("target_shares_after_100_share_fallback"),
+                "current_shares_before_rebalance": target_details.get("current_shares_before_rebalance"),
+                "expected_simulated_fill_side": target_details.get("expected_order_side"),
+                "expected_simulated_fill_quantity": target_details.get("expected_order_quantity_after_fallback"),
+                "actual_fill_quantity_from_trades_csv": target_details.get("actual_fill_quantity"),
+                "target_fill_status": target_details.get("target_fill_status"),
+                "target_lifecycle_status": target_details.get("target_lifecycle_status"),
+                "market_rule_basis": target_details.get("market_rule_basis"),
             })
     return pd.DataFrame(window_rows), pd.DataFrame(neighbor_rows)
 
 
 def _reconstruct_targets(
-    trades: pd.DataFrame,
+    fills: pd.DataFrame,
     candidates: pd.DataFrame,
     bars: pd.DataFrame,
     calendar: pd.DataFrame,
@@ -305,7 +405,7 @@ def _reconstruct_targets(
         pd.to_datetime(calendar.loc[calendar["is_open"].astype(str).str.lower().isin(["true", "1"]), "trade_date"])
         .dt.strftime("%Y-%m-%d").unique()
     )
-    ordered_dates = sorted(trades["trade_date"].astype(str).unique())
+    ordered_dates = sorted(fills["trade_date"].astype(str).unique())
     cash = float(initial_cash_cny)
     positions: dict[str, int] = {}
     rows: list[dict[str, Any]] = []
@@ -356,7 +456,7 @@ def _reconstruct_targets(
                 minimum,
                 step,
             )
-        day_actual = trades.loc[trades["trade_date"].astype(str).eq(execution_date)]
+        day_actual = fills.loc[fills["trade_date"].astype(str).eq(execution_date)]
         actual_map = {
             (str(row.symbol), str(row.side)): int(row.quantity)
             for row in day_actual.itertuples(index=False)
@@ -445,7 +545,7 @@ def _reconstruct_targets(
 
 
 def _trade_rows(
-    trades: pd.DataFrame,
+    fills: pd.DataFrame,
     bars: pd.DataFrame,
     calendar: pd.DataFrame,
     ranked: pd.DataFrame,
@@ -472,7 +572,7 @@ def _trade_rows(
         for row in fallback.itertuples(index=False)
     }
     bars_lookup = bars.set_index([bars["trade_date"].astype(str), "symbol"], drop=False)
-    for source_line, row in enumerate(trades.itertuples(index=False), start=2):
+    for source_line, row in enumerate(fills.itertuples(index=False), start=2):
         day = str(row.trade_date)
         symbol = str(row.symbol)
         side = str(row.side)
@@ -507,7 +607,7 @@ def _trade_rows(
             "trade_id": str(journal_row.operation_key) if journal_row is not None else None,
             "experiment_id": experiment_id,
             "source_trade_row_number": source_line,
-            "source_trades_sha256": input_hashes["trades.csv"],
+            "source_fills_file_sha256": input_hashes["trades.csv"],
             "trade_fields_provenance": "RECORDED_FROM_FROZEN_TRADES_CSV",
             "trade_date": day,
             "symbol": symbol,
@@ -855,7 +955,7 @@ def main() -> int:
         ),
     }
     bars = read_bars(input_paths["bars.csv"])
-    raw_trades = pd.read_csv(input_paths["trades.csv"], keep_default_na=False)
+    raw_fills = pd.read_csv(input_paths["trades.csv"], keep_default_na=False)
     fallback = pd.read_csv(audit_input_dir / "trade-fallback-detail.csv")
     journal = pd.read_csv(input_paths["accounting_journal.csv"], dtype=str, keep_default_na=False)
     blocked = pd.read_csv(input_paths["blocked_orders.csv"], keep_default_na=False)
@@ -864,34 +964,53 @@ def main() -> int:
     run_metrics = _json(input_paths["metrics.json"])
     experiment_id = str(run_metrics.get("experiment_id", "UNAVAILABLE"))
     strategy, market, costs = config["strategy"], config["market"], config["costs"]
-    trades = raw_trades.copy()
-    trades["trade_date"] = trades["trade_date"].astype(str)
+    fills = raw_fills.copy()
+    fills["trade_date"] = fills["trade_date"].astype(str)
     signal_dates = sorted({
         max(day for day in pd.to_datetime(calendar.loc[
             calendar["is_open"].astype(str).str.lower().isin(["true", "1"]), "trade_date"
         ]).dt.strftime("%Y-%m-%d").unique() if day < execution_date)
-        for execution_date in trades["trade_date"].unique()
+        for execution_date in fills["trade_date"].unique()
     })
     ranked, reconstruction = _rank_audit(bars, input_paths["candidate-pool-by-signal.csv"], strategy, market, signal_dates)
-    audit = _trade_rows(trades, bars, calendar, ranked, journal, fallback, hashes, experiment_id, strategy, costs)
+    audit = _trade_rows(fills, bars, calendar, ranked, journal, fallback, hashes, experiment_id, strategy, costs)
     # A stable snapshot of signal candidates is retained so later reviewers can
     # reproduce why each fill mapped to a rank without rerunning the backtest.
     ranked.to_csv(out_dir / "candidate-ranks-reconstructed.csv", index=False)
     audit.to_csv(out_dir / "trade-audit.csv", index=False)
     trade_targets = _reconstruct_targets(
-        trades, ranked, bars, calendar, strategy, market, costs,
+        fills, ranked, bars, calendar, strategy, market, costs,
         float(run_metrics["initial_cash_cny"]),
     )
     trade_targets.to_csv(out_dir / "candidate-target-and-fill-audit.csv", index=False)
+    zero_target_rows = trade_targets.loc[
+        trade_targets.target_fill_status.astype(str).eq("TARGET_ROUNDED_TO_ZERO")
+    ].copy()
+    zero_review_rows: list[dict[str, Any]] = []
+    for row in zero_target_rows.to_dict(orient="records"):
+        following = ranked.loc[
+            ranked["signal_date"].astype(str).eq(str(row["signal_date"]))
+            & ranked["rank"].gt(int(strategy["max_positions"]))
+        ].sort_values("rank").head(1)
+        next_candidate = following.iloc[0].to_dict() if len(following) == 1 else {}
+        zero_review_rows.append({
+            **row,
+            "next_unselected_candidate_rank": int(next_candidate["rank"]) if next_candidate else None,
+            "next_unselected_candidate_symbol": str(next_candidate["symbol"]) if next_candidate else None,
+            "next_unselected_candidate_momentum": _as_float(next_candidate.get("momentum")) if next_candidate else None,
+            "replacement_applied": False,
+            "replacement_policy": "NOT_APPLIED_TOP_N_SELECTED_BEFORE_ROUNDING",
+        })
+    pd.DataFrame(zero_review_rows).to_csv(out_dir / "zero-target-review.csv", index=False)
     suspension_window = pd.DataFrame()
     suspension_neighbors = pd.DataFrame()
     if args.suspension_symbol:
         suspension_window, suspension_neighbors = _suspension_candidate_audit(
-            bars, ranked, trades, calendar, strategy, args.suspension_symbol,
+            bars, ranked, fills, blocked, trade_targets, calendar, strategy, args.suspension_symbol,
         )
         suspension_window.to_csv(out_dir / "suspension-candidate-window.csv", index=False)
         suspension_neighbors.to_csv(out_dir / "suspension-candidate-rank-neighbors.csv", index=False)
-    source_symbols = sorted(trades["symbol"].astype(str).unique())
+    source_symbols = sorted(fills["symbol"].astype(str).unique())
     selected_symbols = sorted(
         pd.read_csv(input_paths["candidate-pool-by-signal.csv"])
         .loc[lambda frame: frame["selected_target"].astype(str).str.lower().isin(["true", "1"]), "symbol"]
@@ -913,12 +1032,12 @@ def main() -> int:
         quotes, quote_queries = _capture_tencent_quotes(quote_symbols, out_dir, quote_start, quote_end)
         if not quotes.empty:
             quotes["date"] = pd.to_datetime(quotes["date"]).dt.strftime("%Y-%m-%d")
-            quote_comparison = trades.merge(
+            quote_comparison = fills.merge(
                 quotes, left_on=["trade_date", "symbol"], right_on=["date", "symbol"], how="left", suffixes=("_baostock", "_tencent")
             )
             bar_lookup = bars.assign(trade_date=bars["trade_date"].astype(str)).set_index(["trade_date", "symbol"])
             compare_rows = []
-            for trade in trades.itertuples(index=False):
+            for trade in fills.itertuples(index=False):
                 key = (str(trade.trade_date), str(trade.symbol))
                 own = bar_lookup.loc[key]
                 ext = quote_comparison.loc[
@@ -1124,7 +1243,7 @@ def main() -> int:
             {"input_family": "daily_ohlc", "primary_source": "BaoStock frozen point-in-time snapshot", "independent_source": "Tencent Finance via AKShare historical daily endpoint", "scope_checked": "24 fill dates / 14 traded securities", "status": "OHLC_COMPARISON_RECORDED; availability/vintage UNVERIFIED"},
             {"input_family": "volume_and_amount", "primary_source": "BaoStock", "independent_source": "Tencent Finance via AKShare", "scope_checked": "24 fill dates; Tencent 000xxx adapter unit behavior separately flagged", "status": "UNIT_AND_ROUNDING_REVIEW_REQUIRED"},
             {"input_family": "historical_trading_calendar", "primary_source": "frozen BaoStock-derived calendar snapshot", "independent_source": "none in this audit", "scope_checked": "next-open mapping for 3 signal dates", "status": "MAPPING_MATCHED; historical source vintage UNVERIFIED"},
-            {"input_family": "security_status_and_universe", "primary_source": "BaoStock point-in-time rows", "independent_source": "none in this audit", "scope_checked": "24 trades and 6024 saved candidate rows", "status": "SOURCE_AND_HISTORICAL_AVAILABILITY_UNVERIFIED"},
+            {"input_family": "security_status_and_universe", "primary_source": "BaoStock point-in-time rows", "independent_source": "none in this audit", "scope_checked": "24 fill records and 6024 saved candidate rows", "status": "SOURCE_AND_HISTORICAL_AVAILABILITY_UNVERIFIED"},
             {"input_family": "market_rules_and_lots", "primary_source": "default configuration fallback", "independent_source": "none in this audit", "scope_checked": "347660 bars; all fallback", "status": "UNVERIFIED_FALLBACK_USED"},
             {"input_family": "historical_fees", "primary_source": "default configuration flat assumptions", "independent_source": "none in this audit", "scope_checked": "24 fills", "status": "UNVERIFIED_CONFIG_ASSUMPTION; HTS personal rate unavailable"},
             {"input_family": "corporate_actions", "primary_source": "in-window registered event tables (empty for the window)", "independent_source": "CNINFO structured dividend records for selected targets plus one issuer filing", "scope_checked": f"{len(selected_symbols)} selected target securities; not full candidate pool", "status": "INCOMPLETE_COVERAGE; empty registry not treated as no events"},
@@ -1136,9 +1255,10 @@ def main() -> int:
     # Records are not event-completeness evidence: the source registry is empty for this window.
     registry = pd.read_csv(experiment_dir / "inputs/provenance-registry.csv", keep_default_na=False)
     blocked_summary = {
-        "blocked_order_file_sha256": sha256_file(input_paths["blocked_orders.csv"]),
-        "blocked_order_row_count": int(len(blocked)),
-        "interpretation": "该文件没有已记录的阻断订单行；不能据此证明回测没有跳过的小于交易单位目标或未记录订单。",
+        "source_file_sha256": sha256_file(input_paths["blocked_orders.csv"]),
+        "recorded_simulator_blocked_attempt_count": int(len(blocked)),
+        "broker_order_log_status": "UNKNOWN_NO_COMPLETE_ORDER_LOG",
+        "interpretation": "该文件仅记录模拟器明确写出的受阻尝试；空文件不能证明没有目标、订单或其他未记录尝试。",
     }
     core_input_hashes_match = all(
         row["status"] == "MATCHED_FROZEN_INVENTORY"
@@ -1149,15 +1269,22 @@ def main() -> int:
         and all(value["candidate_reconstruction_status"] == "MATCH" for value in reconstruction.values())
     )
     all_inputs_frozen = all(row["status"] == "MATCHED_FROZEN_INVENTORY" for row in artifact_hash_checks.values())
+    git_status_result = subprocess.run(
+        ["git", "status", "--porcelain"], check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_type": "transaction_level_data_rule_fee_audit",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(),
+        "git_worktree_clean_at_generation": not bool(git_status_result),
+        "git_uncommitted_paths_at_generation": [line[3:] for line in git_status_result],
         "input_hashes": hashes,
         "experiment_id": experiment_id,
         "window": {"start": str(bars.trade_date.min()), "end": str(bars.trade_date.max()), "sessions": int(bars.trade_date.nunique()), "rows": int(len(bars))},
-        "trade_count": int(len(trades)),
+        "fill_record_count": int(len(fills)),
+        "fill_record_semantics": "trades.csv 每行是一笔模拟成交记录；不等同于订单数，也不能反推出未成交订单数。",
+        "order_log_status": "UNKNOWN_NO_COMPLETE_ORDER_LOG",
         "trade_audit_rows": int(len(audit)),
         "journal_linked_rows": int(audit.journal_link_status.eq("MATCHED").sum()),
         "candidate_reconstruction_by_signal_date": reconstruction,
@@ -1166,18 +1293,47 @@ def main() -> int:
         "selected_target_unique_symbols": len(selected_symbols),
         "selected_target_slots": int(trade_targets.selected_target.sum()),
         "selected_targets_reconstructed_to_zero_shares": int(trade_targets.target_fill_status.eq("TARGET_ROUNDED_TO_ZERO").sum()),
+        "zero_target_reviews": zero_review_rows,
+        "target_selection_and_zero_share_policy": {
+            "selection_order": "rank candidates and take max_positions before quantity rounding",
+            "zero_quantity_action": "retain_cash; no next-ranked replacement",
+            "order_lot_source": "configs/default.toml fallback; historical market rule not verified",
+        },
         "target_lifecycle_status_counts": {
             str(key): int(value) for key, value in trade_targets.target_lifecycle_status.value_counts(dropna=False).items()
         },
         "suspension_candidate_diagnostic": {
             "symbol": args.suspension_symbol,
             "window_rows": int(len(suspension_window)),
-            "window_total_suspended_rows_including_base": int(
-                suspension_window["is_suspended"].fillna(False).astype(bool).sum()
+            "window_state_counts_including_base": _suspension_state_counts(suspension_window["is_suspended"]) if not suspension_window.empty else None,
+            "return_observation_state_counts_excluding_base": _suspension_state_counts(
+                suspension_window.loc[suspension_window.window_role.ne("LOOKBACK_BASE"), "is_suspended"]
             ) if not suspension_window.empty else None,
-            "suspended_observation_count": int(
-                suspension_window.loc[suspension_window.window_role.ne("LOOKBACK_BASE"), "is_suspended"].fillna(False).astype(bool).sum()
-            ) if not suspension_window.empty else None,
+            "session_window_audit": (
+                suspension_window.iloc[0][[
+                    "expected_open_session_count", "expected_open_session_dates", "actual_bar_row_count",
+                    "missing_open_session_dates", "off_calendar_bar_dates", "duplicate_symbol_date_rows",
+                    "duplicate_symbol_dates", "window_alignment_status", "provider_source_values",
+                    "project_forward_fill_detected", "provider_raw_response_vintage",
+                ]].to_dict()
+                if not suspension_window.empty else None
+            ),
+            "signal_momentum_formula": "adjusted_close_t / adjusted_close_at_row_shift_20 - 1; calculated per symbol from stored bar rows, executable no earlier than next open",
+            "price_start": _as_float(suspension_window.iloc[0].get("adjusted_close")) if not suspension_window.empty else None,
+            "price_end": _as_float(suspension_window.iloc[-1].get("adjusted_close")) if not suspension_window.empty else None,
+            "price_ratio_end_over_start": (
+                _as_float(suspension_window.iloc[-1].get("adjusted_close")) / _as_float(suspension_window.iloc[0].get("adjusted_close"))
+                if not suspension_window.empty and _as_float(suspension_window.iloc[0].get("adjusted_close")) not in (None, 0)
+                else None
+            ),
+            "reconstructed_momentum": _as_float(suspension_neighbors.loc[
+                suspension_neighbors.symbol.astype(str).eq(str(args.suspension_symbol)), "momentum"
+            ].iloc[0]) if not suspension_neighbors.empty and not suspension_neighbors.loc[
+                suspension_neighbors.symbol.astype(str).eq(str(args.suspension_symbol))
+            ].empty else None,
+            "candidate_chain": suspension_neighbors.loc[
+                suspension_neighbors.symbol.astype(str).eq(str(args.suspension_symbol))
+            ].to_dict(orient="records") if not suspension_neighbors.empty else [],
             "neighbor_rows": int(len(suspension_neighbors)),
         } if args.suspension_symbol else None,
         "record_date_entitlement_audit": {
@@ -1188,16 +1344,16 @@ def main() -> int:
             "formal_entitlement_validation": "UNVERIFIED",
         },
         "candidate_target_fill_mismatch_rows": int(trade_targets.target_fill_status.astype(str).str.contains("REVIEW_REQUIRED").sum()),
-        "notional_cny": float(pd.to_numeric(trades.notional_cny).sum()),
-        "modeled_fees_cny": float(pd.to_numeric(trades.fees_cny).sum()),
-        "modeled_execution_impact_cny": float(pd.to_numeric(trades.execution_impact_vs_reference_cny).sum()),
+        "notional_cny": float(pd.to_numeric(fills.notional_cny).sum()),
+        "modeled_fees_cny": float(pd.to_numeric(fills.fees_cny).sum()),
+        "modeled_execution_impact_cny": float(pd.to_numeric(fills.execution_impact_vs_reference_cny).sum()),
         "market_rule_fallback_rows_in_window": int(run_metrics.get("market_rule_fallback_row_count", -1)),
         "all_trades_rule_fallback_status": sorted(set(audit.market_rule_source_status.astype(str))),
         "all_trades_fee_fallback_status": sorted(set(audit.fee_source_status.astype(str))),
         "actual_personal_broker_fee_evidence": "UNAVAILABLE",
         "historical_quote_vintage_and_at_decision_availability": "UNVERIFIED",
         "registered_provenance_rows": int(len(registry)),
-        "blocked_orders": blocked_summary,
+        "blocked_simulation_attempts": blocked_summary,
         "external_source_query_count": len(source_rows),
         "supplemental_filing_manifest_sha256": supplemental_manifest_sha256,
         "external_company_action_query_scope": f"CNINFO structured dividend endpoint for {len(selected_symbols)} selected target securities; not all {int(pd.read_csv(input_paths['candidate-pool-by-signal.csv']).symbol.nunique())} distinct eligible candidate securities.",
@@ -1227,13 +1383,15 @@ def main() -> int:
         "# 真实行情短窗口成交级数据审计",
         "",
         f"- 实验：`{summary['experiment_id']}`；窗口 `{summary['window']['start']}..{summary['window']['end']}`。",
-        f"- 成交行：{summary['trade_count']}；逐笔账本关联：{summary['journal_linked_rows']}。",
+        f"- 模拟成交记录：{summary['fill_record_count']}；逐笔账本关联：{summary['journal_linked_rows']}；完整订单日志：`{summary['order_log_status']}`。",
         f"- 模拟成交额：¥{summary['notional_cny']:.2f}；配置模拟费用：¥{summary['modeled_fees_cny']:.2f}；模拟滑点影响：¥{summary['modeled_execution_impact_cny']:.2f}。",
         f"- 市场规则：全窗 {summary['market_rule_fallback_rows_in_window']} 行使用回退；本次成交状态 `{summary['all_trades_rule_fallback_status']}`。",
         f"- 费率：所有本次成交 `{summary['all_trades_fee_fallback_status']}`；华泰个人费率证据 `{summary['actual_personal_broker_fee_evidence']}`。",
         f"- 候选：已保存 {summary['candidate_pool_rows_saved']} 行、{summary['candidate_unique_symbols_saved']} 个代码；排名重建状态按信号日见 JSON。",
         f"- 成交目标：{summary['selected_target_slots']} 个目标槽；其中按配置交易单位舍入为 0 股 {summary['selected_targets_reconstructed_to_zero_shares']} 个；目标与成交未解释差异 {summary['candidate_target_fill_mismatch_rows']} 行。",
-        f"- 拒单记录：{blocked_summary['blocked_order_row_count']} 行；它不覆盖低于最小交易单位而跳过的目标。",
+        f"- 选股与零股顺序：{summary['target_selection_and_zero_share_policy']}。零股目标保留现金；当前没有自动检查第 N+1 名替补。",
+        f"- 零股目标详情：`zero-target-review.csv`。如存在未入选的下一候选，表中记录其排名及代码；当前流程不应用该候选替补。",
+        f"- 模拟器明确记录的受阻尝试：{blocked_summary['recorded_simulator_blocked_attempt_count']} 行；这不是券商拒单/订单日志，当前完整订单证据为未知。",
         f"- 独立行情/公司行动查询数：{len(source_rows)}。独立来源对照是本次取得的查询结果，不证明全量行情或公司行动覆盖。",
         f"- 独立报价：成交日 OHLC 价格容差内匹配 {quote_match_summary.get('open_match_within_0_01', 0)}/{quote_match_summary.get('trade_quote_rows', 0)}、{quote_match_summary.get('high_match_within_0_01', 0)}/{quote_match_summary.get('trade_quote_rows', 0)}、{quote_match_summary.get('low_match_within_0_01', 0)}/{quote_match_summary.get('trade_quote_rows', 0)}、{quote_match_summary.get('close_match_within_0_01', 0)}/{quote_match_summary.get('trade_quote_rows', 0)}；成交量与成交额比较另有单位缩放和容差，见逐笔表。",
         f"- CNINFO 分红/送转接口：{dividend_match_summary.get('query_success_count', 0)}/{dividend_match_summary.get('query_count', 0)} 个选中目标查询成功，返回 {dividend_match_summary.get('returned_record_count', 0)} 条历史记录；查询范围不含全部公司行动。",
@@ -1241,7 +1399,7 @@ def main() -> int:
         "- 松发股份（SH603268）官方公告记载其重大资产重组筹划及 2024-10-08 继续停牌，事件与第一轮高排名候选的动量观察窗重叠；文档日期不是精确首次公开时刻，且这不是该窗口内已确认的现金/股数账务事件。",
         "- 公司行动：本审计按模拟登记日收盘持仓区间生成‘可能匹配’，包含登记日买入且收盘仍持有的区间；登记日收盘前已平仓则不匹配。该口径是审计候选规则，不代表已验证中国结算的账户权益；官方投资者教育与历史结算材料对登记日当日成交的表述不完全一致，详见登记日权益更正说明。CNINFO 股息接口只覆盖查询范围，不证明其他公司行动不存在。",
         f"- 目标生命周期：{summary['target_lifecycle_status_counts']}；零股目标与已有持仓清仓目标分别标注，交易单位来源仍为配置回退。",
-        f"- 停牌候选窗口：{summary['suspension_candidate_diagnostic']}；明细在 `suspension-candidate-window.csv` 和 `suspension-candidate-rank-neighbors.csv`（仅在指定 `--suspension-symbol` 时生成）。" if args.suspension_symbol else "",
+        f"- 停牌候选窗口：21 行含基准点的三态计数 `{summary['suspension_candidate_diagnostic']['window_state_counts_including_base']}`；20 个收益观察行计数 `{summary['suspension_candidate_diagnostic']['return_observation_state_counts_excluding_base']}`；窗口日历核验 `{summary['suspension_candidate_diagnostic']['session_window_audit']}`。成交记录不是订单数，订单状态为未知；完整信号→排名→目标→下一开市日执行痕迹见 `suspension-candidate-rank-neighbors.csv`。" if args.suspension_symbol else "",
         f"- 输入证据：核心行情、日历、配置、成交、账本、阻断单及 metrics 与此前清单 {sum(row['status'] == 'MATCHED_FROZEN_INVENTORY' for row in artifact_hash_checks.values())}/{len(expected_inventory_paths)} 项相符；候选池通过重建匹配但缺少旧哈希锚定。",
         "- 历史行情 vintage、历史决策时点可得性和公告来源人工签认仍未验证。正式基线 `NOT_READY`，增量续跑 `can_continue=false`。",
         "",
