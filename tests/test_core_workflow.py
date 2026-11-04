@@ -78,6 +78,11 @@ def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
     expected_first_order = (date(2025, 1, 1) + timedelta(days=4)).isoformat()
     assert trade_dates[0] == expected_first_order
     assert (result["trades"].loc[result["trades"]["side"] == "BUY", "quantity"] % 100 == 0).all()
+    trust = result["metrics"]["research_trust"]
+    assert trust["historical_availability_and_vendor_vintage"]["status"] == "UNVERIFIED"
+    assert trust["market_rule_coverage"]["status"] == "FALLBACK_USED"
+    assert trust["corporate_action_coverage"]["status"] == "UNVERIFIED_COVERAGE"
+    assert trust["formal_baseline"]["status"] == "NOT_READY"
 
 
 def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events():

@@ -32,6 +32,12 @@ BaoStock 是显式可选适配器，不改变 AKShare 默认数据源。运行 `
 
 点时数据状态分层报告：`raw_bar_quality` 表示规范行情结构与来源哈希检查；`universe_reconciliation_quality` 表示已分类沪深 `type=1` 日成员与日线及状态的对账；`point_in_time_quality` 汇总前两项与身份事件解释，不证明未知类型或全市场历史完整；`baseline_ready` 由 `baseline-readiness` 审计生成，绑定评价窗口、输入 SHA-256、审计代码提交和工作区状态。编辑 TOML 或质量 JSON 不能替代该审计。当前回测引擎还没有实际消费审核过的有效日期交易规则、历史费率及完整公司行动账本，因此正式门控应保持 `NOT_READY`。正式 `backtest` 唯一接受同次 `universe-audit` 生成的过滤行情 `--data <point_in_time_bars.csv>` 与 `--prevalidated-quality <point_in_time_quality.json>`；`--formal --universe` 会被拒绝。`--readiness-universe` 是重新审计所用的原始股票池快照目录，不参与行情过滤。需要直接用股票池过滤原始行情时，应显式使用 `--diagnostic --universe`；`baseline-diagnostics` 也需显式 `--diagnostic`，其回退场景不属于正式基线。身份事件只处理 1:1 代码变更；新代码信号不接续旧代码价格历史。详情见[证券身份事件与公司行动边界](security-identity.md)。
 
+## 研究产物可信度标签
+
+每次回测的 `metrics.json` 会自动附带 `research_trust`。它分开展示当前行情文件完整性、结构性质量检查、checkpoint 绑定、历史供应商可得性、规则、费用、公司行动覆盖和 readiness 门槛。标签刻意区分“引擎消费了输入”与“来源已独立核验”：有效日期规则/费率文件即使被使用，也不会自动标记为来源已复核；事件列表为空也不会被解释为没有公司行动；`available_at` 不能证明历史供应商发布时间。具体标签和含义见 [`trust_labels.py`](../src/cehuan/research/trust_labels.py)。
+
+诊断运行默认显示 `formal_baseline=NOT_READY`。只有正式路径通过程序生成的 readiness 门槛时，才会显示 `READINESS_GATE_PASSED`；这代表数据/流程门槛，不代表策略盈利、真实账户结果或交易建议。
+
 BaoStock 0.9.4 原始 `socketutil.send_msg` 在 `recv()` 返回空字节时不会退出，可能永久空转；适配器在单连接会话中安装 EOF 防护，并设置 20 秒 socket 超时。进程内线程锁和跨进程文件锁共同避免本机并发会话。默认请求最小间隔 1 秒；连接错误最多重试 1 次并指数退避，明确的 `10001001`“用户未登录”响应最多重新登录 1 次后重试原请求；其他 API/权限错误不自动重试。默认本地每日预算 49,000 次（包含分页请求），低于官方 50,000 次限制。断点逐日记录 CSV 哈希和行数；续跑先校验成员、日历、基础资料和追加请求日志。哈希不同或结构不符即停止，不覆盖原文件。原有无哈希断点首次续跑时仅在结构、代码唯一性检查通过后登记本地哈希，并标明迁移来源。具体限制与源码行为见[数据源审计](data-provider-audit.md)。
 
 若 BaoStock 在探测后仍不可用，可用 `cehuan universe-import` 导入另一供应商的历史成员 CSV。必须包含 `trade_date,symbol,source,source_record_date,source_retrieved_at_utc`；`source_record_date` 必须逐行等于 `trade_date`。可选字段为 `security_type,daily_trade_status,is_suspended,is_st,st_status_source,name`。缺失状态保持未知，重复 `(trade_date,symbol)` 拒绝导入。命令保留原文件与哈希，不会查询今天的股票列表或回填历史。模板与示例见[历史股票池 CSV 导入规范](historical-universe-import.md)。
@@ -55,7 +61,7 @@ BaoStock 日线可为取得的日期提供 ST/停牌状态，日期成员接口�
 ## 防泄漏规则
 
 1. t 日特征只读取 t 日收盘及之前数据；任何订单最早放在下一交易日。
-2. 每日接口的 `available_at` 按当日 15:00 Asia/Shanghai 记录为可用时间假设；接口实际到达时间另记 `retrieved_at_utc`。计划命令遇到未来的 `available_at` 会停止，避免收盘前用未完成日线生成计划。
+2. BaoStock 与 AKShare 适配器把日线 `available_at` 标为当日 15:00 Asia/Shanghai。这是“收盘数据可用”的程序假设，不是供应商对历史发布时间的证明。它实际参与计划生成门槛：若该时间晚于命令运行时刻，计划被拒绝；最新行的实际 `retrieved_at_utc` 若早于该假设时间，也会被拒绝。回测信号按 t 日收盘计算，最早模拟在下一交易日开盘执行。历史快照后来抓取到的 `available_at=15:00` 不能证明供应商在该历史时点已经发布同一数据版本。
 3. 前复权价格可能随未来除权事件回改历史；AKShare 数据说明还展示了个别证券后复权历史价出现负值的风险。当前只有每只证券的后复权收盘完整且全为正时才用作信号；整只证券没有复权值时回退原始收盘；部分缺失或非正时该证券动量暂不计算，避免在一个收益序列中混用价格口径。严谨历史复现仍需保存每次获取的复权因子/数据快照。
 4. 不能用当前 ST 名单或当前股票列表代替历史状态/历史成分。没有状态记录时，计划动作标成 `VERIFY` 或 `HOLD`，回测跳过未知状态行。
 5. 交易所日历与停牌不能从缺失行情行准确推出。应提供时点证券主数据和交易所日历文件后再扩大股票池。数据行还会记录预期收盘可用时间和实际拉取时间；若最近交易日快照是在收盘可用时间前拉取，计划生成会要求收盘后重新获取。

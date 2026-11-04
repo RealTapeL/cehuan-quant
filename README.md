@@ -69,6 +69,8 @@ momentum(i, t, L) = adjusted_close(i, t) / adjusted_close(i, t-L) - 1
 - `docs/evidence/huatai-fill-field-investigation-template.csv` 是成交字段调查空表。当前没有经核验的脱敏华泰成交样本；跨文件去重仍为独立审查原型，不接入真实账户盈亏。
 - `fills-dedup` 是面向规范 CSV 的跨文件重叠分类原型。默认不假设成交编号；只有显式指定经核实的标识列才按该字段判重。没有稳定标识时，相同字段仅标为 `POSSIBLE_DUPLICATE`，不会自动合并或删除。当前尚无脱敏华泰样本，因此这不是华泰格式适配。
 - 日线 OHLC 无法准确模拟涨跌停队列、流动性、滑点和真实成交。
+- 对一段已保存的真实行情研究运行做了只读逐笔审计：24 笔模拟成交均能关联账本，三次候选排名可由冻结行情和配置重建；规则、个人费用、历史数据版本和完整公司行动仍未核实。报告只公开汇总结论，逐笔材料留在 `data/private/`，详见[短窗口逐笔审计](docs/transaction-level-audit.md)。
+- 策略研究 Agent 目前只有输入/输出 schema 和合成示例，没有连接 RD-Agent 或语言模型；输出是待审核研究假设，不改生效策略，也不生成委托。详见[策略研究接口契约](docs/strategy-research-agent-contract.md)。
 - 项目当前的 20 日动量基线由本地 Python 代码运行；本机项目环境尚未安装 Qlib，也未训练 Qlib 模型。RD-Agent、TradingAgents 和 TradingView 仍是待验证的可选研究组件。
 - 华泰成交和持仓目前通过用户导出的 CSV 导入；没有假设账户具备程序化交易权限。
 

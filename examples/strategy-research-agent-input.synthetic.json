@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "research_id": "SYNTH-RESEARCH-001",
+  "objective": "检查调仓频率变化是否影响换手；本输入仅演示接口，不代表市场研究结论。",
+  "scope": {
+    "market": "CN_A_SHARE",
+    "start_date": "2024-01-01",
+    "end_date": "2024-12-31",
+    "universe_id": "synthetic-universe-v1"
+  },
+  "data_trust": {
+    "input_file_integrity": {"status": "SYNTHETIC", "sha256": null, "scope": "合成输入"},
+    "canonical_data_quality": {"status": "UNVERIFIED", "scope": "合成输入"},
+    "checkpoint_binding": {"status": "NOT_USED", "scope": "合成输入"},
+    "historical_availability_and_vendor_vintage": {"status": "UNVERIFIED", "scope": "合成输入"},
+    "market_rule_coverage": {"status": "FALLBACK_USED", "fallback_rows": 100, "mode": "synthetic_fallback"},
+    "fee_coverage": {"status": "CONFIG_FLAT_ASSUMPTION", "mode": "synthetic"},
+    "corporate_action_coverage": {"status": "UNVERIFIED_COVERAGE", "typed_events_consumed": 0},
+    "formal_baseline": {"status": "NOT_READY"},
+    "overall": "UNVERIFIED"
+  },
+  "frozen_strategy": {
+    "strategy_id": "momentum-baseline-synthetic-v1",
+    "config_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "parameters": {"lookback_sessions": 20, "rebalance_sessions": 20}
+  },
+  "prior_experiments": [
+    {
+      "experiment_id": "synthetic-run-001",
+      "result_type": "research_diagnostic",
+      "summary": "合成样例显示不同调仓频率产生不同换手。",
+      "input_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    }
+  ],
+  "review_summary": null,
+  "known_data_gaps": ["该案例为合成数据", "规则、费用和公司行动均未真实核验"],
+  "allowed_actions": ["PROPOSE_HYPOTHESIS", "EXPLAIN_EVIDENCE", "DESIGN_VALIDATION"],
+  "forbidden_actions": ["MODIFY_ACTIVE_STRATEGY", "EXECUTE_BACKTEST_WITHOUT_APPROVAL", "GENERATE_BROKER_ORDER", "CONNECT_BROKER_ACCOUNT"]
+}

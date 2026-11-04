@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "hypothesis_id": "SYNTH-HYP-001",
+  "experiment_id": "synthetic-cycle-example-v1",
+  "input_data_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "problem_observed": "在合成数据中，较短调仓间隔增加了交易次数；这只是流程示例，不代表真实实验结论。",
+  "proposed_changes": [
+    {
+      "config_path": "strategy.rebalance_sessions",
+      "current_value": 5,
+      "proposed_value": 10,
+      "reason": "提出待验证的换手敏感性假设。"
+    }
+  ],
+  "rationale": "需要在相同时间顺序、股票池、费用与交易约束下，验证调仓间隔是否减少换手且不恶化风险。",
+  "evidence": [
+    {
+      "description": "合成闭环样例，不是市场证据。",
+      "artifact_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "evidence_status": "SYNTHETIC"
+    }
+  ],
+  "required_data": ["冻结行情快照", "交易日历", "有效日期规则", "费率输入"],
+  "known_limitations": ["样本为合成数据", "正式基线 NOT_READY"],
+  "validation_plan": "先在研究分支运行单参数敏感性实验；若结果满足预先登记门槛，再提交人工审核，不自动替换策略。",
+  "status": "PROPOSED",
+  "human_review_required": true,
+  "may_modify_active_strategy": false,
+  "may_generate_orders": false
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cehuan-quant.local/schemas/strategy-research-hypothesis-v1.json",
+  "title": "Cehuan proposed strategy research hypothesis",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "hypothesis_id", "experiment_id", "input_data_digest", "problem_observed", "proposed_changes", "rationale", "evidence", "required_data", "known_limitations", "validation_plan", "status", "human_review_required", "may_modify_active_strategy", "may_generate_orders"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "hypothesis_id": {"type": "string", "minLength": 1},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "input_data_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "problem_observed": {"type": "string", "minLength": 1},
+    "proposed_changes": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["config_path", "proposed_value"], "properties": {"config_path": {"type": "string", "minLength": 1}, "current_value": {}, "proposed_value": {}, "reason": {"type": "string"}}, "additionalProperties": false}},
+    "rationale": {"type": "string", "minLength": 1},
+    "evidence": {"type": "array", "items": {"type": "object", "required": ["description", "artifact_sha256", "evidence_status"], "properties": {"description": {"type": "string"}, "artifact_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}, "evidence_status": {"enum": ["RECORDED", "RECONSTRUCTED", "UNVERIFIED", "SYNTHETIC"]}}, "additionalProperties": false}},
+    "required_data": {"type": "array", "items": {"type": "string"}},
+    "known_limitations": {"type": "array", "items": {"type": "string"}},
+    "validation_plan": {"type": "string", "minLength": 1},
+    "status": {"enum": ["PROPOSED", "NEEDS_DATA", "REJECTED_FOR_REVIEW"]},
+    "human_review_required": {"const": true},
+    "may_modify_active_strategy": {"const": false},
+    "may_generate_orders": {"const": false}
+  }
+}

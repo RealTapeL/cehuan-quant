@@ -58,6 +58,7 @@ from cehuan.research.baseline_readiness import (
     require_baseline_ready,
     require_report_matches_recomputed,
 )
+from cehuan.research.trust_labels import build_research_trust_labels
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
@@ -2002,7 +2003,19 @@ def run_backtest(
         "strategy_id": str(strategy["name"]),
         "config_sha256": config_sha256,
         "data_version_sha256": data_digest,
+        "current_window_input_file_sha256": current_window_data_sha256 if source_path is not None else None,
         "normalized_window_bars_sha256": current_window_bars_sha256,
+        "research_trust": build_research_trust_labels(
+            quality_healthy=bool(quality.get("healthy", False)),
+            input_file_sha256=current_window_data_sha256 if source_path is not None else None,
+            source_file_checked_during_run=source_path is not None,
+            checkpoint_bound=backtest_checkpoint is not None,
+            market_rule_mode="effective_dated_schedule" if normalized_market_rules is not None else "config_fallback",
+            market_rule_fallback_rows=rule_fallback_rows,
+            fee_mode="effective_dated_schedule" if normalized_fee_schedule is not None else "config_flat_assumption",
+            accounting_event_count=len(accounting_event_list),
+            formal_readiness_gate_passed=formal,
+        ),
         "security_identity_events_sha256": identity_event_data_sha256,
         "security_identity_event_ids": identity_events["event_id"].astype(str).tolist() if not identity_events.empty else [],
         "corporate_actions_sha256": corporate_action_data_sha256,
