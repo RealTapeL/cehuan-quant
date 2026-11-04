@@ -21,6 +21,21 @@
 
 这只是本地格式契约与验证原型，尚未连接大语言模型、RD-Agent 或其他自动研究服务。研究假设仍需由用户审核、另行冻结配置并运行实验。
 
+## 从成交审计生成假设包
+
+`scripts/build_audit_hypotheses.py` 将已封存的成交审计目录作为只读输入，逐项核对其 artifact inventory，并要求实际配置文件 SHA-256 与审计摘要登记值一致。它会把配置参数和摘要都绑定到同一份实际配置；缺哈希、错误配置或证据散列不匹配时拒绝生成。
+
+输出必须指定新的独立目录；目录已存在或位于来源审计目录内时拒绝。脚本先在临时目录写完产物，再复核来源清单及文件哈希，最后发布新目录。来源清单、摘要、证据和配置不会被写回。旧版假设包只做只读一致性检查，结论写入新包的 `source-audit-reference.json`；`UNVERIFIED`/`MISMATCHED` 不会覆盖旧包或自动变成通过。
+
+```bash
+uv run python scripts/build_audit_hypotheses.py \
+  --audit-dir data/private/experiments/<run>/<trade-audit-package> \
+  --config data/private/experiments/<run>/config.json \
+  --output-dir data/private/experiments/<run>/research-hypotheses-<unique-id>
+```
+
+脚本仅证明本地字节、登记哈希和旧包中保存的参数/证据引用之间的对应关系，不证明公告解释正确、历史数据当时可得或策略有效。输出假设仍为 `NEEDS_DATA`，当前正式基线仍 `NOT_READY`。
+
 ## 审核与研究闭环
 
 Agent 输出先保存为候选假设，再由用户审阅、冻结实验配置、确定时间顺序和验收门槛。实验结果回写到假设记录时应保留原始假设、数据散列、代码提交、运行产物和人工结论。只有经批准的研究变更才创建新策略版本；无论 Agent 或回测结果如何，均不生成华泰委托。

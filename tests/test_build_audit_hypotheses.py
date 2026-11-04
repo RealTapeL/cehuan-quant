@@ -1,68 +1,144 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import runpy
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from cehuan.research.strategy_hypothesis import validate_strategy_hypothesis
 
 
-_build = runpy.run_path(Path(__file__).parents[1] / "scripts/build_audit_hypotheses.py")["build"]
+_BUILD = runpy.run_path("scripts/build_audit_hypotheses.py")["build"]
 
 
-def test_build_audit_hypotheses_uses_existing_contract_and_keeps_research_only(tmp_path: Path):
-    audit_dir = tmp_path / "private-audit"
-    audit_dir.mkdir()
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _json(path: Path, payload: object) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _source_package(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    audit = tmp_path / "source-audit"
+    audit.mkdir()
+    config = tmp_path / "config.json"
+    config_payload = {"strategy": {"lookback": 20, "max_positions": 3}}
+    _json(config, config_payload)
+    config_hash = _sha(config)
+    files = {
+        "suspension-candidate-window.csv": "symbol,trade_date,is_suspended\nAAA,2025-01-02,false\n",
+        "suspension-candidate-rank-neighbors.csv": "symbol,rank,momentum\nAAA,1,0.2\nBBB,2,0.1\n",
+        "zero-target-review.csv": (
+            "symbol,rank,target_amount_cny,execution_open_price_cny,raw_target_shares_before_rounding,"
+            "buy_minimum_shares_from_config_fallback,next_unselected_candidate_rank,next_unselected_candidate_symbol\n"
+            "AAA,1,100,200,0,100,4,BBB\n"
+        ),
+    }
+    for name, value in files.items():
+        (audit / name).write_text(value, encoding="utf-8")
     summary = {
         "schema_version": 2,
-        "experiment_id": "synthetic-audit",
-        "window": {"start": "2024-01-01", "end": "2024-03-31"},
-        "input_hashes": {"config.json": "a" * 64, "bars.csv": "b" * 64},
-        "research_trust": {
-            "input_file_integrity": "PARTIAL_OR_UNVERIFIED",
-            "canonical_data_quality": "STRUCTURAL_AUDIT_HEALTHY_WITH_WARNINGS",
-        },
-        "market_rule_fallback_rows_in_window": 100,
-        "record_date_entitlement_audit": {"typed_accounting_events_in_frozen_run": []},
+        "experiment_id": "synthetic-source-test",
+        "input_hashes": {"config.json": config_hash, "bars.csv": "a" * 64},
+        "window": {"start": "2024-12-01", "end": "2025-01-10"},
         "suspension_candidate_diagnostic": {
-            "symbol": "SH603268",
-            "window_state_counts_including_base": {"total_rows": 21, "suspended_rows": 7},
-            "return_observation_state_counts_excluding_base": {"total_rows": 20, "suspended_rows": 6},
-            "session_window_audit": {"window_alignment_status": "MATCHED_EXACT_SESSION_WINDOW"},
+            "symbol": "AAA",
+            "window_state_counts_including_base": {"total_rows": 21, "suspended_rows": 1},
+            "return_observation_state_counts_excluding_base": {"observed": 20},
+            "session_window_audit": {"window_alignment_status": "ALIGNED"},
         },
-        "fill_record_count": 2,
-        "order_log_status": "UNKNOWN_NO_COMPLETE_ORDER_LOG",
+        "market_rule_fallback_rows_in_window": 3,
+        "record_date_entitlement_audit": {"typed_accounting_events_in_frozen_run": []},
         "selected_targets_reconstructed_to_zero_shares": 1,
+        "zero_target_reviews": [],
+        "research_trust": {"input_file_integrity": "MATCHED", "canonical_data_quality": "UNVERIFIED"},
     }
-    (audit_dir / "trade-audit-summary.json").write_text(json.dumps(summary), encoding="utf-8")
-    pd.DataFrame({"trade_date": [f"2024-01-{i:02}" for i in range(1, 22)]}).to_csv(
-        audit_dir / "suspension-candidate-window.csv", index=False,
-    )
-    pd.DataFrame([{
-        "symbol": "SH603268", "rank": 1, "momentum": 2.8,
-    }]).to_csv(audit_dir / "suspension-candidate-rank-neighbors.csv", index=False)
-    pd.DataFrame([{
-        "symbol": "SZ301600", "rank": 2, "target_amount_cny": 8067.54,
-        "execution_open_price_cny": 196.60, "raw_target_shares_before_rounding": 41,
-        "buy_minimum_shares_from_config_fallback": 100,
-        "target_lifecycle_status": "ZERO_TARGET_NO_POSITION_CASH_RETAINED",
-        "next_unselected_candidate_rank": 6,
-        "next_unselected_candidate_symbol": "SZ300493",
-    }]).to_csv(audit_dir / "zero-target-review.csv", index=False)
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"strategy": {"lookback_sessions": 20}}), encoding="utf-8")
+    _json(audit / "trade-audit-summary.json", summary)
+    inventory_paths = ["trade-audit-summary.json", *files]
+    with (audit / "audit-artifact-inventory.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["relative_path", "sha256"])
+        writer.writeheader()
+        writer.writerows({"relative_path": name, "sha256": _sha(audit / name)} for name in inventory_paths)
+    before = {p.name: _sha(p) for p in audit.iterdir() if p.is_file()}
+    return audit, config, before
 
-    result = _build(audit_dir, config_path)
-    assert [item["status"] for item in result["hypotheses"]] == ["NEEDS_DATA", "NEEDS_DATA"]
-    assert all(validate_strategy_hypothesis(item)["may_generate_orders"] is False for item in result["hypotheses"])
-    assert result["input"]["data_trust"]["formal_baseline"]["status"] == "NOT_READY"
-    assert "rank 6 SZ300493" in result["hypotheses"][1]["problem_observed"]
-    assert result["input"]["forbidden_actions"] == [
-        "MODIFY_ACTIVE_STRATEGY", "EXECUTE_BACKTEST_WITHOUT_APPROVAL", "GENERATE_BROKER_ORDER", "CONNECT_BROKER_ACCOUNT",
-    ]
-    updated = json.loads((audit_dir / "trade-audit-summary.json").read_text(encoding="utf-8"))
-    assert updated["research_agent_artifacts"]["active_strategy_modified"] is False
-    inventory = pd.read_csv(audit_dir / "audit-artifact-inventory.csv")
-    assert "research-agent-input.json" in set(inventory.relative_path)
+
+def test_build_binds_actual_config_and_keeps_source_audit_immutable(tmp_path: Path) -> None:
+    audit, config, before = _source_package(tmp_path)
+    output = tmp_path / "new-hypotheses"
+    result = _BUILD(audit, config, output)
+
+    assert result["source_reference"]["config_binding_status"] == "MATCHED"
+    assert result["source_reference"]["source_audit_mutated"] is False
+    assert result["legacy_review"]["status"] == "UNVERIFIED"
+    assert output.is_dir()
+    assert {p.name: _sha(p) for p in audit.iterdir() if p.is_file()} == before
+    assert {item["status"] for item in result["hypotheses"]} == {"NEEDS_DATA"}
+    for hypothesis in result["hypotheses"]:
+        validate_strategy_hypothesis(hypothesis)
+    assert (output / "hypothesis-inventory.csv").is_file()
+    assert json.loads((output / "source-audit-reference.json").read_text())["actual_config_sha256"] == _sha(config)
+
+
+def test_different_config_is_rejected_without_creating_output(tmp_path: Path) -> None:
+    audit, config, before = _source_package(tmp_path)
+    other = tmp_path / "different-config.json"
+    _json(other, {"strategy": {"lookback": 10, "max_positions": 3}})
+    output = tmp_path / "should-not-exist"
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        _BUILD(audit, other, output)
+
+    assert not output.exists()
+    assert {p.name: _sha(p) for p in audit.iterdir() if p.is_file()} == before
+
+
+def test_same_config_bytes_at_another_path_are_accepted(tmp_path: Path) -> None:
+    audit, config, _ = _source_package(tmp_path)
+    copy = tmp_path / "config-copy.json"
+    copy.write_bytes(config.read_bytes())
+    result = _BUILD(audit, copy, tmp_path / "output")
+    assert result["source_reference"]["config_binding_status"] == "MATCHED"
+
+
+def test_missing_registered_config_hash_is_rejected(tmp_path: Path) -> None:
+    audit, config, _ = _source_package(tmp_path)
+    summary_path = audit / "trade-audit-summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["input_hashes"].pop("config.json")
+    _json(summary_path, summary)
+    inventory_path = audit / "audit-artifact-inventory.csv"
+    rows = list(csv.DictReader(inventory_path.open(encoding="utf-8")))
+    with inventory_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["relative_path", "sha256"])
+        writer.writeheader()
+        for row in rows:
+            if row["relative_path"] == "trade-audit-summary.json":
+                row["sha256"] = _sha(summary_path)
+            writer.writerow(row)
+
+    with pytest.raises(ValueError, match="缺少有效的 config.json"):
+        _BUILD(audit, config, tmp_path / "output")
+
+
+def test_source_evidence_hash_mismatch_is_rejected(tmp_path: Path) -> None:
+    audit, config, _ = _source_package(tmp_path)
+    with (audit / "zero-target-review.csv").open("a", encoding="utf-8") as handle:
+        handle.write("# changed\n")
+    with pytest.raises(ValueError, match="哈希不匹配"):
+        _BUILD(audit, config, tmp_path / "output")
+
+
+def test_existing_or_nested_output_is_rejected(tmp_path: Path) -> None:
+    audit, config, _ = _source_package(tmp_path)
+    existing = tmp_path / "exists"
+    existing.mkdir()
+    with pytest.raises(FileExistsError):
+        _BUILD(audit, config, existing)
+    with pytest.raises(ValueError, match="必须与来源审计包分离"):
+        _BUILD(audit, config, audit / "nested-output")
