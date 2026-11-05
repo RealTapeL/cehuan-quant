@@ -19,6 +19,31 @@ SUPPORTED_HYPOTHESIS_PATHS = {
     "strategy.lookback_sessions": {"kind": "integer", "minimum": 2, "maximum": 30},
     "strategy.min_momentum": {"kind": "number", "minimum": -0.5, "maximum": 0.5},
 }
+MAX_CHANGES_PER_EXPERIMENT = 1
+
+
+def build_experiment_capabilities(baseline_config: dict[str, Any]) -> dict[str, Any]:
+    """Build model-visible parameter limits from the executor's authoritative map."""
+    parameters: list[dict[str, Any]] = []
+    for path, contract in SUPPORTED_HYPOTHESIS_PATHS.items():
+        section, key = path.split(".", 1)
+        if section not in baseline_config or key not in baseline_config[section]:
+            raise ValueError(f"冻结策略配置缺少受控实验参数：{path}")
+        current_value = baseline_config[section][key]
+        if isinstance(current_value, bool) or not isinstance(current_value, (int, float)):
+            raise ValueError(f"冻结策略参数类型与受控实验映射不一致：{path}")
+        parameters.append({
+            "config_path": path,
+            "value_type": contract["kind"],
+            "minimum_inclusive": contract["minimum"],
+            "maximum_inclusive": contract["maximum"],
+            "current_value": current_value,
+        })
+    return {
+        "source": "cehuan.research.controlled_experiments.SUPPORTED_HYPOTHESIS_PATHS",
+        "maximum_changes_per_experiment": MAX_CHANGES_PER_EXPERIMENT,
+        "supported_parameters": parameters,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -78,6 +103,7 @@ def run_candidate_experiment(
         "status": "NOT_RUN",
         "input_bars_sha256": bars_sha256,
         "baseline_config_sha256": _sha256(run_dir / "baseline_config.json"),
+        "baseline_metrics_sha256": _sha256(baseline_metrics_path),
         "same_data_and_initial_conditions": True,
         "same_backtest_engine": "cehuan.backtest.engine.run_backtest",
         "same_accounting_mode": "ledger_v2",
@@ -92,9 +118,11 @@ def run_candidate_experiment(
         registration["pending_implementation"] = [f"hypothesis status is {hypothesis['status']}; candidate not executed"]
         _json_write(registration, run_dir / "candidate_experiment.json")
         return {"candidate_experiment": "candidate_experiment.json"}
-    if len(changes) != 1:
-        registration["status"] = "REJECTED_MULTI_CHANGE_NOT_CONTROLLED"
-        registration["pending_implementation"] = ["one-factor-at-a-time contract requires exactly one proposed change"]
+    if len(changes) != MAX_CHANGES_PER_EXPERIMENT:
+        registration["status"] = "REJECTED_CHANGE_COUNT_NOT_CONTROLLED"
+        registration["pending_implementation"] = [
+            f"one-factor-at-a-time contract requires exactly {MAX_CHANGES_PER_EXPERIMENT} proposed change"
+        ]
         _json_write(registration, run_dir / "candidate_experiment.json")
         return {"candidate_experiment": "candidate_experiment.json"}
     candidate_config, reason = _apply_one_change(baseline_config, changes[0])
@@ -139,7 +167,6 @@ def run_candidate_experiment(
         "candidate_config_sha256": _sha256(run_dir / "candidate_config.json"),
         "candidate_metrics_sha256": _sha256(run_dir / "candidate_metrics.json"),
         "candidate_trades_sha256": _sha256(run_dir / "candidate_trades.csv"),
-        "baseline_metrics_sha256": _sha256(baseline_metrics_path),
         "baseline_trade_count": int(len(baseline_backtest["trades"])),
         "candidate_trade_count": int(len(candidate["trades"])),
         "metric_comparison": {

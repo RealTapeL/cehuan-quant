@@ -4,7 +4,7 @@
 
 ## 输入
 
-输入包括研究目标与时间范围、数据可信度标签、冻结策略 ID 和配置散列、既有实验摘要、复盘摘要以及已知缺口。Agent 只可提出假设、解释证据或设计验证；每条证据应标记为原始记录、代码重建、未核实或合成材料。
+输入包括研究目标与时间范围、数据可信度标签、冻结策略 ID 和配置散列、既有实验摘要、复盘摘要以及已知缺口。运行时的 `experiment_capabilities` 由受控实验器的 `SUPPORTED_HYPOTHESIS_PATHS` 动态生成，展示参数路径、类型、含界限范围和冻结配置当前值，并声明每次实验的改动数上限。提示词不维护第二份参数清单；受控实验器仍独立验证模型提出的每项变化，未支持的路径保留为待实现状态。
 
 文件契约见 [Agent 输入 JSON Schema](../examples/strategy-research-agent-input.schema.json)，合成输入见 [输入示例](../examples/strategy-research-agent-input.synthetic.json)。`data_trust` 沿用回测 `metrics.json` 中的结构化 `research_trust` 对象。当任何可信度字段为 `UNVERIFIED`、`FALLBACK_USED` 或 `NOT_READY`，Agent 必须在输出限制中保留该状态，不得将它改写为通过。
 
@@ -30,11 +30,26 @@ uv run cehuan research-cycle \
 
 命令使用合成行情，调用结构化 Agent 生成初始假设；只允许有限的单参数映射进入候选配置；复用 `run_backtest()` 跑相同输入的基线与候选；随后复用 `synthetic_cycle` 的成交/持仓对账并基于审计摘要请求下一轮假设。默认预算是每周期两条假设、一个候选实验、每次调用最多一次重试。未知配置或规则会登记为 `PENDING_IMPLEMENTATION`，不会被忽略。候选配置只写入本周期目录，不更改 `configs/default.toml`。
 
+下一轮输入从已保存的 `candidate_experiment.json`、基线/候选指标及成交和持仓对账文件重建 `program_facts`，并逐项列出来源文件名和 SHA-256。Agent 初始假设等文字位于独立的 `agent_authored_context`，不会混入程序事实。实验未完成、失败或候选指标缺失时，相应状态和空值会原样保留，不补造比较值；下一轮假设摘要通过输入摘要绑定这些事实和来源。
+
 模型设置位于 `configs/research_agent.toml`。`mode="auto"` 只有在模型名、服务地址和 API Key 都可用时才发起外部调用，否则使用明确标记的 stub。外部服务通过 `CEHUAN_LLM_MODEL`、`CEHUAN_LLM_BASE_URL` 和 `CEHUAN_LLM_API_KEY` 提供；Key 只放在环境变量中，不写入配置或产物。运行输入只有研究目标、合成数据摘要、参数和合成复盘事实，不包含账户资料或原始成交文件。切换真实模型前应避免把私密信息写入研究目标。
+
+真实 LLM 验收必须显式使用 `--model-mode llm`，例如在安全配置好环境变量后运行：
+
+```bash
+uv run cehuan research-cycle \
+  --objective "检验合成研究闭环的结构化假设输出" \
+  --model-mode llm \
+  --output outputs/research-cycles
+```
+
+任何模型配置缺失都会失败并说明缺少的变量名，不会自动退回 stub；stub 验收应显式使用 `--model-mode stub`。
 
 每个研究周期目录保存 Agent 输入/输出、提示词版本和摘要、候选配置/结果、合成成交复盘、研究报告及散列 manifest。若 provider 返回 usage，会记录 token 数；没有 provider 费率配置时不估算费用。`stub` 运行绝不标记成真实 LLM 调用。结果只验证软件流程，不代表策略表现；正式 baseline 仍为 `NOT_READY`，研究假设需要人工审核，不自动修改生效策略。
 
-该 MVP 目前只在合成数据上跑完整闭环。真实数据的受限摘要研究、LLM 真实调用、Qlib/RD-Agent 自动搜索和多参数/新交易规则实验仍需独立完成与审核。
+若要做一次明确的真实模型验收，必须显式指定 `--model-mode llm`；模型名、HTTPS 服务地址及 API Key 缺一项都会直接失败，不会退回 stub。验收输入仍是自动生成的合成行情摘要与用户研究目标，不接受原始账户文件。审计只保存 provider、model、尝试次数、usage、endpoint 和费用未知状态，不保存 API Key。
+
+该 MVP 目前只在合成数据上跑完整闭环。本轮机器未配置真实 LLM 所需环境变量，因此真实模型调用验收尚未完成。真实数据的受限摘要入口目前只有设计文档，尚未连接模型；Qlib/RD-Agent 自动搜索和多参数/新交易规则实验也需独立评估。
 
 ## 从成交审计生成假设包
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import urllib.error
@@ -14,6 +15,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
+from cehuan.research.controlled_experiments import (
+    MAX_CHANGES_PER_EXPERIMENT,
+    SUPPORTED_HYPOTHESIS_PATHS,
+)
 from cehuan.research.strategy_hypothesis import validate_strategy_hypothesis
 
 
@@ -22,6 +27,7 @@ INPUT_REQUIRED = {
     "frozen_strategy", "prior_experiments", "known_data_gaps", "allowed_actions",
     "forbidden_actions",
 }
+INPUT_OPTIONAL = {"review_summary", "experiment_capabilities"}
 TRUST_FIELDS = {
     "input_file_integrity", "canonical_data_quality", "checkpoint_binding",
     "historical_availability_and_vendor_vintage", "market_rule_coverage", "fee_coverage",
@@ -38,7 +44,7 @@ HYPOTHESIS_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "examples" / "str
 def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the existing strategy-research-agent input contract without a new dependency."""
     missing = INPUT_REQUIRED - set(payload)
-    extra = set(payload) - INPUT_REQUIRED - {"review_summary"}
+    extra = set(payload) - INPUT_REQUIRED - INPUT_OPTIONAL
     if missing or extra:
         raise ValueError(
             "研究 Agent 输入字段不符合 schema："
@@ -108,6 +114,54 @@ def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, An
         raise ValueError("研究 Agent 输入必须完整禁止策略修改、无审批回测和券商操作")
     if "review_summary" in payload and payload["review_summary"] is not None and not isinstance(payload["review_summary"], Mapping):
         raise ValueError("review_summary 必须是对象或 null")
+    if "experiment_capabilities" in payload:
+        capabilities = payload["experiment_capabilities"]
+        if not isinstance(capabilities, Mapping) or set(capabilities) != {
+            "source", "maximum_changes_per_experiment", "supported_parameters",
+        }:
+            raise ValueError("experiment_capabilities 字段与能力清单契约不一致")
+        if not isinstance(capabilities["source"], str) or not capabilities["source"]:
+            raise ValueError("experiment_capabilities.source 必须标明程序清单来源")
+        maximum_changes = capabilities["maximum_changes_per_experiment"]
+        if isinstance(maximum_changes, bool) or maximum_changes != MAX_CHANGES_PER_EXPERIMENT:
+            raise ValueError("experiment_capabilities 改动数与受控实验器契约不一致")
+        parameters = capabilities["supported_parameters"]
+        if not isinstance(parameters, list) or not parameters:
+            raise ValueError("experiment_capabilities.supported_parameters 必须是非空列表")
+        if [item.get("config_path") for item in parameters if isinstance(item, Mapping)] != list(SUPPORTED_HYPOTHESIS_PATHS):
+            raise ValueError("experiment_capabilities 参数路径与受控实验器实际支持清单不一致")
+        seen_paths: set[str] = set()
+        for index, parameter in enumerate(parameters):
+            if not isinstance(parameter, Mapping) or set(parameter) != {
+                "config_path", "value_type", "minimum_inclusive", "maximum_inclusive", "current_value",
+            }:
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}] 字段无效")
+            path = parameter["config_path"]
+            value_type = parameter["value_type"]
+            if not isinstance(path, str) or not path or path in seen_paths:
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}].config_path 无效或重复")
+            seen_paths.add(path)
+            if value_type not in {"integer", "number"}:
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}].value_type 不受支持")
+            contract = SUPPORTED_HYPOTHESIS_PATHS[path]
+            if (
+                value_type != contract["kind"]
+                or parameter["minimum_inclusive"] != contract["minimum"]
+                or parameter["maximum_inclusive"] != contract["maximum"]
+            ):
+                raise ValueError(f"experiment_capabilities 参数范围与受控实验器实际契约不一致：{path}")
+            bounds = [parameter["minimum_inclusive"], parameter["maximum_inclusive"], parameter["current_value"]]
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in bounds):
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}] 范围和当前值必须是数值")
+            if not all(math.isfinite(float(value)) for value in bounds):
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}] 数值必须有限")
+            low, high, current = map(float, bounds)
+            if low > high or not low <= current <= high:
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}] 范围或当前值无效")
+            if value_type == "integer" and any(not float(value).is_integer() for value in bounds):
+                raise ValueError(f"experiment_capabilities.supported_parameters[{index}] 整数参数不能含小数")
+            if path.startswith("strategy.") and frozen["parameters"].get(path.split(".", 1)[1]) != parameter["current_value"]:
+                raise ValueError(f"experiment_capabilities 当前值与冻结策略参数不一致：{path}")
     return dict(payload)
 
 
@@ -138,15 +192,33 @@ class StubResearchModel:
     model = "cehuan-structured-stub-v1"
 
     def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
-        current = context["strategy_parameters"]
+        capabilities = context.get("experiment_capabilities") or {}
+        supported = capabilities.get("supported_parameters", [])
+        if not supported:
+            raise ValueError("Stub 研究 Agent 需要输入的动态 experiment_capabilities 清单")
+        index = 0 if phase == "initial" else min(1, len(supported) - 1)
+        capability = supported[index]
+        path = capability["config_path"]
+        current_value = capability["current_value"]
+        minimum = capability["minimum_inclusive"]
+        maximum = capability["maximum_inclusive"]
+        if capability["value_type"] == "integer":
+            proposed = current_value + 1 if current_value < maximum else current_value - 1
+        else:
+            step = min(0.01, (maximum - minimum) / 10)
+            proposed = current_value + step if current_value + step <= maximum else current_value - step
         if phase == "initial":
-            path = "strategy.rebalance_sessions"
-            proposed = 10 if current.get("rebalance_sessions") != 10 else 15
             observation = "合成闭环没有市场证据；Stub 仅用于验证结构化接口和受控实验串接。"
         else:
-            path = "strategy.lookback_sessions"
-            proposed = 8 if current.get("lookback_sessions") != 8 else 10
-            observation = "复盘只使用假成交与假持仓算术；单次合成场景不能支持真实策略调整。"
+            summary = (context.get("research_input") or {}).get("review_summary") or {}
+            facts = summary.get("program_facts", {})
+            experiment_status = facts.get("experiment", {}).get("status", "UNKNOWN")
+            reconciliation = facts.get("reconciliation", {})
+            snapshot_status = reconciliation.get("position_snapshot_status", "UNKNOWN")
+            observation = (
+                f"程序记录的合成候选实验状态为 {experiment_status}；持仓快照状态为 {snapshot_status}。"
+                "复盘与实验都只是合成流程事实，不能支持真实策略结论。"
+            )
         payload = {
             "schema_version": 1,
             "hypothesis_id": f"{context['research_id']}-{phase}-hypothesis",
@@ -155,7 +227,7 @@ class StubResearchModel:
             "problem_observed": observation,
             "proposed_changes": [{
                 "config_path": path,
-                "current_value": current.get(path.split(".", 1)[1]),
+                "current_value": current_value,
                 "proposed_value": proposed,
                 "reason": "作为一项待验证参数假设；不修改当前生效策略。",
             }],
@@ -282,9 +354,9 @@ def build_hypothesis_prompt(
 ) -> str:
     output_schema = json.loads(HYPOTHESIS_SCHEMA_PATH.read_text(encoding="utf-8"))
     phase_instruction = (
-        "根据研究目标提出一项、且仅一项可以被当前实验映射清单验证的参数假设。"
+        "根据研究目标提出假设；参数必须来自输入中的 experiment_capabilities.supported_parameters，且只提出能力清单允许数量的配置改动。"
         if phase == "initial" else
-        "根据复盘摘要提出下一轮一项待验证研究假设；若证据不足，使用 NEEDS_DATA 并说明原因。"
+        "根据复盘摘要中的程序事实提出下一轮待验证研究假设；只使用 program_facts 明示的实验/成交事实，null 或缺失指标代表不可用，不得补写成事实；参数必须来自 experiment_capabilities.supported_parameters。证据不足时使用 NEEDS_DATA。"
     )
     return "\n".join([
         "输出一个 JSON 对象，匹配 strategy-research-hypothesis.schema.json，不要 Markdown 围栏。",
@@ -294,7 +366,7 @@ def build_hypothesis_prompt(
         f"hypothesis_id 必须是 {input_payload['research_id']}-{phase}-hypothesis。",
         f"experiment_id 必须是 {experiment_id}。",
         f"input_data_digest 必须是 {input_data_digest}。",
-        "proposed_changes 只能表达配置参数或已实现规则；不要输出订单、交易股数、券商指令、代码或工具调用。",
+        "proposed_changes 只能引用 experiment_capabilities 中的参数；未列入的规则可以作为待实现建议说明，但不能写入拟执行改动。不要输出订单、交易股数、券商指令、代码或工具调用。",
         "保留 data_trust 中的 UNVERIFIED、FALLBACK_USED、NOT_READY 和所有合成数据限制。",
         "Agent 不能修改当前有效策略；human_review_required=true、may_modify_active_strategy=false、may_generate_orders=false。",
         "研究输入 JSON：",
@@ -329,6 +401,8 @@ def generate_validated_hypothesis(
                 "experiment_id": experiment_id,
                 "input_data_digest": input_data_digest,
                 "strategy_parameters": validated_input["frozen_strategy"]["parameters"],
+                "experiment_capabilities": validated_input.get("experiment_capabilities"),
+                "research_input": validated_input,
             })
             payload = json.loads(reply.content)
             hypothesis = validate_strategy_hypothesis(payload)

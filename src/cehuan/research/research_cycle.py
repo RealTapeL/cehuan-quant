@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import tomllib
 import uuid
 from datetime import datetime
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from cehuan.research.controlled_experiments import run_candidate_experiment
+from cehuan.research.controlled_experiments import build_experiment_capabilities, run_candidate_experiment
 from cehuan.research.research_agent import (
     generate_validated_hypothesis,
     resolve_research_model,
@@ -87,6 +88,7 @@ def _build_input(
             "config_sha256": _canonical_digest(config),
             "parameters": copy.deepcopy(config["strategy"]),
         },
+        "experiment_capabilities": build_experiment_capabilities(config),
         "prior_experiments": prior_experiments or [],
         "review_summary": review_summary,
         "known_data_gaps": [
@@ -141,26 +143,150 @@ def _review_summary(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def _artifact_reference(run_dir: Path, role: str, filename: str) -> dict[str, str]:
+    path = run_dir / filename
+    if not path.is_file():
+        return {"role": role, "path": filename, "status": "MISSING"}
+    return {
+        "role": role,
+        "path": filename,
+        "status": "PRESENT",
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _finite_metric(metrics: dict[str, Any] | None, key: str) -> float | int | None:
+    if not metrics or key not in metrics:
+        return None
+    value = metrics[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return None
+    return value
+
+
+def _build_next_round_review_summary(
+    run_dir: Path,
+    *,
+    reconciliation_facts: dict[str, Any],
+    initial_hypothesis: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind next-round model input to persisted experiment/review facts and source files."""
+    registration_path = run_dir / "candidate_experiment.json"
+    registration = json.loads(registration_path.read_text(encoding="utf-8"))
+    baseline_path = run_dir / "baseline_metrics.json"
+    candidate_path = run_dir / "candidate_metrics.json"
+    status = str(registration.get("status", "UNKNOWN"))
+    baseline_metrics = None
+    candidate_metrics = None
+    metrics_status = "BASELINE_METRICS_MISSING"
+    comparison: dict[str, Any] | None = None
+    if baseline_path.is_file():
+        baseline_sha256 = hashlib.sha256(baseline_path.read_bytes()).hexdigest()
+        if registration.get("baseline_metrics_sha256") != baseline_sha256:
+            metrics_status = "BASELINE_METRIC_ARTIFACT_HASH_MISMATCH"
+        else:
+            baseline_metrics = json.loads(baseline_path.read_text(encoding="utf-8"))
+            metrics_status = "EXPERIMENT_NOT_COMPLETED" if status != "COMPLETED_SYNTHETIC_ONLY" else "CANDIDATE_METRICS_MISSING"
+    if status == "COMPLETED_SYNTHETIC_ONLY" and baseline_metrics is not None:
+        if not candidate_path.is_file():
+            metrics_status = "CANDIDATE_METRICS_MISSING"
+        else:
+            candidate_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+            if registration.get("candidate_metrics_sha256") != candidate_sha256:
+                metrics_status = "CANDIDATE_METRIC_ARTIFACT_HASH_MISMATCH"
+            else:
+                candidate_metrics = json.loads(candidate_path.read_text(encoding="utf-8"))
+                metrics_status = "AVAILABLE_FROM_HASH_BOUND_PERSISTED_METRICS"
+    if metrics_status == "AVAILABLE_FROM_HASH_BOUND_PERSISTED_METRICS":
+        comparison = {}
+        for key in ("total_return", "max_drawdown", "volatility", "turnover", "win_rate", "trade_count"):
+            baseline_value = _finite_metric(baseline_metrics, key)
+            candidate_value = _finite_metric(candidate_metrics, key)
+            if baseline_value is not None and candidate_value is not None:
+                comparison[key] = {
+                    "baseline": baseline_value,
+                    "candidate": candidate_value,
+                    "candidate_minus_baseline": float(candidate_value) - float(baseline_value),
+                }
+        if not comparison:
+            metrics_status = "NO_COMPARABLE_NUMERIC_METRICS"
+            comparison = None
+
+    source_artifacts = [
+        _artifact_reference(run_dir, "candidate_experiment_registration", "candidate_experiment.json"),
+        _artifact_reference(run_dir, "baseline_metrics", "baseline_metrics.json"),
+        _artifact_reference(run_dir, "candidate_metrics", "candidate_metrics.json"),
+        _artifact_reference(run_dir, "trade_reconciliation", "reconciliation.csv"),
+        _artifact_reference(run_dir, "position_reconciliation", "position_reconciliation.csv"),
+        _artifact_reference(run_dir, "synthetic_cycle_manifest", "manifest.json"),
+        _artifact_reference(run_dir, "initial_agent_hypothesis", "hypothesis_initial.json"),
+    ]
+    return {
+        "schema": "cehuan.research_next_round_context.v1",
+        "evidence_scope": "synthetic_cycle_artifacts_only",
+        "program_facts": {
+            "experiment": {
+                "experiment_id": registration.get("experiment_id"),
+                "hypothesis_id": registration.get("hypothesis_id"),
+                "status": status,
+                "changed_parameters": registration.get("changed_parameters", []),
+                "pending_implementation": registration.get("pending_implementation", []),
+                "same_data_and_initial_conditions": registration.get("same_data_and_initial_conditions"),
+            },
+            "metrics_status": metrics_status,
+            "baseline_metrics": baseline_metrics,
+            "candidate_metrics": candidate_metrics,
+            "metric_comparison": comparison,
+            "reconciliation": reconciliation_facts,
+            "source_artifacts": source_artifacts,
+            "interpretation_constraints": [
+                "此处 program_facts 只反映所列程序产物；不代表真实 A 股收益或账户事实。",
+                "候选未完成或指标产物缺失时，null/缺失表示不可用；不得推测或补写为程序计算事实。",
+                "无成交行、无持仓快照或原因未知时，不得推断撤单、拒绝、过期或零持仓。",
+                "正式基线为 NOT_READY；历史时点、规则、费用和公司行动仍有限制。",
+            ],
+        },
+        "agent_authored_context": {
+            "classification": "AGENT_TEXT_NOT_PROGRAM_FACT",
+            "initial_hypothesis_id": initial_hypothesis.get("hypothesis_id"),
+            "status": initial_hypothesis.get("status"),
+            "problem_observed": initial_hypothesis.get("problem_observed"),
+            "rationale": initial_hypothesis.get("rationale"),
+            "proposed_changes": initial_hypothesis.get("proposed_changes"),
+        },
+    }
+
+
 def _research_report(
     *,
     research_id: str,
     objective: str,
     initial_hypothesis: dict[str, Any],
     next_hypothesis: dict[str, Any] | None,
-    baseline_metrics: dict[str, Any],
-    candidate_registration: dict[str, Any],
+    program_facts: dict[str, Any],
     review_summary: dict[str, Any],
     model_audits: list[dict[str, Any]],
     next_hypothesis_error: str | None,
 ) -> str:
-    comparison = candidate_registration.get("metric_comparison", {})
+    comparison = program_facts.get("metric_comparison") or {}
+    experiment_facts = program_facts.get("experiment", {})
+    baseline_metrics = program_facts.get("baseline_metrics") or {}
+    candidate_metrics = program_facts.get("candidate_metrics") or {}
+    total_return_comparison = comparison.get("total_return", {})
+    drawdown_comparison = comparison.get("max_drawdown", {})
     lines = [
         "# 策环研究周期报告",
         "",
         "> **SYNTHETIC ONLY。** 本报告验证 Agent、回测和复盘程序的连接，不代表 A 股策略收益或真实账户结果。",
         "",
         f"- 研究周期 ID：`{research_id}`",
-        f"- 用户研究目标：{objective}",
+        "",
+        "## 研究目标",
+        "",
+        objective,
+        "",
+        "## 执行边界",
+        "",
         "- 正式基线：`NOT_READY`",
         "- 券商连接：否；真实委托：否",
         "",
@@ -173,13 +299,16 @@ def _research_report(
         "",
         "## 程序计算事实",
         "",
+        f"- 候选实验状态：`{experiment_facts.get('status', 'UNKNOWN')}`；指标状态：`{program_facts.get('metrics_status', 'UNKNOWN')}`",
         f"- 合成基线净值收益字段：`{baseline_metrics.get('total_return', '未提供')}`",
-        f"- 候选合成净值收益字段：`{comparison.get('candidate_total_return', '未运行')}`",
-        f"- 基线/候选合成最大回撤字段：`{comparison.get('baseline_max_drawdown', '未提供')}` / `{comparison.get('candidate_max_drawdown', '未运行')}`",
+        f"- 候选合成净值收益字段：`{total_return_comparison.get('candidate', '无完整候选指标')}`",
+        f"- 基线/候选合成最大回撤字段：`{drawdown_comparison.get('baseline', baseline_metrics.get('max_drawdown', '未提供'))}` / `{drawdown_comparison.get('candidate', candidate_metrics.get('max_drawdown', '无完整候选指标'))}`",
         f"- 合成基线交易行数：`{baseline_metrics.get('trade_count', '见 baseline_trades.csv')}`",
-        f"- 候选实验状态：`{candidate_registration.get('status')}`",
-        f"- 候选参数登记：`{candidate_registration.get('changed_parameters')}`",
-        f"- 候选与基线使用相同输入：`{candidate_registration.get('same_data_and_initial_conditions')}`",
+        f"- 候选参数登记：`{experiment_facts.get('changed_parameters')}`",
+        f"- 候选与基线使用相同输入：`{experiment_facts.get('same_data_and_initial_conditions')}`",
+        "",
+        "## 成交与持仓复盘事实",
+        "",
         f"- 成交复盘事实：`{review_summary.get('reconciliation_facts')}`",
         f"- 持仓快照状态：`{review_summary.get('position_snapshot_status')}`",
         "",
@@ -267,7 +396,9 @@ def run_research_cycle(
         failed_dir = Path(output_root).expanduser().resolve() / research_id
         failed_dir.mkdir(parents=True, exist_ok=False)
         failed_audit = getattr(exc, "audit", None)
-        (failed_dir / "agent_input_rejected.json").write_text(
+        rejected_input_path = failed_dir / "agent_input_rejected.json"
+        rejected_output_path = failed_dir / "agent_output_rejected.json"
+        rejected_input_path.write_text(
             json.dumps(initial_input, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
         failure = {
@@ -284,8 +415,34 @@ def run_research_cycle(
             "orders_generated": False,
             "broker_connected": False,
         }
-        (failed_dir / "agent_output_rejected.json").write_text(
+        rejected_output_path.write_text(
             json.dumps(failure, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+        rejection_manifest = {
+            "schema": "cehuan.research_cycle_rejection_manifest.v1",
+            "research_cycle_id": research_id,
+            "classification": "SYNTHETIC_ONLY_NOT_MARKET_RESEARCH",
+            "failure_status": "INITIAL_HYPOTHESIS_REJECTED",
+            "model": {
+                **model_settings_audit,
+                "provider": getattr(model, "provider", "unknown"),
+                "attempt_count": failure["attempt_count"],
+                "attempts": failed_audit.get("attempts", []) if failed_audit else [],
+                "usage": failed_audit.get("response_usage") if failed_audit else None,
+                "api_cost_estimate": None,
+            },
+            "formal_baseline": "NOT_READY",
+            "account_data_used": False,
+            "broker_connected": False,
+            "orders_generated": False,
+            "artifacts": {
+                rejected_input_path.name: _sha256_bytes(rejected_input_path.read_bytes()),
+                rejected_output_path.name: _sha256_bytes(rejected_output_path.read_bytes()),
+            },
+        }
+        (failed_dir / "rejection_manifest.json").write_text(
+            json.dumps(rejection_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
         raise ValueError(f"初始研究假设被拒绝；审计记录：{failed_dir}；{exc}") from None
     model_audits = [initial_audit]
@@ -306,13 +463,34 @@ def run_research_cycle(
         (run_dir / "model_audit_initial.json").write_text(
             json.dumps(initial_audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
-        candidate_box["artifacts"] = run_candidate_experiment(
-            run_dir=run_dir,
-            bars=actual_bars,
-            baseline_config=base_config,
-            baseline_backtest=base_result,
-            hypothesis=initial_hypothesis,
-        )
+        try:
+            candidate_box["artifacts"] = run_candidate_experiment(
+                run_dir=run_dir,
+                bars=actual_bars,
+                baseline_config=base_config,
+                baseline_backtest=base_result,
+                hypothesis=initial_hypothesis,
+            )
+        except Exception as exc:
+            candidate_box["artifacts"] = {"candidate_experiment": "candidate_experiment.json"}
+            failed_registration = {
+                "schema": "cehuan.controlled_synthetic_experiment.v1",
+                "experiment_id": initial_hypothesis["experiment_id"],
+                "hypothesis_id": initial_hypothesis["hypothesis_id"],
+                "result_type": "synthetic_candidate_comparison_not_market_research",
+                "status": "FAILED",
+                "baseline_metrics_sha256": hashlib.sha256(
+                    (run_dir / "baseline_metrics.json").read_bytes()
+                ).hexdigest(),
+                "failure_type": type(exc).__name__,
+                "failure_summary": str(exc)[:500],
+                "broker_connected": False,
+                "orders_generated": False,
+            }
+            (run_dir / "candidate_experiment.json").write_text(
+                json.dumps(failed_registration, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         candidate_box["registration"] = json.loads((run_dir / "candidate_experiment.json").read_text(encoding="utf-8"))
         return {
             "agent_input_initial": "agent_input_initial.json",
@@ -326,7 +504,12 @@ def run_research_cycle(
         cycle_run_id=research_id,
         before_plan_callback=before_plan,
     )
-    review_summary = _review_summary(run_dir)
+    reconciliation_facts = _review_summary(run_dir)
+    review_summary = _build_next_round_review_summary(
+        run_dir,
+        reconciliation_facts=reconciliation_facts,
+        initial_hypothesis=initial_hypothesis,
+    )
     review_digest = _canonical_digest({
         "bars_sha256": bars_digest,
         "review_summary": review_summary,
@@ -342,7 +525,11 @@ def run_research_cycle(
         prior_experiments=[{
             "experiment_id": initial_hypothesis["experiment_id"],
             "result_type": candidate_box["registration"]["status"],
-            "summary": "程序运行的合成基线/候选对照；不是市场研究证据。",
+            "summary": (
+                "程序已完成合成候选与基线对照；数值详见带来源散列的 review_summary.program_facts。"
+                if candidate_box["registration"]["status"] == "COMPLETED_SYNTHETIC_ONLY"
+                else f"程序记录候选实验状态为 {candidate_box['registration']['status']}；没有可引用的完整基线/候选比较事实。"
+            ),
             "input_digest": bars_digest,
         }],
     )
@@ -381,16 +568,13 @@ def run_research_cycle(
                 encoding="utf-8",
             )
 
-    baseline_metrics = json.loads((run_dir / "baseline_metrics.json").read_text(encoding="utf-8"))
-    candidate_registration = candidate_box["registration"]
     report = _research_report(
         research_id=research_id,
         objective=objective,
         initial_hypothesis=initial_hypothesis,
         next_hypothesis=next_hypothesis,
-        baseline_metrics=baseline_metrics,
-        candidate_registration=candidate_registration,
-        review_summary=review_summary,
+        program_facts=review_summary["program_facts"],
+        review_summary=reconciliation_facts,
         model_audits=model_audits,
         next_hypothesis_error=next_error,
     )
@@ -427,8 +611,8 @@ def run_research_cycle(
             "calls": model_audits,
             "api_cost_estimate": None,
         },
-        "candidate_experiment_status": candidate_registration["status"],
-        "position_snapshot_status": review_summary["position_snapshot_status"],
+        "candidate_experiment_status": candidate_box["registration"]["status"],
+        "position_snapshot_status": reconciliation_facts["position_snapshot_status"],
         "broker_connected": False,
         "account_data_used": False,
         "orders_generated": False,

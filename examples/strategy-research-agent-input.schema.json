@@ -29,6 +29,31 @@
     "frozen_strategy": {"type": "object", "required": ["strategy_id", "config_sha256", "parameters"], "properties": {"strategy_id": {"type": "string"}, "config_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}, "parameters": {"type": "object"}}, "additionalProperties": false},
     "prior_experiments": {"type": "array", "items": {"type": "object", "required": ["experiment_id", "result_type", "summary", "input_digest"], "properties": {"experiment_id": {"type": "string"}, "result_type": {"type": "string"}, "summary": {"type": "string"}, "input_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}}, "additionalProperties": false}},
     "review_summary": {"type": ["object", "null"]},
+    "experiment_capabilities": {
+      "type": "object",
+      "required": ["source", "maximum_changes_per_experiment", "supported_parameters"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "maximum_changes_per_experiment": {"type": "integer", "minimum": 1},
+        "supported_parameters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["config_path", "value_type", "minimum_inclusive", "maximum_inclusive", "current_value"],
+            "properties": {
+              "config_path": {"type": "string", "minLength": 1},
+              "value_type": {"enum": ["integer", "number"]},
+              "minimum_inclusive": {"type": "number"},
+              "maximum_inclusive": {"type": "number"},
+              "current_value": {"type": "number"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "known_data_gaps": {"type": "array", "items": {"type": "string"}},
     "allowed_actions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["PROPOSE_HYPOTHESIS", "EXPLAIN_EVIDENCE", "DESIGN_VALIDATION"]}},
     "forbidden_actions": {

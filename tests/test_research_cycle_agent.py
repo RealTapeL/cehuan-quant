@@ -7,15 +7,24 @@ from pathlib import Path
 
 import pytest
 
-from cehuan.research.controlled_experiments import _apply_one_change
+from cehuan.research.controlled_experiments import (
+    MAX_CHANGES_PER_EXPERIMENT,
+    SUPPORTED_HYPOTHESIS_PATHS,
+    _apply_one_change,
+    build_experiment_capabilities,
+)
 from cehuan.research.research_agent import (
     ModelReply,
     StubResearchModel,
+    build_hypothesis_prompt,
     generate_validated_hypothesis,
     resolve_research_model,
     validate_strategy_research_input,
 )
-from cehuan.research.research_cycle import run_research_cycle
+from cehuan.research.research_cycle import (
+    _build_next_round_review_summary,
+    run_research_cycle,
+)
 from cehuan.research.synthetic_cycle import synthetic_cycle_config
 
 
@@ -23,7 +32,11 @@ ROOT = Path(__file__).parents[1]
 
 
 def _agent_input() -> dict:
-    return json.loads((ROOT / "examples/strategy-research-agent-input.synthetic.json").read_text(encoding="utf-8"))
+    payload = json.loads((ROOT / "examples/strategy-research-agent-input.synthetic.json").read_text(encoding="utf-8"))
+    config = synthetic_cycle_config()
+    payload["frozen_strategy"]["parameters"] = config["strategy"]
+    payload["experiment_capabilities"] = build_experiment_capabilities(config)
+    return payload
 
 
 def test_agent_input_schema_and_stub_hypothesis_are_validated():
@@ -34,6 +47,8 @@ def test_agent_input_schema_and_stub_hypothesis_are_validated():
         "experiment_id": "stub-experiment-001",
         "input_data_digest": digest,
         "strategy_parameters": payload["frozen_strategy"]["parameters"],
+        "experiment_capabilities": payload["experiment_capabilities"],
+        "research_input": payload,
     }
     hypothesis, audit = generate_validated_hypothesis(
         StubResearchModel(), input_payload=payload, phase="initial",
@@ -45,6 +60,26 @@ def test_agent_input_schema_and_stub_hypothesis_are_validated():
     assert hypothesis["may_generate_orders"] is False
     assert audit["provider"] == "stub"
     assert audit["prompt_version"]
+
+
+def test_model_prompt_capability_list_is_generated_from_executor_contract():
+    payload = _agent_input()
+    capability = payload["experiment_capabilities"]
+    paths = [item["config_path"] for item in capability["supported_parameters"]]
+    assert paths == list(SUPPORTED_HYPOTHESIS_PATHS)
+    assert capability["maximum_changes_per_experiment"] == MAX_CHANGES_PER_EXPERIMENT
+    for item in capability["supported_parameters"]:
+        assert item["current_value"] == payload["frozen_strategy"]["parameters"][item["config_path"].split(".", 1)[1]]
+        assert item["minimum_inclusive"] == SUPPORTED_HYPOTHESIS_PATHS[item["config_path"]]["minimum"]
+        assert item["maximum_inclusive"] == SUPPORTED_HYPOTHESIS_PATHS[item["config_path"]]["maximum"]
+
+    prompt = build_hypothesis_prompt(
+        input_payload=payload, phase="initial", input_data_digest="a" * 64,
+        experiment_id="capability-test",
+    )
+    for path in paths:
+        assert path in prompt
+    assert '"maximum_changes_per_experiment": 1' in prompt
 
 
 def test_research_agent_rejects_order_or_unknown_action_fields():
@@ -143,9 +178,25 @@ def test_stub_completes_synthetic_research_experiment_review_and_next_hypothesis
     assert initial["experiment_id"] == experiment["experiment_id"]
     assert next_hypothesis["experiment_id"] == f"{manifest['research_cycle_id']}-next-round"
     assert next_input["research_id"] == manifest["research_cycle_id"]
-    assert next_input["review_summary"]["position_snapshot_status"] == "NOT_PROVIDED"
+    summary = next_input["review_summary"]
+    program_facts = summary["program_facts"]
+    assert program_facts["experiment"]["status"] == experiment["status"]
+    assert program_facts["experiment"]["changed_parameters"] == experiment["changed_parameters"]
+    assert program_facts["metrics_status"] == "AVAILABLE_FROM_HASH_BOUND_PERSISTED_METRICS"
+    baseline_metrics = json.loads((run_dir / "baseline_metrics.json").read_text(encoding="utf-8"))
+    candidate_metrics = json.loads((run_dir / "candidate_metrics.json").read_text(encoding="utf-8"))
+    assert program_facts["baseline_metrics"] == baseline_metrics
+    assert program_facts["candidate_metrics"] == candidate_metrics
+    assert program_facts["metric_comparison"]["total_return"]["baseline"] == baseline_metrics["total_return"]
+    assert program_facts["metric_comparison"]["total_return"]["candidate"] == candidate_metrics["total_return"]
+    assert program_facts["reconciliation"]["position_snapshot_status"] == "NOT_PROVIDED"
+    assert summary["agent_authored_context"]["classification"] == "AGENT_TEXT_NOT_PROGRAM_FACT"
+    source_hashes = {item["role"]: item.get("sha256") for item in program_facts["source_artifacts"]}
+    assert source_hashes["candidate_metrics"] == hashlib.sha256((run_dir / "candidate_metrics.json").read_bytes()).hexdigest()
+    assert source_hashes["trade_reconciliation"] == hashlib.sha256((run_dir / "reconciliation.csv").read_bytes()).hexdigest()
     assert "SYNTHETIC ONLY" in review
     assert "NOT_READY" in report
+    assert "## 成交与持仓复盘事实" in report
     assert "候选合成净值收益字段" in report
     assert "不代表 A 股策略收益" in report
     for artifact_name, expected_sha256 in manifest["artifacts"].items():
@@ -153,3 +204,59 @@ def test_stub_completes_synthetic_research_experiment_review_and_next_hypothesis
         assert actual_sha256 == expected_sha256, artifact_name
     assert "remain `NOT_READY`" not in report
     assert (ROOT / "configs/default.toml").read_bytes() == before
+
+
+@pytest.mark.parametrize("status", ["FAILED", "NEEDS_IMPLEMENTATION_OR_REVIEW", "BLOCKED_BY_HYPOTHESIS_STATUS"])
+def test_next_round_context_does_not_invent_candidate_metrics_when_experiment_not_completed(tmp_path, status):
+    baseline_metrics = {"total_return": 0.12, "trade_count": 4}
+    baseline_path = tmp_path / "baseline_metrics.json"
+    baseline_path.write_text(json.dumps(baseline_metrics), encoding="utf-8")
+    registration = {
+        "schema": "cehuan.controlled_synthetic_experiment.v1",
+        "experiment_id": "failed-experiment",
+        "hypothesis_id": "failed-hypothesis",
+        "status": status,
+        "baseline_metrics_sha256": hashlib.sha256(baseline_path.read_bytes()).hexdigest(),
+        "changed_parameters": [],
+        "pending_implementation": ["synthetic test status"],
+    }
+    (tmp_path / "candidate_experiment.json").write_text(json.dumps(registration), encoding="utf-8")
+    (tmp_path / "candidate_metrics.json").write_text(json.dumps({"total_return": 999}), encoding="utf-8")
+    facts = {"position_snapshot_status": "NOT_PROVIDED", "reconciliation_facts": []}
+    hypothesis = {"hypothesis_id": "initial", "status": "PROPOSED", "problem_observed": "agent words"}
+
+    context = _build_next_round_review_summary(
+        tmp_path, reconciliation_facts=facts, initial_hypothesis=hypothesis,
+    )
+
+    program = context["program_facts"]
+    assert program["experiment"]["status"] == status
+    assert program["metrics_status"] == "EXPERIMENT_NOT_COMPLETED"
+    assert program["baseline_metrics"] == baseline_metrics
+    assert program["candidate_metrics"] is None
+    assert program["metric_comparison"] is None
+    assert program["reconciliation"] == facts
+    assert context["agent_authored_context"]["classification"] == "AGENT_TEXT_NOT_PROGRAM_FACT"
+
+
+def test_next_round_context_blocks_metrics_with_mismatched_artifact_hash(tmp_path):
+    baseline_path = tmp_path / "baseline_metrics.json"
+    candidate_path = tmp_path / "candidate_metrics.json"
+    baseline_path.write_text(json.dumps({"total_return": 0.1}), encoding="utf-8")
+    candidate_path.write_text(json.dumps({"total_return": 0.2}), encoding="utf-8")
+    (tmp_path / "candidate_experiment.json").write_text(json.dumps({
+        "status": "COMPLETED_SYNTHETIC_ONLY",
+        "baseline_metrics_sha256": hashlib.sha256(baseline_path.read_bytes()).hexdigest(),
+        "candidate_metrics_sha256": "0" * 64,
+    }), encoding="utf-8")
+
+    context = _build_next_round_review_summary(
+        tmp_path,
+        reconciliation_facts={"reconciliation_facts": [], "position_snapshot_status": "UNKNOWN"},
+        initial_hypothesis={},
+    )
+
+    assert context["program_facts"]["metrics_status"] == "CANDIDATE_METRIC_ARTIFACT_HASH_MISMATCH"
+    assert context["program_facts"]["baseline_metrics"] is not None
+    assert context["program_facts"]["candidate_metrics"] is None
+    assert context["program_facts"]["metric_comparison"] is None
