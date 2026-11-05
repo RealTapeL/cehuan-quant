@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from cehuan.data.adjustment import select_signal_prices
+from cehuan.data.adjustment import (
+    ADJUSTED_SOURCE,
+    RAW_SOURCE,
+    select_signal_prices,
+    signal_price_sources,
+)
 from cehuan.data.canonical import normalize_bar_frame
 
 
@@ -17,7 +22,9 @@ def export_qlib_frame(frame: pd.DataFrame, target: str | Path) -> Path:
     """
     data = normalize_bar_frame(frame)
     signal_prices, _ = select_signal_prices(data)
+    sources = signal_price_sources(data)
     factor = signal_prices.div(data["close"]).where(data["close"] > 0)
+    source_code = sources.map({ADJUSTED_SOURCE: 1, RAW_SOURCE: 2}).fillna(0).astype("int8")
     qlib = pd.DataFrame({
         "open": data["open"] * factor,
         "close": signal_prices,
@@ -25,6 +32,7 @@ def export_qlib_frame(frame: pd.DataFrame, target: str | Path) -> Path:
         "low": data["low"] * factor,
         "volume": data["volume_shares"].div(factor),
         "factor": factor,
+        "price_source_code": source_code,
     })
     qlib.index = pd.MultiIndex.from_arrays(
         [pd.to_datetime(data["trade_date"]), data["symbol"].astype(str)],
@@ -67,10 +75,29 @@ def calculate_qlib_momentum(loaded: pd.DataFrame, lookback_sessions: int) -> pd.
         raise ValueError("输入需要 Qlib datetime/instrument 多级索引")
     if "close" not in loaded.columns:
         raise ValueError("Qlib 数据缺少 close 特征")
-    result = loaded[["close"]].sort_index().copy()
-    result["momentum"] = result.groupby(level="instrument", sort=False)["close"].transform(
-        lambda values: values.div(values.shift(lookback_sessions)).sub(1.0)
-    )
+    columns = ["close"] + (["price_source_code"] if "price_source_code" in loaded.columns else [])
+    result = loaded[columns].sort_index().copy()
+
+    def calculate(group: pd.DataFrame) -> pd.Series:
+        close = pd.to_numeric(group["close"], errors="coerce")
+        source = (
+            pd.to_numeric(group["price_source_code"], errors="coerce").fillna(0)
+            if "price_source_code" in group.columns
+            else pd.Series(1, index=group.index, dtype="int8")
+        )
+        consistent = pd.Series(True, index=group.index, dtype="bool")
+        for offset in range(lookback_sessions + 1):
+            consistent &= source.eq(source.shift(offset)).fillna(False) & source.ne(0)
+        valid_window = close.notna().rolling(
+            lookback_sessions + 1, min_periods=lookback_sessions + 1,
+        ).sum().eq(lookback_sessions + 1)
+        momentum = close.div(close.shift(lookback_sessions)).sub(1.0)
+        return momentum.where(consistent & valid_window)
+
+    momentum = pd.Series(float("nan"), index=result.index, dtype="float64", name="momentum")
+    for _, group in result.groupby(level="instrument", sort=False):
+        momentum.loc[group.index] = calculate(group)
+    result["momentum"] = momentum
     result["rank"] = result.groupby(level="datetime")["momentum"].rank(
         ascending=False, method="first"
     )

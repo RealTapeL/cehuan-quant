@@ -351,17 +351,60 @@ def _validate_v2(document: dict[str, Any], base_dir: Path) -> dict[str, Any]:
 
 def derive_research_eligibility(
     *, quote_available: bool | None, is_listed: bool | None, is_suspended: bool | None,
-    is_st: bool | None, exclude_st: bool, market_rules_complete: bool | None,
-    price_within_limits: bool | None, account_cash_sufficient: bool | None,
+    is_st: bool | None, exclude_st: bool, market_rules_complete: Any,
+    price_within_limits: Any, account_cash_sufficient: Any,
     decision_observations_timely: bool | None = True,
 ) -> dict[str, Any]:
     """Derive a research-only eligibility state; never interpret it as a fill guarantee."""
+    supplied_inputs: dict[str, dict[str, Any]] = {}
+
+    def unpack(label: str, raw: Any) -> bool | None:
+        if isinstance(raw, dict):
+            value = raw.get("value")
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{label}.value 必须是 bool 或 None")
+            sha = str(raw.get("source_sha256", "")).lower()
+            structurally_bound = (
+                bool(str(raw.get("source_id", "")).strip())
+                and len(sha) == 64
+                and all(char in "0123456789abcdef" for char in sha)
+                and bool(str(raw.get("known_at_utc", "")).strip())
+                and bool(str(raw.get("valid_from", "")).strip())
+                and bool(str(raw.get("review_status", "")).strip())
+                and bool(str(raw.get("reviewed_by", "")).strip())
+                and bool(str(raw.get("reviewed_at", "")).strip())
+            )
+            supplied_inputs[label] = {
+                "value": value,
+                "evidence_status": "STRUCTURALLY_BOUND_SOURCE_UNVERIFIED" if structurally_bound else "INCOMPLETE_EVIDENCE",
+                "source_id": raw.get("source_id"),
+                "source_sha256": sha or None,
+                "known_at_utc": raw.get("known_at_utc"),
+                "valid_from": raw.get("valid_from"),
+                "valid_to": raw.get("valid_to"),
+                "review_status": raw.get("review_status"),
+            }
+            return value
+        if raw is not None and not isinstance(raw, bool):
+            raise ValueError(f"{label} 必须是 bool、结构化证据对象或 None")
+        supplied_inputs[label] = {
+            "value": raw,
+            "evidence_status": "SUPPLIED_ASSUMPTION" if raw is not None else "MISSING",
+            "source_id": None,
+            "source_sha256": None,
+            "known_at_utc": None,
+            "valid_from": None,
+            "valid_to": None,
+            "review_status": None,
+        }
+        return raw
+
+    market_rules_value = unpack("market_rules_complete", market_rules_complete)
+    price_limit_value = unpack("price_within_limits", price_within_limits)
+    account_cash_value = unpack("account_cash_sufficient", account_cash_sufficient)
     for label, value in (
         ("quote_available", quote_available), ("is_listed", is_listed),
         ("is_suspended", is_suspended), ("is_st", is_st),
-        ("market_rules_complete", market_rules_complete),
-        ("price_within_limits", price_within_limits),
-        ("account_cash_sufficient", account_cash_sufficient),
     ):
         if value is not None and not isinstance(value, bool):
             raise ValueError(f"{label} 必须是 bool 或 None")
@@ -385,19 +428,25 @@ def derive_research_eligibility(
         unknown.append("QUOTE_UNAVAILABLE_OR_UNKNOWN")
     if decision_observations_timely is not True:
         unknown.append("DECISION_OBSERVATION_NOT_AVAILABLE_BY_DECISION")
-    if market_rules_complete is not True:
+    if market_rules_value is not True:
         unknown.append("MARKET_RULES_INCOMPLETE_OR_UNKNOWN")
-    if price_within_limits is False:
+    if price_limit_value is False:
         blocked.append("PRICE_OUTSIDE_RULE_LIMITS")
-    elif price_within_limits is None:
+    elif price_limit_value is None:
         unknown.append("PRICE_LIMIT_CHECK_INCOMPLETE_OR_FAILED")
-    if account_cash_sufficient is False:
+    if account_cash_value is False:
         blocked.append("INSUFFICIENT_ACCOUNT_CASH")
-    elif account_cash_sufficient is None:
+    elif account_cash_value is None:
         unknown.append("ACCOUNT_CASH_CHECK_INCOMPLETE_OR_FAILED")
     state = "BLOCKED" if blocked else "UNKNOWN" if unknown else "ELIGIBLE"
     return {
         "state": state, "blocked_reasons": blocked, "unknown_reasons": unknown,
+        "eligibility_inputs": supplied_inputs,
+        "evidence_quality": (
+            "STRUCTURALLY_BOUND_SOURCE_UNVERIFIED"
+            if supplied_inputs and all(row["evidence_status"] == "STRUCTURALLY_BOUND_SOURCE_UNVERIFIED" for row in supplied_inputs.values())
+            else "SUPPLIED_ASSUMPTION_OR_INCOMPLETE_EVIDENCE"
+        ),
         "meaning": "Research eligibility under supplied inputs only; not a broker acceptance or fill guarantee.",
     }
 

@@ -21,6 +21,7 @@ class SignalHistoryBar:
     trade_date: date
     close_cny: Decimal
     signal_price_cny: Decimal | None
+    signal_price_source: str = "legacy_unknown"
 
     def __post_init__(self) -> None:
         if not str(self.symbol).strip():
@@ -35,6 +36,13 @@ class SignalHistoryBar:
         if signal is not None and (not signal.is_finite() or signal <= 0):
             raise ValueError("checkpoint signal_price 必须是有限正数或空值")
         object.__setattr__(self, "signal_price_cny", signal)
+        source = str(self.signal_price_source).strip()
+        if source not in {
+            "adjusted_close", "raw_close_no_adjustment",
+            "unusable_mixed_or_nonpositive_adjustment", "legacy_unknown",
+        }:
+            raise ValueError("checkpoint signal_price_source 未知")
+        object.__setattr__(self, "signal_price_source", source)
 
 
 @dataclass(frozen=True)
@@ -92,12 +100,12 @@ class BacktestCheckpoint:
     state_sha256: str = ""
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise ValueError(f"不支持的 backtest checkpoint schema_version={self.schema_version}")
         if self.schema_version == 1 and self.pending_targets_active is not None:
             raise ValueError("checkpoint v1 不支持 pending_targets_active")
-        if self.schema_version == 2 and not isinstance(self.pending_targets_active, bool):
-            raise ValueError("checkpoint v2 必须明确 pending_targets_active")
+        if self.schema_version in {2, 3} and not isinstance(self.pending_targets_active, bool):
+            raise ValueError(f"checkpoint v{self.schema_version} 必须明确 pending_targets_active")
         if not str(self.strategy_id).strip():
             raise ValueError("backtest checkpoint strategy_id 不能为空")
         as_of = calendar_date(self.as_of_date, "checkpoint.as_of_date")
@@ -115,15 +123,18 @@ class BacktestCheckpoint:
             raise ValueError("checkpoint pending_targets 包含无效标的或权重")
         if len({symbol for symbol, _ in pending}) != len(pending):
             raise ValueError("checkpoint pending_targets 存在重复证券")
-        if self.schema_version == 2 and not self.pending_targets_active and pending:
-            raise ValueError("checkpoint v2 无待执行信号时不能包含 pending_targets")
+        if self.schema_version in {2, 3} and not self.pending_targets_active and pending:
+            raise ValueError(f"checkpoint v{self.schema_version} 无待执行信号时不能包含 pending_targets")
         transition = tuple(sorted((str(symbol).strip().upper(), int(index)) for symbol, index in self.transition_signal_ready_index))
         if any(not symbol or index < 0 for symbol, index in transition):
             raise ValueError("checkpoint transition signal state 无效")
         modes = tuple(sorted((str(symbol).strip().upper(), str(mode).strip()) for symbol, mode in self.signal_price_modes))
         if len({symbol for symbol, _ in modes}) != len(modes):
             raise ValueError("checkpoint signal price modes 存在重复证券")
-        if any(mode not in {"adjusted_close", "raw_close_no_adjustment", "unusable_mixed_or_nonpositive_adjustment"} for _, mode in modes):
+        if any(mode not in {
+            "adjusted_close", "raw_close_no_adjustment",
+            "unusable_mixed_or_nonpositive_adjustment", "point_in_time_mixed_adjustment",
+        } for _, mode in modes):
             raise ValueError("checkpoint signal price mode 未知")
         if len({(item.trade_date, item.symbol) for item in self.signal_history}) != len(self.signal_history):
             raise ValueError("checkpoint signal history 存在重复证券日")
@@ -180,11 +191,13 @@ class BacktestCheckpoint:
     def _payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("state_sha256", None)
-        # Preserve the exact v1 digest and JSON contract. V2 adds an explicit
-        # bit because an empty target map means "liquidate all", while no
-        # pending signal means "do nothing".
+        # Preserve legacy checkpoint hashes. V2 added an explicit active bit;
+        # v3 adds per-row price basis to signal history.
         if self.schema_version == 1:
             payload.pop("pending_targets_active", None)
+        if self.schema_version < 3:
+            for row in payload["signal_history"]:
+                row.pop("signal_price_source", None)
         return payload
 
     def calculate_state_sha256(self) -> str:
@@ -207,6 +220,9 @@ class BacktestCheckpoint:
         payload = asdict(sealed)
         if sealed.schema_version == 1:
             payload.pop("pending_targets_active", None)
+        if sealed.schema_version < 3:
+            for row in payload["signal_history"]:
+                row.pop("signal_price_source", None)
         payload["as_of_date"] = sealed.as_of_date.isoformat()
         payload["next_expected_session"] = sealed.next_expected_session.isoformat()
         payload["previous_equity_cny"] = str(sealed.previous_equity_cny)
@@ -234,7 +250,7 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
         "calendar_sha256", "calendar_prefix_sha256", "last_window_data_sha256", "last_window_bars_sha256",
         "data_chain_sha256", "state_sha256",
     }
-    if value.get("schema_version") == 2:
+    if value.get("schema_version") in {2, 3}:
         required.add("pending_targets_active")
     missing = required.difference(value)
     if missing:
@@ -254,6 +270,7 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
         symbol=str(row["symbol"]), trade_date=row["trade_date"],
         close_cny=Decimal(str(row["close_cny"])),
         signal_price_cny=None if row.get("signal_price_cny") is None else Decimal(str(row["signal_price_cny"])),
+        signal_price_source=str(row.get("signal_price_source", "legacy_unknown")),
     ) for row in value["signal_history"])
     last_prices = tuple(CheckpointPrice(
         symbol=str(row["symbol"]), price_cny=Decimal(str(row["price_cny"])),

@@ -126,6 +126,24 @@ def test_can_buy_is_derived_and_distinguishes_blocked_from_unknown() -> None:
     )
     assert blocked["state"] == "BLOCKED"
     assert "INSUFFICIENT_ACCOUNT_CASH" in blocked["blocked_reasons"]
+    assert blocked["eligibility_inputs"]["market_rules_complete"]["evidence_status"] == "SUPPLIED_ASSUMPTION"
+
+
+def test_structured_eligibility_evidence_is_bound_but_not_claimed_verified() -> None:
+    result = derive_research_eligibility(
+        quote_available=True, is_listed=True, is_suspended=False, is_st=False, exclude_st=True,
+        market_rules_complete={
+            "value": True, "source_id": "rule-source", "source_sha256": "a" * 64,
+            "known_at_utc": "2026-11-05T07:00:00Z", "valid_from": "2026-11-01",
+            "valid_to": None, "review_status": "REVIEWED", "reviewed_by": "reviewer",
+            "reviewed_at": "2026-11-05T08:00:00+08:00",
+        },
+        price_within_limits=True, account_cash_sufficient=True,
+    )
+    assert result["state"] == "ELIGIBLE"
+    assert result["eligibility_inputs"]["market_rules_complete"]["evidence_status"] == "STRUCTURALLY_BOUND_SOURCE_UNVERIFIED"
+    assert result["eligibility_inputs"]["price_within_limits"]["evidence_status"] == "SUPPLIED_ASSUMPTION"
+    assert result["evidence_quality"] == "SUPPLIED_ASSUMPTION_OR_INCOMPLETE_EVIDENCE"
 
 
 def test_parse_failed_preserves_response_but_does_not_publish_business_payload(tmp_path: Path) -> None:

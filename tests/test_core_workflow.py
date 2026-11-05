@@ -23,7 +23,7 @@ from cehuan.review.reconcile import (
 )
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.qlib_bridge import calculate_qlib_momentum
-from cehuan.signals.plan import generate_plan
+from cehuan.signals.plan import PlanReadinessError, generate_plan
 from cehuan.signals.strategy import add_momentum
 
 
@@ -261,7 +261,7 @@ def test_existing_st_position_can_be_exited_but_is_not_a_new_buy_candidate():
         "symbol": "SIM001", "shares": 500, "available_to_sell": 500, "average_cost": 10.0,
     }])
 
-    plan = generate_plan(data, 100_000, config, positions=positions)
+    plan = generate_plan(data, 100_000, config, positions=positions, purpose="SYNTHETIC_DIAGNOSTIC")
 
     held = plan.loc[plan["symbol"] == "SIM001"].iloc[0]
     assert held["action"] == "SELL"
@@ -394,7 +394,7 @@ def test_locked_limit_up_open_blocks_buy() -> None:
 def test_unknown_st_status_requires_manual_verification() -> None:
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
-    plan = generate_plan(bars(st_unknown=True), 100_000, config)
+    plan = generate_plan(bars(st_unknown=True), 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
     assert not plan.empty
     assert set(plan["action"]) == {"VERIFY"}
     assert (plan["planned_shares"] == 0).all()
@@ -405,7 +405,7 @@ def test_unknown_market_order_rules_require_manual_verification() -> None:
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
     data["buy_step_shares"] = pd.NA
-    plan = generate_plan(data, 100_000, config)
+    plan = generate_plan(data, 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
     assert not plan.empty
     assert set(plan["action"]) == {"VERIFY"}
     assert plan["planned_shares"].eq(0).all()
@@ -417,7 +417,7 @@ def test_plan_cannot_disable_point_in_time_rule_checks() -> None:
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     config["market"]["require_point_in_time_status"] = False
     try:
-        generate_plan(bars(), 100_000, config)
+        generate_plan(bars(), 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
     except ValueError as exc:
         assert "不能关闭点时" in str(exc)
     else:
@@ -433,7 +433,7 @@ def test_plan_respects_board_specific_minimum_and_increment() -> None:
     data["buy_step_shares"] = 1
     data["sell_min_shares"] = 200
     data["sell_step_shares"] = 1
-    plan = generate_plan(data, 100_000, config)
+    plan = generate_plan(data, 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
     buys = plan.loc[plan["action"] == "BUY"]
     assert not buys.empty
     assert (buys["planned_shares"] >= 200).all()
@@ -449,6 +449,18 @@ def test_qlib_momentum_feature_uses_instrument_history_and_date_rank() -> None:
     third_day = result.xs(dates[2], level="datetime")
     assert third_day.loc["SH600001", "momentum"] == 12 / 11 - 1
     assert third_day.loc["SZ000001", "rank"] == 1
+
+
+def test_qlib_momentum_rejects_price_basis_mixing_inside_lookback_window() -> None:
+    dates = pd.date_range("2025-01-01", periods=4)
+    index = pd.MultiIndex.from_product([dates, ["SH600001"]], names=["datetime", "instrument"])
+    loaded = pd.DataFrame({
+        "close": [10.0, 11.0, 12.0, 13.0],
+        "price_source_code": [1, 1, 2, 1],
+    }, index=index)
+    result = calculate_qlib_momentum(loaded, 2)
+    assert pd.isna(result.loc[(dates[2], "SH600001"), "momentum"])
+    assert pd.isna(result.loc[(dates[3], "SH600001"), "momentum"])
 
 
 def test_fill_reconciliation_reports_unfilled_and_vwap_gap() -> None:
@@ -507,11 +519,42 @@ def test_partial_adjusted_prices_do_not_mix_with_raw_prices_for_signals() -> Non
     data = bars(16)
     data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-08"), "adjusted_close"] = pd.NA
     selected, modes = select_signal_prices(data)
-    assert modes["SIM001"] == "unusable_mixed_or_nonpositive_adjustment"
-    assert selected.loc[data["symbol"] == "SIM001"].isna().all()
+    assert modes["SIM001"] == "point_in_time_mixed_adjustment"
+    assert selected.loc[data["symbol"] == "SIM001"].notna().all()
     signalled = add_momentum(data, 3)
-    assert signalled.loc[signalled["symbol"] == "SIM001", "momentum"].isna().all()
+    first_symbol = signalled.loc[signalled["symbol"] == "SIM001"]
+    signal_days = first_symbol.trade_date.astype(str)
+    assert first_symbol.loc[signal_days < "2025-01-08", "momentum"].notna().any()
+    assert first_symbol.loc[signal_days.between("2025-01-08", "2025-01-11"), "momentum"].isna().all()
+    assert first_symbol.loc[signal_days > "2025-01-11", "momentum"].notna().any()
     assert signalled.loc[signalled["symbol"] == "SIM002", "momentum"].notna().any()
+
+
+def test_nonempty_malformed_adjusted_price_is_not_treated_as_missing() -> None:
+    data = bars(4)
+    target = data.index[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-03")][0]
+    data["adjusted_close"] = data["adjusted_close"].astype("object")
+    data.loc[target, "adjusted_close"] = "bad-value"
+    selected, modes = select_signal_prices(data)
+    assert pd.isna(selected.loc[target])
+    assert modes["SIM001"] == "unusable_mixed_or_nonpositive_adjustment"
+
+
+def test_future_adjustment_missing_row_does_not_change_prior_momentum() -> None:
+    original = bars(16)
+    with_momentum = add_momentum(original, 3)
+    future = original.iloc[[-2, -1]].copy()
+    original["adjusted_close"] = original["adjusted_close"].astype("Float64")
+    future["adjusted_close"] = future["adjusted_close"].astype("Float64")
+    future["trade_date"] = "2025-01-17"
+    future["close"] = future["close"] + 1
+    future["adjusted_close"] = pd.NA
+    joined = pd.DataFrame([*original.to_dict("records"), *future.to_dict("records")])
+    extended = add_momentum(joined, 3)
+    before = with_momentum.loc[with_momentum.trade_date.eq("2025-01-16"), ["symbol", "momentum"]].reset_index(drop=True)
+    after = extended.loc[extended.trade_date.eq("2025-01-16"), ["symbol", "momentum"]].reset_index(drop=True)
+    pd.testing.assert_frame_equal(before, after)
+    assert extended.loc[extended.trade_date.eq("2025-01-17"), "momentum"].isna().all()
 
 
 def test_data_quality_rejects_mixed_price_sources_for_one_security() -> None:
@@ -549,10 +592,83 @@ def test_plan_records_next_open_day_and_calendar_source() -> None:
         "is_open": True,
         "source": "synthetic_calendar",
     })
-    plan = generate_plan(data, 100_000, config, calendar=calendar)
+    plan = generate_plan(data, 100_000, config, calendar=calendar, purpose="SYNTHETIC_DIAGNOSTIC")
     assert not plan.empty
     assert plan["effective_time"].str.contains("2025-01-17").all()
     assert plan["calendar_source"].eq("synthetic_calendar").all()
+
+
+def test_default_plan_is_research_only_and_has_no_executable_quantity() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    plan = generate_plan(bars(), 100_000, config)
+    assert not plan.empty
+    assert set(plan["plan_purpose"]) == {"RESEARCH_ONLY"}
+    assert not plan["executable_quantity_permitted"].any()
+    assert plan["planned_shares"].eq(0).all()
+    assert plan["target_shares"].isna().all()
+    assert not plan["action"].isin(["BUY", "SELL"]).any()
+
+
+def test_synthetic_diagnostic_plan_rejects_non_synthetic_data() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    data = bars()
+    data["data_source"] = "BaoStock"
+    with pytest.raises(ValueError, match="只接受明确标记为 synthetic"):
+        generate_plan(data, 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
+
+
+def test_manual_review_blocks_when_formal_readiness_is_missing() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    with pytest.raises(PlanReadinessError, match="缺少正式基线 readiness"):
+        generate_plan(bars(), 100_000, config, purpose="MANUAL_REVIEW")
+
+
+def test_manual_review_refuses_to_value_missing_holding_price_at_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+    import json
+    import cehuan.signals.plan as plan_module
+
+    monkeypatch.setattr(plan_module, "require_baseline_ready", lambda *args, **kwargs: None)
+
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
+    data = bars()
+    last_day = data["trade_date"].max()
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == last_day), "close"] = pd.NA
+    data["available_at"] = data["trade_date"].map(lambda value: f"{value}T15:00:00+08:00")
+    data["retrieved_at_utc"] = data["trade_date"].map(lambda value: f"{value}T07:01:00Z")
+    calendar = pd.DataFrame({
+        "trade_date": pd.date_range("2025-01-01", "2025-01-17").date,
+        "is_open": True, "source": "synthetic_calendar",
+    })
+    universe = pd.DataFrame({
+        "trade_date": [last_day, last_day], "symbol": ["SIM001", "SIM002"],
+        "pool_status": ["STOCK_MEMBER", "STOCK_MEMBER"],
+    })
+    formal_readiness = {
+        "schema": "cehuan.baseline_readiness.v1", "schema_version": 1,
+        "ready": True, "decision": "READY", "blockers": [],
+        "checks": {"execution_engine": {"complete": True}},
+        "input_hashes": {}, "evaluation_window": {"start": "2025-01-01", "end": "2025-01-16"},
+    }
+    formal_readiness["report_sha256"] = hashlib.sha256(
+        json.dumps(formal_readiness, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    positions = pd.DataFrame([{
+        "symbol": "SIM001", "shares": 1000, "available_to_sell": 1000, "average_cost": 10.0,
+    }])
+    with pytest.raises(PlanReadinessError, match="禁止用历史成本估算组合市值"):
+        generate_plan(
+            data, 100_000, config, positions=positions,
+            now=datetime(2025, 1, 16, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+            calendar=calendar, purpose="MANUAL_REVIEW",
+            universe=universe,
+            positions_as_of=datetime(2025, 1, 16, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+            formal_readiness=formal_readiness,
+        )
 
 
 def test_plan_rejects_snapshot_fetched_before_close_even_if_plan_runs_after_close() -> None:
@@ -639,7 +755,7 @@ def test_plan_does_not_sell_more_than_t_plus_one_available_quantity() -> None:
     positions = pd.DataFrame([{
         "symbol": "SIM002", "shares": 100, "available_to_sell": 0, "average_cost": 30.0,
     }])
-    plan = generate_plan(bars(), 100_000, config, positions)
+    plan = generate_plan(bars(), 100_000, config, positions, purpose="SYNTHETIC_DIAGNOSTIC")
     held = plan.loc[plan["symbol"] == "SIM002"].iloc[0]
     assert held["action"] == "HOLD"
     assert held["planned_shares"] == 0

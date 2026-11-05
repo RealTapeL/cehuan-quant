@@ -50,7 +50,7 @@ from cehuan.review.reconcile import (
 )
 from cehuan.review.import_registry import find_fill_import_record, register_fill_import
 from cehuan.review.fill_dedup import audit_cross_file_fills
-from cehuan.signals.plan import generate_plan, plan_markdown
+from cehuan.signals.plan import PlanReadinessError, generate_plan, plan_markdown
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -247,8 +247,12 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--positions")
     plan.add_argument("--config")
     plan.add_argument("--security-master")
-    plan.add_argument("--calendar", help="可选交易日历 CSV；提供后标记下一个开市日")
+    plan.add_argument("--calendar", help="交易日历 CSV；人工审核模式必需")
+    plan.add_argument("--universe", help="逐日 STOCK_MEMBER 股票池 CSV；人工审核模式必需")
     plan.add_argument("--mapping")
+    plan.add_argument("--purpose", choices=["RESEARCH_ONLY", "MANUAL_REVIEW"], default="RESEARCH_ONLY")
+    plan.add_argument("--positions-as-of", help="持仓快照时点，ISO-8601 且必须含时区")
+    plan.add_argument("--formal-readiness", help="正式基线 readiness JSON；人工审核模式必需且必须为 READY")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
@@ -1053,24 +1057,80 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan":
+            plan_input_paths = {
+                "bars": Path(args.data).expanduser().resolve(),
+                "config": Path(args.config).expanduser().resolve() if args.config else REPO_ROOT / "configs" / "default.toml",
+                "positions": Path(args.positions).expanduser().resolve() if args.positions else None,
+                "position_mapping": Path(args.mapping).expanduser().resolve() if args.mapping else (REPO_ROOT / "configs" / "huatai_columns.toml" if args.positions else None),
+                "security_master": Path(args.security_master).expanduser().resolve() if args.security_master else None,
+                "calendar": Path(args.calendar).expanduser().resolve() if args.calendar else None,
+                "universe": Path(args.universe).expanduser().resolve() if args.universe else None,
+                "formal_readiness": Path(args.formal_readiness).expanduser().resolve() if args.formal_readiness else None,
+            }
+            plan_input_hashes_before = {
+                label: sha256_file(path) for label, path in plan_input_paths.items()
+                if path is not None and path.is_file()
+            }
             config = load_config(args.config)
             bars = read_bars(args.data)
             if args.security_master:
                 bars = apply_security_master(bars, pd.read_csv(args.security_master))
             positions = read_positions(args.positions, args.mapping) if args.positions else None
             calendar = pd.read_csv(args.calendar, dtype=str) if args.calendar else None
-            plan_frame = generate_plan(bars, args.cash, config, positions, calendar=calendar)
+            universe = pd.read_csv(args.universe, dtype=str, keep_default_na=False) if args.universe else None
+            positions_as_of = datetime.fromisoformat(args.positions_as_of.replace("Z", "+00:00")) if args.positions_as_of else None
+            formal_readiness = json.loads(Path(args.formal_readiness).expanduser().read_text(encoding="utf-8")) if args.formal_readiness else None
+            try:
+                plan_frame = generate_plan(
+                    bars, args.cash, config, positions, calendar=calendar,
+                    universe=universe,
+                    purpose=args.purpose, positions_as_of=positions_as_of,
+                    formal_readiness=formal_readiness,
+                )
+            except PlanReadinessError as exc:
+                folder = REPO_ROOT / "outputs" / "plans" / f"readiness-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+                folder.mkdir(parents=True, exist_ok=False)
+                exc.report["input_bindings"] = {
+                    label: {"path": str(plan_input_paths[label]), "sha256": digest}
+                    for label, digest in plan_input_hashes_before.items()
+                }
+                _write_json(exc.report, folder / "plan-readiness.json")
+                print(f"未生成计划：准入检查未通过，报告已保存到 {folder / 'plan-readiness.json'}", file=sys.stderr)
+                return 1
+            plan_input_hashes_after = {
+                label: sha256_file(path) for label, path in plan_input_paths.items()
+                if path is not None and path.is_file()
+            }
+            if plan_input_hashes_after != plan_input_hashes_before:
+                raise ValueError("交易计划输入文件在生成过程中发生变化；没有发布计划文件")
             plan_id = str(plan_frame["plan_id"].iloc[0]) if not plan_frame.empty else "empty-plan"
             folder = REPO_ROOT / "outputs" / "plans" / plan_id
-            folder.mkdir(parents=True, exist_ok=True)
+            folder.mkdir(parents=True, exist_ok=False)
             plan_path = folder / "plan.csv"
             plan_frame.to_csv(plan_path, index=False)
             markdown = plan_markdown(plan_frame)
             (folder / "plan.md").write_text(markdown, encoding="utf-8")
-            (REPO_ROOT / "outputs").mkdir(parents=True, exist_ok=True)
-            plan_frame.to_csv(REPO_ROOT / "outputs" / "latest_plan.csv", index=False)
-            (REPO_ROOT / "outputs" / "latest_plan.md").write_text(markdown, encoding="utf-8")
-            print(f"计划已保存：{plan_path}\n人工审核必需；本命令不会下单。")
+            readiness_report = plan_frame.attrs.get("readiness_report", {
+                "schema": "cehuan.plan_readiness.v1", "status": "RESEARCH_ONLY",
+                "checks": {}, "blocking_reasons": [],
+                "plan_is_order": False, "orders_generated": False,
+            })
+            readiness_report["plan_purpose"] = args.purpose
+            readiness_report["input_bindings"] = {
+                label: {"path": str(plan_input_paths[label]), "sha256": digest}
+                for label, digest in plan_input_hashes_before.items()
+            }
+            _write_json(readiness_report, folder / "plan-readiness.json")
+            _write_json({
+                "schema": "cehuan.plan_input_manifest.v1",
+                "plan_id": plan_id,
+                "classification": args.purpose,
+                "inputs": readiness_report["input_bindings"],
+                "plan_sha256": sha256_file(plan_path),
+                "orders_generated": False,
+                "broker_connected": False,
+            }, folder / "plan-manifest.json")
+            print(f"计划已保存：{plan_path}\n性质：{args.purpose}；本命令不会连接券商或下单。")
             if not plan_frame.empty:
                 print(plan_frame[["symbol", "action", "planned_shares", "reference_price", "major_risks"]].to_string(index=False))
             return 0
@@ -1100,6 +1160,8 @@ def main(argv: list[str] | None = None) -> int:
             input_hashes_before = {name: sha256_file(path) for name, path in tracked_inputs.items()}
 
             plan_frame = pd.read_csv(plan_path)
+            if "plan_purpose" in plan_frame.columns and plan_frame["plan_purpose"].astype(str).eq("RESEARCH_ONLY").any():
+                raise ValueError("RESEARCH_ONLY 候选不能作为实际交易计划复盘；请使用通过准入的 MANUAL_REVIEW 计划")
             fills = read_fills(fills_path, mapping_path)
             order_statuses = read_order_statuses(statuses_path) if statuses_path else None
             if order_statuses is not None:

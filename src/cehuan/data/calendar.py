@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from cehuan.data.canonical import normalize_bar_frame, parse_optional_bool
+from cehuan.data.adjustment import INVALID_SOURCE, signal_price_sources
+from cehuan.data.canonical import canonical_symbol, normalize_bar_frame, parse_optional_bool
 
 
 CALENDAR_REQUIRED = ["trade_date", "is_open", "source"]
@@ -79,3 +80,87 @@ def next_open_session(calendar: pd.DataFrame, after: object) -> tuple[str, str] 
         return None
     row = next_rows.iloc[0]
     return row["trade_date"].isoformat(), str(row["source"])
+
+
+def audit_security_windows(
+    bars: pd.DataFrame,
+    calendar: pd.DataFrame,
+    symbols: list[str] | set[str] | tuple[str, ...],
+    *,
+    signal_date: object,
+    lookback_sessions: int,
+) -> pd.DataFrame:
+    """Audit a per-security calendar window without inferring missing bars as suspensions."""
+    if isinstance(lookback_sessions, bool) or lookback_sessions < 1:
+        raise ValueError("lookback_sessions 必须是正整数")
+    data = normalize_bar_frame(bars)
+    sessions = normalize_trading_calendar(calendar)
+    signal_day = pd.Timestamp(signal_date).date()
+    opens = sessions.loc[sessions["is_open"].fillna(False), "trade_date"].tolist()
+    if signal_day not in opens:
+        raise ValueError(f"signal_date {signal_day} 不在交易日历开市日中")
+    end = opens.index(signal_day)
+    required = opens[max(0, end - lookback_sessions):end + 1]
+    window_length = lookback_sessions + 1
+    normalized_symbols = sorted({canonical_symbol(symbol) for symbol in symbols})
+    duplicate = data.duplicated(["trade_date", "symbol"], keep=False)
+    if duplicate.any():
+        duplicate_rows = data.loc[duplicate, ["symbol", "trade_date"]].to_dict(orient="records")
+        raise ValueError(f"证券日行情有重复行，不能做窗口审计: {duplicate_rows[:10]}")
+
+    date_text = data["trade_date"].astype(str)
+    source_by_index = signal_price_sources(data)
+    records: list[dict[str, object]] = []
+    for symbol in normalized_symbols:
+        symbol_mask = data["symbol"].astype(str).eq(symbol)
+        history = data.loc[symbol_mask & date_text.le(signal_day.isoformat())].copy()
+        history_dates = set(pd.to_datetime(history["trade_date"]).dt.date.tolist())
+        actual_dates = history_dates.intersection(set(required))
+        missing = [day.isoformat() for day in required if day not in actual_dates]
+        # Missing rows inside a complete calendar window are data gaps, not a
+        # shorter history. Reserve INSUFFICIENT_HISTORY for the calendar edge.
+        insufficient_history = len(required) < window_length
+        rows = history.loc[pd.to_datetime(history["trade_date"]).dt.date.isin(required)].copy()
+        status_fields = [field for field in ("is_listed", "is_suspended", "is_st") if field not in rows.columns]
+        if status_fields:
+            unknown_status_dates = ["ALL_REQUIRED_SESSIONS"]
+        else:
+            unknown_mask = rows[["is_listed", "is_suspended", "is_st"]].isna().any(axis=1)
+            unknown_status_dates = sorted({
+                *pd.to_datetime(rows.loc[unknown_mask, "trade_date"]).dt.strftime("%Y-%m-%d").tolist(),
+                *missing,
+            })
+        suspended_dates = sorted(pd.to_datetime(rows.loc[rows.get("is_suspended", pd.Series(pd.NA, index=rows.index)).fillna(False).astype(bool), "trade_date"]).dt.strftime("%Y-%m-%d").tolist()) if "is_suspended" in rows else []
+        source_rows = source_by_index.loc[rows.index].astype(str)
+        invalid_prices = (
+            pd.to_numeric(rows["close"], errors="coerce").isna()
+            | pd.to_numeric(rows["close"], errors="coerce").le(0)
+            | source_rows.eq(INVALID_SOURCE)
+        )
+        mixed_basis = source_rows.nunique(dropna=False) > 1
+        if insufficient_history:
+            status = "INSUFFICIENT_HISTORY"
+        elif missing:
+            status = "MISSING_BAR"
+        elif unknown_status_dates:
+            status = "UNKNOWN_STATUS"
+        elif invalid_prices.any() or mixed_basis:
+            status = "INVALID_OR_MIXED_PRICE_WINDOW"
+        elif suspended_dates:
+            status = "COMPLETE_WITH_SUSPENSION"
+        else:
+            status = "COMPLETE"
+        records.append({
+            "symbol": symbol,
+            "signal_date": signal_day.isoformat(),
+            "expected_session_count": len(required),
+            "required_sessions": ";".join(day.isoformat() for day in required),
+            "actual_row_count": len(actual_dates),
+            "missing_sessions": ";".join(missing),
+            "unknown_status_sessions": ";".join(unknown_status_dates),
+            "suspended_sessions": ";".join(suspended_dates),
+            "price_basis_status": "MIXED" if mixed_basis else "INVALID" if invalid_prices.any() else "CONSISTENT",
+            "window_status": status,
+            "included_in_ranking_scope": status in {"COMPLETE", "COMPLETE_WITH_SUSPENSION"},
+        })
+    return pd.DataFrame(records)

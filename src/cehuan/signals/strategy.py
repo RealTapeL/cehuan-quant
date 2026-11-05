@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from cehuan.data.adjustment import select_signal_prices
+from cehuan.data.adjustment import select_signal_prices, signal_price_sources
 from cehuan.data.canonical import normalize_bar_frame
 
 
@@ -69,9 +69,39 @@ def add_momentum(
         assume_sorted=assume_sorted,
     )
     data["signal_price"], _ = select_signal_prices(data)
-    data["momentum"] = data.groupby("symbol", sort=False, observed=True)["signal_price"].transform(
-        lambda values: values.div(values.shift(lookback_sessions)).sub(1.0)
-    )
+    data["signal_price_source"] = signal_price_sources(data)
+    return add_momentum_from_signal_prices(data, lookback_sessions)
+
+
+def add_momentum_from_signal_prices(frame: pd.DataFrame, lookback_sessions: int) -> pd.DataFrame:
+    """Calculate momentum only when its entire window uses one price basis.
+
+    The helper is shared with checkpoint continuation so a split run applies
+    the same per-row basis tags as a continuous run.
+    """
+    if lookback_sessions < 1:
+        raise ValueError("lookback_sessions 必须大于 0")
+    required = {"symbol", "close", "signal_price", "signal_price_source"}
+    if not required.issubset(frame.columns):
+        raise ValueError("窗口动量计算需要 symbol/close/signal_price/signal_price_source 字段")
+    data = frame.copy()
+
+    def calculate(group: pd.DataFrame) -> pd.Series:
+        price = pd.to_numeric(group["signal_price"], errors="coerce")
+        source = group["signal_price_source"].astype("string")
+        consistent = pd.Series(True, index=group.index, dtype="bool")
+        for offset in range(lookback_sessions + 1):
+            consistent &= source.eq(source.shift(offset)).fillna(False)
+        valid_window = price.notna().rolling(
+            lookback_sessions + 1, min_periods=lookback_sessions + 1,
+        ).sum().eq(lookback_sessions + 1)
+        result = price.div(price.shift(lookback_sessions)).sub(1.0)
+        return result.where(consistent & valid_window)
+
+    momentum = pd.Series(float("nan"), index=data.index, dtype="float64", name="momentum")
+    for _, group in data.groupby("symbol", sort=False, observed=True):
+        momentum.loc[group.index] = calculate(group)
+    data["momentum"] = momentum
     return data
 
 

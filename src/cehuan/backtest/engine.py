@@ -61,13 +61,14 @@ from cehuan.research.baseline_readiness import (
 from cehuan.research.trust_labels import build_research_trust_labels
 from cehuan.signals.strategy import (
     add_momentum,
+    add_momentum_from_signal_prices,
     order_constraints,
     rank_precomputed_day,
     round_order_quantity,
     status_is_buy_eligible,
     status_is_sell_eligible,
 )
-from cehuan.data.adjustment import select_signal_prices
+from cehuan.data.adjustment import select_signal_prices, signal_price_sources
 
 
 def _git_metadata() -> dict[str, Any]:
@@ -561,12 +562,15 @@ def run_backtest(
     )
 
     data["signal_price"], current_signal_modes = select_signal_prices(data)
+    data["signal_price_source"] = signal_price_sources(data)
     current_modes = {str(symbol): mode for symbol, mode in current_signal_modes.items()}
     if backtest_checkpoint is None:
         signal_modes = current_modes
         feature_data = add_momentum(data, lookback, normalized=True)
         feature_data["previous_close"] = feature_data.groupby("symbol", sort=False, observed=True)["close"].shift(1)
-        signal_history_source = feature_data[["trade_date", "symbol", "close", "signal_price"]].copy()
+        signal_history_source = feature_data[[
+            "trade_date", "symbol", "close", "signal_price", "signal_price_source",
+        ]].copy()
     else:
         if backtest_checkpoint.strategy_id != str(strategy["name"]):
             raise ValueError("checkpoint 策略名称变化；请从受影响日期重新计算")
@@ -628,46 +632,29 @@ def run_backtest(
 
         checkpoint_modes = dict(backtest_checkpoint.signal_price_modes)
         signal_modes = dict(checkpoint_modes)
-        for symbol, current_mode in current_modes.items():
-            prior_mode = checkpoint_modes.get(symbol)
-            if prior_mode is None:
-                signal_modes[symbol] = current_mode
-            elif prior_mode == "adjusted_close" and current_mode != "adjusted_close":
-                raise ValueError(f"{symbol} 续跑后复权价格缺失/变化；不能沿用 checkpoint 信号历史")
-            elif prior_mode == "raw_close_no_adjustment" and current_mode != "raw_close_no_adjustment":
-                raise ValueError(f"{symbol} 续跑后复权字段可用性发生变化；请重新计算信号历史")
-
-        current_signal_values: list[float] = []
-        for row_index, row in data.iterrows():
-            symbol = str(row["symbol"])
-            mode = signal_modes[symbol]
-            if mode == "adjusted_close":
-                value = pd.to_numeric(pd.Series([row.get("adjusted_close")]), errors="coerce").iloc[0]
-            elif mode == "raw_close_no_adjustment":
-                value = row["close"]
-            else:
-                value = np.nan
-            if mode != "unusable_mixed_or_nonpositive_adjustment" and (
-                pd.isna(value) or not np.isfinite(float(value)) or float(value) <= 0
-            ):
-                raise ValueError(f"{symbol} 续跑信号价格无效；请重新生成完整历史特征")
-            current_signal_values.append(float(value) if not pd.isna(value) else np.nan)
-        data["signal_price"] = current_signal_values
+        signal_modes.update(current_modes)
         history_frame = pd.DataFrame([
             {
                 "trade_date": item.trade_date,
                 "symbol": item.symbol,
                 "close": float(item.close_cny),
                 "signal_price": np.nan if item.signal_price_cny is None else float(item.signal_price_cny),
+                "signal_price_source": (
+                    item.signal_price_source
+                    if item.signal_price_source != "legacy_unknown"
+                    else checkpoint_modes.get(item.symbol, "legacy_unknown")
+                    if checkpoint_modes.get(item.symbol) in {"adjusted_close", "raw_close_no_adjustment"}
+                    else "legacy_unknown"
+                ),
             }
             for item in backtest_checkpoint.signal_history
         ])
-        current_feature_rows = data[["trade_date", "symbol", "close", "signal_price"]].copy()
+        current_feature_rows = data[[
+            "trade_date", "symbol", "close", "signal_price", "signal_price_source",
+        ]].copy()
         signal_history_source = pd.concat([history_frame, current_feature_rows], ignore_index=True)
         signal_history_source = signal_history_source.sort_values(["trade_date", "symbol"], kind="stable")
-        signal_history_source["momentum"] = signal_history_source.groupby(
-            "symbol", sort=False, observed=True
-        )["signal_price"].transform(lambda values: values.div(values.shift(lookback)).sub(1.0))
+        signal_history_source = add_momentum_from_signal_prices(signal_history_source, lookback)
         signal_history_source["previous_close"] = signal_history_source.groupby(
             "symbol", sort=False, observed=True
         )["close"].shift(1)
@@ -1903,6 +1890,7 @@ def run_backtest(
                     trade_date=pd.Timestamp(row.trade_date).date(),
                     close_cny=Decimal(str(float(row.close))),
                     signal_price_cny=signal_value,
+                    signal_price_source=str(row.signal_price_source),
                 ))
         checkpoint_prices = tuple(
             CheckpointPrice(
@@ -1939,7 +1927,7 @@ def run_backtest(
             benchmark_data_digest,
         )
         strategy_checkpoint = BacktestCheckpoint(
-            schema_version=2,
+            schema_version=3,
             strategy_id=str(strategy["name"]),
             as_of_date=last_date,
             next_expected_session=future_open_dates.iloc[0],

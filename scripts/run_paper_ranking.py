@@ -20,6 +20,8 @@ def main() -> int:
     parser.add_argument("--signal-date", required=True)
     parser.add_argument("--classification", choices=("SYNTHETIC", "FORWARD_PAPER"), default="SYNTHETIC")
     parser.add_argument("--source-capture-manifest", type=Path)
+    parser.add_argument("--calendar", type=Path, help="FORWARD_PAPER 必需的独立交易日历 CSV")
+    parser.add_argument("--universe", type=Path, help="FORWARD_PAPER 必需的点时股票池 CSV")
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
@@ -33,6 +35,8 @@ def main() -> int:
         output_dir=output_dir,
         classification=args.classification,
         source_capture_manifest_path=args.source_capture_manifest,
+        trading_calendar_path=args.calendar,
+        universe_path=args.universe,
     )
     manifest = result["manifest"]
     print(json.dumps({
@@ -42,6 +46,7 @@ def main() -> int:
         "signal_date": manifest["signal_date"],
         "ranking_generated_at_utc": manifest["ranking_generated_at_utc"],
         "candidate_count": manifest.get("candidate_count", 0),
+        "window_scope": manifest.get("window_scope"),
         "ranking_file_sha256": manifest.get("ranking_file_sha256"),
         "data_trust": manifest["data_trust"],
         "blocking_reasons": manifest.get("blocking_reasons", []),

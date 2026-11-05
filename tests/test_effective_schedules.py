@@ -225,6 +225,12 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
     rename_mask = (data["symbol"] == "SZ000001") & (data["trade_date"] >= "2025-01-12")
     data.loc[rename_mask, "symbol"] = "SZ000003"
     data.loc[rename_mask, "name"] = "SZ000003"
+    # An adjustment gap after the split must affect only windows that include
+    # this future row, and the checkpoint must carry each prior row's basis.
+    data.loc[
+        (data["symbol"] == "SZ000003") & data["trade_date"].eq("2025-01-15"),
+        "adjusted_close",
+    ] = pd.NA
     calendar = _open_calendar(date(2025, 1, 1), 20)
     empty_identity = pd.DataFrame(columns=[
         "event_id", "old_symbol", "new_symbol", "effective_date", "share_ratio",
@@ -380,7 +386,7 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
         backtest_checkpoint_from_dict(payload)
 
     valid_payload = first["backtest_checkpoint"].to_dict()
-    assert valid_payload["schema_version"] == 2
+    assert valid_payload["schema_version"] == 3
     assert isinstance(valid_payload["pending_targets_active"], bool)
     invalid_hash_payloads = []
     missing_hash = dict(valid_payload)
@@ -1325,7 +1331,7 @@ def test_rights_checkpoint_resume_before_decision_and_after_registration():
             opening_accounting_snapshot=opening_snapshot, **common,
         )
         checkpoint = first["backtest_checkpoint"]
-        assert checkpoint.schema_version == 2
+        assert checkpoint.schema_version == 3
         second = run_backtest(
             data.iloc[split_index + 1:].copy(), float(checkpoint.ledger_snapshot.cash_cny), config,
             backtest_checkpoint=checkpoint, **common,

@@ -32,6 +32,20 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _calendar_and_universe(tmp_path: Path, bars_path: Path, signal_date: str) -> tuple[Path, Path]:
+    bars = pd.read_csv(bars_path, dtype=str)
+    dates = sorted(bars["trade_date"].unique())
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"trade_date": dates, "is_open": True, "source": "synthetic_calendar"}).to_csv(calendar, index=False)
+    universe = tmp_path / "universe.csv"
+    members = sorted(bars.loc[bars["trade_date"].eq(signal_date), "symbol"].unique())
+    pd.DataFrame({
+        "trade_date": [signal_date] * len(members), "symbol": members,
+        "pool_status": ["STOCK_MEMBER"] * len(members),
+    }).to_csv(universe, index=False)
+    return calendar, universe
+
+
 def test_synthetic_paper_ranking_is_generated_and_bound_to_current_inputs(tmp_path: Path) -> None:
     bars, signal_date = _bars_csv(tmp_path / "bars.csv")
     repo = Path(__file__).resolve().parents[1]
@@ -78,10 +92,12 @@ def test_forward_ranking_requires_bound_same_day_capture_and_marks_unsigned_time
         "trusted_external_timestamp": "UNVERIFIED",
         "provider_published_at_utc": None,
     }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars, signal_date)
     result = create_paper_ranking_artifact(
         bars_path=bars, config_path=repo / "configs/default.toml", signal_date=signal_date,
         output_dir=tmp_path / "forward-fixture", classification="FORWARD_PAPER",
         source_capture_manifest_path=capture,
+        trading_calendar_path=calendar, universe_path=universe,
         now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
     )
     manifest = result["manifest"]
@@ -104,6 +120,7 @@ def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: P
         "data_file_sha256": _sha(bars),
         "trusted_external_timestamp": "UNVERIFIED",
     }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars, signal_date)
     original_rank = module.rank_precomputed_day
 
     def mutate_capture(*args: object, **kwargs: object) -> pd.DataFrame:
@@ -115,9 +132,67 @@ def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: P
         bars_path=bars, config_path=repo / "configs/default.toml", signal_date=signal_date,
         output_dir=tmp_path / "forward-mutated-manifest", classification="FORWARD_PAPER",
         source_capture_manifest_path=capture,
+        trading_calendar_path=calendar, universe_path=universe,
         now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
     )
     manifest = result["manifest"]
     assert manifest["status"] == "FAILED_INPUT_CHANGED_DURING_RUN"
     assert "行情抓取清单在生成排名期间发生变化" in manifest["blocking_reasons"]
     assert not (Path(result["output_dir"]) / "ranking.csv").exists()
+
+
+def test_forward_ranking_excludes_security_with_missing_session_even_when_other_symbol_has_bar(tmp_path: Path) -> None:
+    bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
+    bars = pd.read_csv(bars_path)
+    missing_date = sorted(bars["trade_date"].unique())[-2]
+    bars = bars.loc[~(bars["symbol"].eq("SH600001") & bars["trade_date"].eq(missing_date))]
+    bars.to_csv(bars_path, index=False)
+    repo = Path(__file__).resolve().parents[1]
+    capture = tmp_path / "capture.json"
+    capture.write_text(json.dumps({
+        "source_id": "synthetic-provider-fixture",
+        "captured_at_utc": "2026-11-05T07:05:00Z",
+        "data_file_sha256": _sha(bars_path),
+        "trusted_external_timestamp": "UNVERIFIED",
+    }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars_path, signal_date)
+    result = create_paper_ranking_artifact(
+        bars_path=bars_path, config_path=repo / "configs/default.toml", signal_date=signal_date,
+        output_dir=tmp_path / "forward-window-audit", classification="FORWARD_PAPER",
+        source_capture_manifest_path=capture, trading_calendar_path=calendar, universe_path=universe,
+        now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
+    )
+    manifest = result["manifest"]
+    assert manifest["status"] == "CAPTURED_WITH_EXCLUSIONS"
+    assert manifest["window_scope"]["point_in_time_universe_members"] == 2
+    assert manifest["window_scope"]["excluded_symbols"] == 1
+    audit = pd.read_csv(Path(result["output_dir"]) / "window-audit.csv")
+    missing = audit.loc[audit["symbol"].eq("SH600001")].iloc[0]
+    assert missing["window_status"] == "MISSING_BAR"
+    ranking = pd.read_csv(Path(result["output_dir"]) / "ranking.csv")
+    assert "SH600001" not in set(ranking["symbol"])
+
+
+def test_forward_ranking_rejects_bars_on_calendar_closed_date(tmp_path: Path) -> None:
+    bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
+    repo = Path(__file__).resolve().parents[1]
+    capture = tmp_path / "capture.json"
+    capture.write_text(json.dumps({
+        "source_id": "synthetic-provider-fixture",
+        "captured_at_utc": "2026-11-05T07:05:00Z",
+        "data_file_sha256": _sha(bars_path),
+        "trusted_external_timestamp": "UNVERIFIED",
+    }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars_path, signal_date)
+    calendar_data = pd.read_csv(calendar)
+    closed_date = sorted(calendar_data["trade_date"].astype(str).tolist())[-2]
+    calendar_data.loc[calendar_data["trade_date"].astype(str).eq(closed_date), "is_open"] = False
+    calendar_data.to_csv(calendar, index=False)
+    result = create_paper_ranking_artifact(
+        bars_path=bars_path, config_path=repo / "configs/default.toml", signal_date=signal_date,
+        output_dir=tmp_path / "forward-calendar-mismatch", classification="FORWARD_PAPER",
+        source_capture_manifest_path=capture, trading_calendar_path=calendar, universe_path=universe,
+        now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
+    )
+    assert result["manifest"]["status"] == "FAILED_INPUT"
+    assert "标记的休市日" in " ".join(result["manifest"]["blocking_reasons"])

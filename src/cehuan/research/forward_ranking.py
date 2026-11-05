@@ -14,7 +14,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from cehuan.config import load_config
-from cehuan.data.canonical import read_bars
+from cehuan.data.canonical import canonical_symbol, read_bars
+from cehuan.data.calendar import (
+    audit_security_windows,
+    normalize_trading_calendar,
+    validate_bars_against_calendar,
+)
 from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 
 
@@ -29,6 +34,8 @@ def create_paper_ranking_artifact(
     output_dir: str | Path,
     classification: str = "SYNTHETIC",
     source_capture_manifest_path: str | Path | None = None,
+    trading_calendar_path: str | Path | None = None,
+    universe_path: str | Path | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Generate and seal a non-order candidate ranking; forward mode needs same-day capture evidence."""
@@ -37,6 +44,8 @@ def create_paper_ranking_artifact(
     signal_day = date.fromisoformat(signal_date)
     bars_file, config_file = Path(bars_path).resolve(), Path(config_path).resolve()
     capture_file = Path(source_capture_manifest_path).resolve() if source_capture_manifest_path else None
+    calendar_file = Path(trading_calendar_path).resolve() if trading_calendar_path else None
+    universe_file = Path(universe_path).resolve() if universe_path else None
     target = Path(output_dir).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -54,6 +63,8 @@ def create_paper_ranking_artifact(
             "bars": str(bars_file),
             "config": str(config_file),
             "source_capture_manifest": str(capture_file) if capture_file else None,
+            "trading_calendar": str(calendar_file) if calendar_file else None,
+            "point_in_time_universe": str(universe_file) if universe_file else None,
         },
         "ranking_started_at_utc": _iso_utc(started),
         "ranking_generated_at_utc": None,
@@ -61,6 +72,8 @@ def create_paper_ranking_artifact(
         "input_data_sha256": _sha256(bars_file) if bars_file.is_file() else None,
         "config_sha256": _sha256(config_file) if config_file.is_file() else None,
         "source_capture_manifest_sha256": _sha256(capture_file) if capture_file and capture_file.is_file() else None,
+        "trading_calendar_sha256": _sha256(calendar_file) if calendar_file and calendar_file.is_file() else None,
+        "universe_sha256": _sha256(universe_file) if universe_file and universe_file.is_file() else None,
         "source_data_capture_time_utc": None,
         "data_trust": "UNVERIFIED",
         "code_commit": _git_revision(),
@@ -81,6 +94,8 @@ def create_paper_ranking_artifact(
             bars_file=bars_file,
             config_file=config_file,
             capture_file=capture_file,
+            calendar_file=calendar_file,
+            universe_file=universe_file,
         )
         report["readiness_checks"] = readiness["checks"]
         report["data_trust"] = readiness["data_trust"]
@@ -98,9 +113,47 @@ def create_paper_ranking_artifact(
             if bars.duplicated(["trade_date", "symbol"]).any():
                 raise ValueError("行情存在重复证券日，拒绝生成排名")
             if classification == "FORWARD_PAPER":
+                assert calendar_file is not None and universe_file is not None
+                calendar = normalize_trading_calendar(pd.read_csv(calendar_file, dtype=str))
+                universe = pd.read_csv(universe_file, dtype=str, keep_default_na=False)
+                required_universe_fields = {"trade_date", "symbol", "pool_status"}
+                if not required_universe_fields.issubset(universe.columns):
+                    raise ValueError("点时股票池缺少 trade_date、symbol 或 pool_status")
+                universe["trade_date"] = pd.to_datetime(universe["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                signal_members = universe.loc[universe["trade_date"].eq(signal_day.isoformat())].copy()
+                if signal_members["symbol"].map(canonical_symbol).duplicated().any():
+                    raise ValueError("signal_date 股票池存在重复证券成员")
+                members = universe.loc[
+                    universe["trade_date"].eq(signal_day.isoformat())
+                    & universe["pool_status"].eq("STOCK_MEMBER"), "symbol",
+                ].map(canonical_symbol).astype(str).tolist()
+                if not members:
+                    raise ValueError("点时股票池在 signal_date 没有已确认的 STOCK_MEMBER")
+                bars = bars.loc[bars["symbol"].astype(str).isin(set(members))].copy()
+                calendar_check = validate_bars_against_calendar(bars, calendar)
+                if not calendar_check["healthy"]:
+                    raise ValueError("前瞻行情与交易日历不一致：" + "; ".join(calendar_check["errors"]))
+                audit = audit_security_windows(
+                    bars, calendar, members, signal_date=signal_day,
+                    lookback_sessions=int(config["strategy"]["lookback_sessions"]),
+                )
+                audit_path = staging / "window-audit.csv"
+                audit.to_csv(audit_path, index=False)
+                report["window_audit_file"] = "window-audit.csv"
+                report["window_audit_sha256"] = _sha256(audit_path)
+                report["window_scope"] = {
+                    "point_in_time_universe_members": len(members),
+                    "complete_symbols": int(audit["window_status"].isin(["COMPLETE", "COMPLETE_WITH_SUSPENSION"]).sum()),
+                    "excluded_symbols": int((~audit["included_in_ranking_scope"]).sum()),
+                    "excluded_by_status": audit.loc[~audit["included_in_ranking_scope"], "window_status"].value_counts().to_dict(),
+                    "suspended_window_symbols": int(audit["window_status"].eq("COMPLETE_WITH_SUSPENSION").sum()),
+                }
+                rank_symbols = set(audit.loc[audit["included_in_ranking_scope"], "symbol"].astype(str))
+                bars = bars.loc[bars["symbol"].astype(str).isin(rank_symbols)].copy()
+                if not rank_symbols:
+                    raise ValueError("所有点时股票池证券都因逐证券窗口缺口被排除")
                 _validate_signal_window_availability(
-                    bars,
-                    signal_day=signal_day,
+                    bars, signal_day=signal_day,
                     lookback_sessions=int(config["strategy"]["lookback_sessions"]),
                     available_by=started,
                 )
@@ -120,7 +173,7 @@ def create_paper_ranking_artifact(
             generated = datetime.now(timezone.utc) if now_utc is None else _coerce_utc(now_utc)
             report["ranking_generated_at_utc"] = _iso_utc(generated)
             report["candidate_count"] = int(len(ranking))
-            report["status"] = "CAPTURED"
+            report["status"] = "CAPTURED_WITH_EXCLUSIONS" if report.get("window_scope", {}).get("excluded_symbols", 0) else "CAPTURED"
             report["result_type"] = "RANKING_ONLY_NO_RETURN_OR_EXECUTION_RESULT"
             ranking_path = staging / "ranking.csv"
             ranking.to_csv(ranking_path, index=False)
@@ -151,6 +204,18 @@ def create_paper_ranking_artifact(
                 report.pop("ranking_file", None)
                 report["ranking_file_sha256"] = None
                 (staging / "ranking.csv").unlink(missing_ok=True)
+        for label, input_file, key in (
+            ("交易日历", calendar_file, "trading_calendar_sha256"),
+            ("点时股票池", universe_file, "universe_sha256"),
+        ):
+            if input_file is not None:
+                current_hash = _sha256(input_file) if input_file.is_file() else None
+                if report[key] != current_hash:
+                    report["status"] = "FAILED_INPUT_CHANGED_DURING_RUN"
+                    report.setdefault("blocking_reasons", []).append(f"{label}文件在生成排名期间发生变化")
+                    report.pop("ranking_file", None)
+                    report["ranking_file_sha256"] = None
+                    (staging / "ranking.csv").unlink(missing_ok=True)
         report["finished_at_utc"] = _iso_utc(datetime.now(timezone.utc))
         manifest_path = staging / "paper-ranking-manifest.json"
         manifest_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -180,6 +245,7 @@ def create_paper_ranking_artifact(
 def _forward_input_readiness(
     *, classification: str, signal_day: date, now: datetime,
     bars_file: Path, config_file: Path, capture_file: Path | None,
+    calendar_file: Path | None, universe_file: Path | None,
 ) -> dict[str, Any]:
     checks: dict[str, str] = {}
     reasons = []
@@ -195,6 +261,18 @@ def _forward_input_readiness(
         checks["config_file"] = "AVAILABLE"
     if classification == "SYNTHETIC":
         return {"checks": checks, "blocking_reasons": reasons, "data_trust": "SYNTHETIC_ONLY"}
+    for label, file, title in (
+        ("trading_calendar", calendar_file, "交易日历"),
+        ("point_in_time_universe", universe_file, "点时股票池"),
+    ):
+        if file is None:
+            checks[label] = "NOT_PROVIDED"
+            reasons.append(f"前瞻排名缺少{title}输入")
+        elif not file.is_file():
+            checks[label] = "MISSING"
+            reasons.append(f"{title}文件不存在")
+        else:
+            checks[label] = "AVAILABLE"
     local_now = now.astimezone(SHANGHAI)
     if local_now.date() != signal_day:
         checks["signal_date_is_today"] = "FAILED"

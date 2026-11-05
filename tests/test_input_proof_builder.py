@@ -496,7 +496,7 @@ def test_changed_file_bytes_and_unchanged_normalized_config_are_reported_separat
 def test_rebuild_cli_writes_expected_artifacts_without_mutating_checkpoint(tmp_path):
     fixture = _fixture(tmp_path)
     checkpoint, config, bars, calendar, identity, actions, manifest, rules, fees = fixture
-    assert checkpoint.schema_version == 2
+    assert checkpoint.schema_version == 3
     assert checkpoint.pending_targets_active is not None
     checkpoint_path = tmp_path / "checkpoint.json"
     checkpoint_path.write_text(json.dumps(checkpoint.to_dict(), default=str), encoding="utf-8")

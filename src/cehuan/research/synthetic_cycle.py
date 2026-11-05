@@ -122,7 +122,7 @@ def run_synthetic_cycle(
     backtest["equity_curve"].to_csv(run_dir / "baseline_equity_curve.csv", index=False)
     backtest["trades"].to_csv(run_dir / "baseline_trades.csv", index=False)
 
-    plan = generate_plan(bars, 100_000.0, config, now=local_now)
+    plan = generate_plan(bars, 100_000.0, config, now=local_now, purpose="SYNTHETIC_DIAGNOSTIC")
     if plan.empty:
         raise RuntimeError("合成示例未生成计划行")
     plan["cycle_run_id"] = run_id

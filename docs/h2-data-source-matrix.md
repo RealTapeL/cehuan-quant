@@ -42,7 +42,7 @@
 
 记录格式为 `PAPER_OBSERVATION` schema v2。v2 绑定排名输入、逐条原始响应 SHA-256、解析器名称/版本、由归档响应重建的规范 payload 和 payload 摘要，并分别保留请求开始、响应接收、计划观察、市场事件、供应商发布时间等时点。验证器会实际调用同一版本解析器重建 payload；只有文件哈希正确不再足以证明规范值来自该文件。
 
-schema v1 仍可读取，但验证结果标为 `VALID_LEGACY_UNVERIFIED_PAYLOAD_BINDING`，不声称原始响应与规范 payload 已绑定。`can_buy` 不接受为供应商原始状态字段；只有报价、上市/停牌/ST 状态、交易规则和账户现金等输入足够时，项目才推导研究资格。任何缺失状态都保持 `UNKNOWN`，不能等同于非停牌。
+schema v1 仍可读取，但验证结果标为 `VALID_LEGACY_UNVERIFIED_PAYLOAD_BINDING`，不声称原始响应与规范 payload 已绑定。`can_buy` 不接受为供应商原始状态字段；只有报价、上市/停牌/ST 状态、交易规则和账户现金等输入足够时，项目才推导研究资格。规则完整性、价格限制和账户现金若只传布尔值，会显示 `SUPPLIED_ASSUMPTION`；结构化来源字段齐全时也只显示 `STRUCTURALLY_BOUND_SOURCE_UNVERIFIED`，不宣称来源内容已经独立核实。任何缺失状态都保持 `UNKNOWN`，不能等同于非停牌。
 
 本机合成演练命令：
 
@@ -55,7 +55,7 @@ uv run python scripts/rehearse_paper_observation.py \
 
 ## 只生成候选排名的前瞻记录
 
-`scripts/run_paper_ranking.py` 可以生成研究排名文件和清单，不计算回报、不生成目标委托，也不连接券商。默认 `SYNTHETIC` 仅用于流程验证；`FORWARD_PAPER` 要求信号日是本机当天、收盘后等待到 15:05（Asia/Shanghai）、行情文件有同日收盘后本机抓取清单且 SHA-256 匹配，并且动量窗口内每行都有不晚于任务开始时间的带时区 `available_at`。
+`scripts/run_paper_ranking.py` 可以生成研究排名文件和清单，不计算回报、不生成目标委托，也不连接券商。默认 `SYNTHETIC` 仅用于流程验证；`FORWARD_PAPER` 要求信号日是本机当天、收盘后等待到 15:05（Asia/Shanghai）、行情文件有同日收盘后本机抓取清单且 SHA-256 匹配、独立交易日历和逐日股票池输入齐备。程序先对 signal_date 股票池逐证券审计整个 `lookback + 1` 日窗口；缺日、历史不足、未知状态或价格口径不一致的证券会从排名范围排除，并写入 `window-audit.csv`。停牌窗口单独计数；不能仅凭缺行情推断停牌。
 
 ```bash
 # 合成流程示例；输出只能写到私有目录
@@ -65,12 +65,14 @@ uv run python scripts/run_paper_ranking.py \
   --classification SYNTHETIC \
   --output-dir data/private/experiments/paper-ranking-<unique-id>
 
-# 前瞻模式还需提供与行情文件绑定的本机抓取清单
+# 前瞻模式还需提供本机抓取清单、交易日历和按日股票池
 uv run python scripts/run_paper_ranking.py \
   --data path/to/current-bars.csv \
   --signal-date YYYY-MM-DD \
   --classification FORWARD_PAPER \
   --source-capture-manifest path/to/capture-manifest.json \
+  --calendar path/to/trading-calendar.csv \
+  --universe path/to/securities_by_date.csv \
   --output-dir data/private/experiments/paper-ranking-<unique-id>
 ```
 
