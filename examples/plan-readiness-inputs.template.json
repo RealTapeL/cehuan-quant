@@ -1,0 +1,23 @@
+{
+  "schema": "cehuan.plan_readiness_inputs.v1",
+  "evaluation_window": {
+    "start": "YYYY-MM-DD",
+    "end": "YYYY-MM-DD"
+  },
+  "paths": {
+    "data": "path/to/point_in_time_bars.csv",
+    "point_in_time_quality": "path/to/point_in_time_quality.json",
+    "universe": "path/to/universe-snapshot-directory",
+    "identity_events": "path/to/security_identity_events.csv",
+    "out_date_evidence": "path/to/out_date_evidence.csv",
+    "unknown_type_review": "path/to/unknown_type_review.csv",
+    "unknown_type_summary": "path/to/unknown_type_summary.json",
+    "unknown_type_bars": "path/to/unknown_type_bars.csv",
+    "corporate_actions": "path/to/corporate_actions.csv",
+    "corporate_action_coverage": "path/to/corporate_action_coverage.csv",
+    "market_rules": "path/to/market_rules.csv",
+    "fees": "path/to/historical_fees.csv",
+    "benchmark": "path/to/benchmark_bars.csv",
+    "config": "path/to/frozen_config.toml"
+  }
+}

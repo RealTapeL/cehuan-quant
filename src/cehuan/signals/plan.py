@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 import math
-import hashlib
-import json
-import subprocess
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,7 +12,12 @@ from cehuan.data.calendar import (
     normalize_trading_calendar,
     validate_bars_against_calendar,
 )
-from cehuan.research.baseline_readiness import require_baseline_ready
+from cehuan.research.baseline_readiness import (
+    _git_state,
+    rebuild_baseline_readiness_from_context,
+    require_baseline_ready,
+    require_report_matches_recomputed,
+)
 from cehuan.signals.strategy import (
     add_momentum,
     order_constraints,
@@ -42,6 +43,51 @@ class PlanReadinessError(ValueError):
         super().__init__("人工审核计划未通过准入：" + "; ".join(report["blocking_reasons"]))
 
 
+def _confirmed_stock_members(
+    universe: pd.DataFrame,
+    signal_date: object,
+    current_symbols: set[str] | None = None,
+) -> tuple[set[str], dict[str, object]]:
+    """Return only same-day confirmed stock members; reject ambiguous membership."""
+    required = {"trade_date", "symbol", "pool_status"}
+    if not required.issubset(universe.columns):
+        raise ValueError("点时股票池缺少 trade_date/symbol/pool_status")
+    members = universe.copy()
+    members["trade_date"] = pd.to_datetime(members["trade_date"], errors="coerce").dt.date
+    if members["trade_date"].isna().any():
+        raise ValueError("点时股票池包含无效 trade_date")
+    members["symbol"] = members["symbol"].map(canonical_symbol)
+    if members["symbol"].astype(str).str.strip().str.upper().isin({"", "NAN", "NONE"}).any():
+        raise ValueError("点时股票池包含无效证券代码")
+    as_of = pd.Timestamp(signal_date).date()
+    rows = members.loc[members["trade_date"].eq(as_of)].copy()
+    if rows.empty:
+        raise ValueError(f"点时股票池在 {as_of} 没有成员记录")
+    duplicated = rows["symbol"].duplicated(keep=False)
+    if duplicated.any():
+        symbols = sorted(rows.loc[duplicated, "symbol"].astype(str).unique())
+        raise ValueError("点时股票池同日证券成员重复或状态冲突：" + ", ".join(symbols))
+    status = rows["pool_status"].astype(str).str.strip().str.upper()
+    confirmed = set(rows.loc[status.eq("STOCK_MEMBER"), "symbol"].astype(str))
+    if not confirmed:
+        raise ValueError(f"点时股票池在 {as_of} 没有 STOCK_MEMBER")
+    current = current_symbols or set()
+    missing = sorted(confirmed.difference(current)) if current_symbols is not None else []
+    if missing:
+        raise ValueError("点时股票池成员缺少最新日线，状态保持未知：" + ", ".join(missing[:20]))
+    return confirmed, {
+        "signal_date": as_of.isoformat(),
+        "confirmed_member_count": len(confirmed),
+        "unknown_or_excluded_members": int((~status.eq("STOCK_MEMBER")).sum()),
+        "excluded_members_sample": rows.loc[~status.eq("STOCK_MEMBER"), ["symbol", "pool_status"]]
+        .head(25).astype(str).to_dict(orient="records"),
+        "universe_row_count": int(len(rows)),
+        "current_bar_member_count": len(confirmed) - len(missing),
+        "missing_member_bars": missing,
+        "membership_semantics": "only same-day STOCK_MEMBER rows are eligible for new buys",
+    }
+
+
 def _manual_plan_readiness(
     data: pd.DataFrame,
     calendar: pd.DataFrame | None,
@@ -50,51 +96,43 @@ def _manual_plan_readiness(
     positions_as_of: datetime | None,
     formal_readiness: dict[str, object] | None,
     now: datetime,
+    readiness_context: dict[str, str | object] | None,
+    readiness_evaluation_window: dict[str, str] | None,
+    runtime_config: dict[str, object],
 ) -> dict[str, object]:
     local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
     blockers: list[str] = []
-    checks: dict[str, str] = {}
+    checks: dict[str, object] = {}
     if formal_readiness is None:
         checks["formal_baseline_readiness"] = "MISSING"
         blockers.append("缺少正式基线 readiness 报告")
-    elif (
-        formal_readiness.get("schema") != "cehuan.baseline_readiness.v1"
-        or formal_readiness.get("ready") is not True
-        or formal_readiness.get("decision") != "READY"
-        or formal_readiness.get("blockers")
-        or not isinstance(formal_readiness.get("checks"), dict)
-        or not isinstance(formal_readiness.get("checks", {}).get("execution_engine"), dict)
-        or formal_readiness.get("checks", {}).get("execution_engine", {}).get("complete") is not True
-    ):
-        checks["formal_baseline_readiness"] = "NOT_READY"
-        blockers.append("正式基线 readiness 未达到 READY")
     else:
-        copy = dict(formal_readiness)
-        supplied = copy.pop("report_sha256", None)
-        digest = hashlib.sha256(
-            json.dumps(copy, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        if supplied != digest:
-            checks["formal_baseline_readiness"] = "INVALID_REPORT_HASH"
-            blockers.append("正式基线 readiness 报告散列校验失败")
+        if readiness_context is None or readiness_evaluation_window is None:
+            checks["formal_baseline_readiness"] = "UNVERIFIED_INPUTS_MISSING"
+            blockers.append("缺少实际历史 readiness 输入清单；报告自带哈希和窗口不能作为独立证明")
         else:
             try:
-                window = formal_readiness["evaluation_window"]
-                root = Path(__file__).resolve().parents[3]
-                commit = subprocess.run(
-                    ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
-                    text=True, check=True,
-                ).stdout.strip()
+                start = readiness_evaluation_window["start"]
+                end = readiness_evaluation_window["end"]
+                recomputed, actual_hashes = rebuild_baseline_readiness_from_context(
+                    readiness_context=readiness_context,
+                    evaluation_start=start,
+                    evaluation_end=end,
+                    runtime_config=runtime_config,
+                )
+                require_report_matches_recomputed(formal_readiness, recomputed)
+                commit, _ = _git_state()
                 require_baseline_ready(
                     formal_readiness,
-                    expected_input_hashes=formal_readiness["input_hashes"],
-                    evaluation_start=window["start"], evaluation_end=window["end"],
+                    expected_input_hashes=actual_hashes,
+                    evaluation_start=start,
+                    evaluation_end=end,
                     current_git_commit=commit,
                 )
                 checks["formal_baseline_readiness"] = "READY"
             except Exception as exc:
                 checks["formal_baseline_readiness"] = "NOT_READY"
-                blockers.append(f"正式基线 readiness 深度校验失败：{exc}")
+                blockers.append(f"正式基线 readiness 实际输入复审失败：{exc}")
 
     if calendar is None:
         checks["calendar"] = "MISSING"
@@ -122,32 +160,16 @@ def _manual_plan_readiness(
     if universe is None:
         checks["point_in_time_universe"] = "MISSING"
         blockers.append("人工审核计划必须提供当日点时股票池")
-    elif not {"trade_date", "symbol", "pool_status"}.issubset(universe.columns):
-        checks["point_in_time_universe"] = "INVALID_SCHEMA"
-        blockers.append("点时股票池缺少 trade_date/symbol/pool_status")
     else:
-        membership = universe.copy()
-        membership["trade_date"] = pd.to_datetime(membership["trade_date"], errors="coerce").dt.date
-        membership["symbol"] = membership["symbol"].map(canonical_symbol)
         as_of = pd.Timestamp(data["trade_date"].max()).date()
-        day_members = membership.loc[
-            membership["trade_date"].eq(as_of)
-            & membership["pool_status"].astype(str).eq("STOCK_MEMBER"), "symbol",
-        ]
-        if day_members.empty:
-            checks["point_in_time_universe"] = "MISSING_AS_OF_DATE"
-            blockers.append(f"点时股票池在 {as_of} 没有 STOCK_MEMBER")
-        elif day_members.duplicated().any():
-            checks["point_in_time_universe"] = "DUPLICATE_MEMBERS"
-            blockers.append("点时股票池存在重复证券成员")
-        else:
-            latest_symbols = set(data.loc[data["trade_date"] == data["trade_date"].max(), "symbol"].astype(str))
-            missing_symbols = sorted(set(day_members.astype(str)).difference(latest_symbols))
-            if missing_symbols:
-                checks["point_in_time_universe"] = "MEMBERS_WITHOUT_LATEST_BAR"
-                blockers.append("点时股票池成员缺少最新日线，状态保持未知：" + ", ".join(missing_symbols[:20]))
-            else:
-                checks["point_in_time_universe"] = "VALIDATED"
+        latest_symbols = set(data.loc[data["trade_date"] == data["trade_date"].max(), "symbol"].astype(str))
+        try:
+            _, membership_audit = _confirmed_stock_members(universe, as_of, latest_symbols)
+            checks["point_in_time_universe"] = "VALIDATED"
+            checks["point_in_time_universe_audit"] = membership_audit
+        except Exception as exc:
+            checks["point_in_time_universe"] = "FAILED"
+            blockers.append(f"点时股票池校验失败：{exc}")
 
     if local_now.time() < datetime.strptime("15:05", "%H:%M").time():
         checks["after_close_stability"] = "NOT_READY"
@@ -253,6 +275,8 @@ def generate_plan(
     purpose: str = "RESEARCH_ONLY",
     positions_as_of: datetime | None = None,
     formal_readiness: dict[str, object] | None = None,
+    readiness_context: dict[str, str | object] | None = None,
+    readiness_evaluation_window: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Create a non-actionable research candidate or a gated manual-review plan."""
     if purpose not in {"RESEARCH_ONLY", "SYNTHETIC_DIAGNOSTIC", "MANUAL_REVIEW"}:
@@ -272,6 +296,7 @@ def generate_plan(
         current_time = current_time.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
     readiness = _manual_plan_readiness(
         data, calendar, universe, positions, positions_as_of, formal_readiness, current_time,
+        readiness_context, readiness_evaluation_window, config,
     ) if purpose == "MANUAL_REVIEW" else {
         "schema": "cehuan.plan_readiness.v1", "status": "RESEARCH_ONLY",
         "checks": {}, "blocking_reasons": [], "plan_is_order": False,
@@ -312,6 +337,19 @@ def generate_plan(
         raise ValueError("最新交易日行情快照在标记的收盘可用时间前获取；请在收盘后重新拉取数据再生成计划")
     current = current.sort_values(["momentum", "symbol"], ascending=[False, True])
     current_by_symbol = {str(row["symbol"]): row for _, row in current.iterrows()}
+    candidate_scope = current.copy()
+    universe_audit: dict[str, object] | None = None
+    if universe is not None:
+        confirmed_members, universe_audit = _confirmed_stock_members(
+            universe,
+            as_of,
+            set(current["symbol"].map(canonical_symbol).astype(str)),
+        )
+        candidate_scope = current.loc[current["symbol"].map(canonical_symbol).isin(confirmed_members)].copy()
+    readiness["new_buy_candidate_scope"] = universe_audit or {
+        "universe_supplied": False,
+        "candidate_scope": "all current bars; no point-in-time universe supplied",
+    }
     existing: dict[str, dict[str, float]] = {}
     if positions is not None and not positions.empty:
         for _, row in positions.iterrows():
@@ -328,9 +366,10 @@ def generate_plan(
     if purpose == "MANUAL_REVIEW":
         gate = dict(readiness)
         errors: list[str] = []
-        current_rows = data.loc[data["trade_date"] == data["trade_date"].max()].set_index("symbol", drop=False)
+        # Holdings outside the buy universe still need current status/rule checks.
+        current_rows = current.set_index("symbol", drop=False)
         required_symbols = set(existing) | {
-            str(row["symbol"]) for _, row in current_rows.iterrows()
+            str(row["symbol"]) for _, row in candidate_scope.iterrows()
             if pd.notna(row.get("momentum")) and float(row["momentum"]) >= float(config["strategy"].get("min_momentum", 0.0))
         }
         rule_fields = (
@@ -385,7 +424,7 @@ def generate_plan(
         raise ValueError("交易计划不能关闭点时上市、停牌、ST 与交易规则校验")
     eligible_rows: list[pd.Series] = []
     unknown_rows: list[tuple[pd.Series, str]] = []
-    for _, row in current.iterrows():
+    for _, row in candidate_scope.iterrows():
         if pd.isna(row["momentum"]):
             continue
         if float(row["momentum"]) < float(strategy.get("min_momentum", 0.0)):

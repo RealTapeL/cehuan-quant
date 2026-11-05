@@ -7,6 +7,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -24,6 +25,18 @@ from cehuan.review.reconcile import (
 )
 from cehuan.review.import_registry import DuplicateFillImportError, register_fill_import
 from cehuan.signals.plan import generate_plan, plan_markdown
+
+
+def synthetic_cycle_config() -> dict[str, Any]:
+    config = load_config()
+    config["strategy"].update({
+        "lookback_sessions": 5,
+        "rebalance_sessions": 5,
+        "max_positions": 1,
+        "max_position_weight": 0.20,
+        "max_total_exposure": 0.20,
+    })
+    return config
 
 
 def synthetic_cycle_bars(now: datetime | None = None) -> pd.DataFrame:
@@ -77,6 +90,8 @@ def run_synthetic_cycle(
     now: datetime | None = None,
     *,
     scenario: str = "partial_fill",
+    cycle_run_id: str | None = None,
+    before_plan_callback: Callable[[Path, pd.DataFrame, dict[str, Any], dict[str, Any]], dict[str, str]] | None = None,
 ) -> Path:
     """Write one isolated synthetic plan/review scenario; never calls a broker."""
     allowed_scenarios = {
@@ -86,18 +101,11 @@ def run_synthetic_cycle(
     if scenario not in allowed_scenarios:
         raise ValueError(f"scenario 必须为以下之一：{', '.join(sorted(allowed_scenarios))}")
     local_now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
-    run_id = f"synthetic-{local_now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
+    run_id = cycle_run_id or f"synthetic-{local_now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
     run_dir = Path(output_root).expanduser().resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    config = load_config()
-    config["strategy"].update({
-        "lookback_sessions": 5,
-        "rebalance_sessions": 5,
-        "max_positions": 1,
-        "max_position_weight": 0.20,
-        "max_total_exposure": 0.20,
-    })
+    config = synthetic_cycle_config()
     bars = synthetic_cycle_bars(local_now)
     bars_path = run_dir / "synthetic_bars.csv"
     bars.to_csv(bars_path, index=False)
@@ -121,6 +129,10 @@ def run_synthetic_cycle(
     )
     backtest["equity_curve"].to_csv(run_dir / "baseline_equity_curve.csv", index=False)
     backtest["trades"].to_csv(run_dir / "baseline_trades.csv", index=False)
+    (run_dir / "baseline_config.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    research_artifacts = before_plan_callback(run_dir, bars, config, backtest) if before_plan_callback else {}
 
     plan = generate_plan(bars, 100_000.0, config, now=local_now, purpose="SYNTHETIC_DIAGNOSTIC")
     if plan.empty:
@@ -294,6 +306,7 @@ def run_synthetic_cycle(
         "baseline_metrics": "baseline_metrics.json",
         "baseline_equity_curve": "baseline_equity_curve.csv",
         "baseline_trades": "baseline_trades.csv",
+        "baseline_config": "baseline_config.json",
         "plan_id": str(plan["plan_id"].iloc[0]),
         "plan": "plan.csv",
         "fictitious_fills": "fictitious_fills.csv",
@@ -301,6 +314,7 @@ def run_synthetic_cycle(
         "review": "review.md",
         "next_hypothesis": "next_hypothesis.json",
     }
+    artifact_map.update(research_artifacts)
     if positions is not None:
         artifact_map["fictitious_positions"] = "fictitious_positions.csv"
         artifact_map["position_reconciliation"] = "position_reconciliation.csv"

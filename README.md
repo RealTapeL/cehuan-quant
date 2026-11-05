@@ -60,6 +60,8 @@ momentum(i, t, L) = signal_price(i, t) / signal_price(i, t-L) - 1
 
 项目另有一个完全合成的闭环命令，自动生成待审核计划、虚构成交与持仓 CSV、复盘对账和结构化下一轮假设。它只验收文件与计算链路，不提供市场信号，也不连接华泰；运行方法见[合成闭环示例](docs/synthetic-cycle.md)。
 
+策环研究版 MVP 在这条合成闭环前后接入了结构化研究 Agent：它先接收用户研究目标并提出待审核参数假设，再由策环在相同合成数据和初始条件上运行基线/单参数候选对照，随后对合成成交与持仓复盘，并生成关联同一研究周期 ID 的下一轮假设。Agent 有本地 stub 与可配置的 OpenAI-compatible 接口；默认没有完整 API 配置时使用 stub，并明确记录模式。候选参数仅写入独立实验目录，不会改动当前策略。命令和边界见[策略研究 Agent 契约](docs/strategy-research-agent-contract.md)。
+
 ## 市场规则与研究风险
 
 不同板块、风险状态和规则生效日期可能有不同的涨跌幅及申报数量要求。项目将 `has_price_limit`、`price_limit_pct`、买卖最小数量和递增单位保存在有效日期证券主数据中，不把统一的 10% 涨跌幅或 100 股交易单位套用到所有证券。配置默认值只允许作为明确标注的回测假设。
@@ -75,7 +77,7 @@ momentum(i, t, L) = signal_price(i, t) / signal_price(i, t-L) - 1
 - 日线 OHLC 无法准确模拟涨跌停队列、流动性、滑点和真实成交。
 - 对一段已保存的真实行情研究运行做了只读逐笔审计：24 笔模拟成交均能关联账本，三次候选排名可由冻结行情和配置重建；规则、个人费用、历史数据版本和完整公司行动仍未核实。报告只公开汇总结论，逐笔材料留在 `data/private/`，详见[短窗口逐笔审计](docs/transaction-level-audit.md)。
 - 登记日权益匹配现按模拟收盘持仓区间生成“可能匹配”，而非账户权益确认。交易日成交的具体登记口径仍须结合市场、事件和结算证据核实；旧报告保留并附更正记录，正式基线仍为 `NOT_READY`。详见[登记日权益边界更正](docs/record-date-entitlement-correction.md)。
-- 策略研究 Agent 目前只有输入/输出 schema 和合成示例，没有连接 RD-Agent 或语言模型；输出是待审核研究假设，不改生效策略，也不生成委托。详见[策略研究接口契约](docs/strategy-research-agent-contract.md)。
+- 研究版 Agent 已提供 stub 和可替换 LLM 适配器，并可在合成数据上比较有限参数候选、复用合成成交/持仓复盘并提出下一轮假设。stub 不是 LLM，默认不发送外部请求；模型只接收研究目标与合成摘要，不读取账户记录。LLM 输出需经 schema 与配置白名单校验，未实现的规则记录为待实现。Agent 不改生效策略、不生成委托，正式基线仍 `NOT_READY`。详见[策略研究 Agent 契约](docs/strategy-research-agent-contract.md)。
 - 项目当前的 20 日动量基线由本地 Python 代码运行。本机 uv 环境安装了 `pyqlib==0.9.7`，但只完成静态数据读取与特征桥接，尚未训练 Qlib 模型；RD-Agent、TradingAgents 和 TradingView 仍是待验证的可选研究组件。
 - 华泰成交和持仓目前通过用户导出的 CSV 导入；没有假设账户具备程序化交易权限。
 

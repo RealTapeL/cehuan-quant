@@ -1,0 +1,13 @@
+[agent]
+# auto uses the LLM only when model, base URL, and API key are all configured;
+# otherwise it clearly selects the local stub.
+mode = "auto"
+model_env = "CEHUAN_LLM_MODEL"
+base_url_env = "CEHUAN_LLM_BASE_URL"
+api_key_env = "CEHUAN_LLM_API_KEY"
+model = ""
+base_url = ""
+timeout_seconds = 45
+max_hypotheses_per_cycle = 2
+max_experiments_per_cycle = 1
+max_model_retries = 1

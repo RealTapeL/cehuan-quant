@@ -11,7 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from cehuan.data.canonical import normalize_bar_frame
+from cehuan.config import load_config
+from cehuan.data.canonical import normalize_bar_frame, read_bars
 from cehuan.data.corporate_actions import normalize_corporate_actions
 from cehuan.data.fee_schedule import FEE_SCHEDULE_COLUMNS
 from cehuan.data.market_rules import MARKET_RULE_COLUMNS
@@ -681,3 +682,55 @@ def require_report_matches_recomputed(saved: dict[str, Any], recomputed: dict[st
         raise ValueError(
             "正式基线就绪报告与当前输入重新审计结果不一致：" + ", ".join(mismatches)
         )
+
+
+def rebuild_baseline_readiness_from_context(
+    *,
+    readiness_context: dict[str, str | Path],
+    evaluation_start: str,
+    evaluation_end: str,
+    runtime_config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Re-run the baseline audit from its bound files and return report plus actual hashes.
+
+    The caller must compare this result to the persisted readiness report and then
+    apply ``require_baseline_ready``. The report's own hashes are never used as
+    the source of truth.
+    """
+    missing = set(READINESS_CONTEXT_KEYS).difference(readiness_context)
+    if missing:
+        raise ValueError("正式基线缺少 readiness 输入路径：" + ", ".join(sorted(missing)))
+    context = {key: Path(readiness_context[key]).expanduser().resolve() for key in READINESS_CONTEXT_KEYS}
+    for key, path in context.items():
+        if key == "universe":
+            if not path.is_dir():
+                raise FileNotFoundError(f"readiness 股票池目录不存在：{path}")
+        elif not path.is_file():
+            raise FileNotFoundError(f"readiness 输入文件不存在（{key}）：{path}")
+
+    before = readiness_input_hashes(**context)
+    audited_config = load_config(context["config"])
+    if audited_config != runtime_config:
+        raise ValueError("当前计划配置与历史 readiness 绑定配置不一致")
+    recomputed = build_baseline_readiness(
+        data=read_bars(context["data"]),
+        input_hashes=before,
+        universe=context["universe"],
+        identity_events_path=context["identity_events"],
+        out_date_evidence_path=context["out_date_evidence"],
+        unknown_type_review_path=context["unknown_type_review"],
+        unknown_type_summary_path=context["unknown_type_summary"],
+        unknown_type_bars_path=context["unknown_type_bars"],
+        point_in_time_quality_path=context["point_in_time_quality"],
+        corporate_actions_path=context["corporate_actions"],
+        corporate_action_coverage_path=context["corporate_action_coverage"],
+        market_rules_path=context["market_rules"],
+        fees_path=context["fees"],
+        benchmark=read_bars(context["benchmark"]),
+        evaluation_start=evaluation_start,
+        evaluation_end=evaluation_end,
+    )
+    after = readiness_input_hashes(**context)
+    if before != after:
+        raise ValueError("readiness 输入文件在重新审计期间发生变化")
+    return recomputed, before

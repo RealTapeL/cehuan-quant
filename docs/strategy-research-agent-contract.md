@@ -1,6 +1,6 @@
 # 策略研究 Agent 接口契约
 
-本接口用于把数据状态、冻结策略和实验摘要交给研究 Agent，并接收**待审核研究假设**。当前没有连接 RD-Agent、LLM 或券商；schema 与校验函数只定义项目边界。
+本接口用于把数据状态、冻结策略和实验摘要交给研究 Agent，并接收**待审核研究假设**。项目提供本地 stub 与 OpenAI-compatible Chat Completions 适配器；它们只生成结构化假设，不运行任意代码、策略回测或券商操作。受控实验由策环本地代码执行。
 
 ## 输入
 
@@ -17,9 +17,24 @@
 - `may_modify_active_strategy` 和 `may_generate_orders` 必须为 `false`。
 - 输出不得包含委托、券商命令或执行指令字段。
 
-文件契约见 [假设输出 JSON Schema](../examples/strategy-research-hypothesis.schema.json)，示例 [仅使用合成数据](../examples/strategy-research-hypothesis.synthetic.json)。本地 `validate_strategy_hypothesis()` 会检查必要字段和这些边界，但不会应用配置或启动实验。
+文件契约见 [假设输出 JSON Schema](../examples/strategy-research-hypothesis.schema.json)，示例 [仅使用合成数据](../examples/strategy-research-hypothesis.synthetic.json)。本地 `validate_strategy_hypothesis()` 检查 schema、禁止字段和安全布尔值。输入继续使用 [Agent 输入 JSON Schema](../examples/strategy-research-agent-input.schema.json)，`validate_strategy_research_input()` 在请求前检查输入字段与研究边界。
 
-这只是本地格式契约与验证原型，尚未连接大语言模型、RD-Agent 或其他自动研究服务。研究假设仍需由用户审核、另行冻结配置并运行实验。
+## 本地研究版 MVP
+
+```bash
+uv run cehuan research-cycle \
+  --objective "检查调仓间隔对换手的影响" \
+  --model-mode stub \
+  --output outputs/research-cycles
+```
+
+命令使用合成行情，调用结构化 Agent 生成初始假设；只允许有限的单参数映射进入候选配置；复用 `run_backtest()` 跑相同输入的基线与候选；随后复用 `synthetic_cycle` 的成交/持仓对账并基于审计摘要请求下一轮假设。默认预算是每周期两条假设、一个候选实验、每次调用最多一次重试。未知配置或规则会登记为 `PENDING_IMPLEMENTATION`，不会被忽略。候选配置只写入本周期目录，不更改 `configs/default.toml`。
+
+模型设置位于 `configs/research_agent.toml`。`mode="auto"` 只有在模型名、服务地址和 API Key 都可用时才发起外部调用，否则使用明确标记的 stub。外部服务通过 `CEHUAN_LLM_MODEL`、`CEHUAN_LLM_BASE_URL` 和 `CEHUAN_LLM_API_KEY` 提供；Key 只放在环境变量中，不写入配置或产物。运行输入只有研究目标、合成数据摘要、参数和合成复盘事实，不包含账户资料或原始成交文件。切换真实模型前应避免把私密信息写入研究目标。
+
+每个研究周期目录保存 Agent 输入/输出、提示词版本和摘要、候选配置/结果、合成成交复盘、研究报告及散列 manifest。若 provider 返回 usage，会记录 token 数；没有 provider 费率配置时不估算费用。`stub` 运行绝不标记成真实 LLM 调用。结果只验证软件流程，不代表策略表现；正式 baseline 仍为 `NOT_READY`，研究假设需要人工审核，不自动修改生效策略。
+
+该 MVP 目前只在合成数据上跑完整闭环。真实数据的受限摘要研究、LLM 真实调用、Qlib/RD-Agent 自动搜索和多参数/新交易规则实验仍需独立完成与审核。
 
 ## 从成交审计生成假设包
 

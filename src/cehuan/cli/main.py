@@ -38,7 +38,12 @@ from cehuan.data.universe_import import import_historical_universe_csv
 from cehuan.data.unknown_types import audit_unknown_security_types
 from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loader_check
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
-from cehuan.research.baseline_readiness import build_baseline_readiness, readiness_input_hashes
+from cehuan.research.research_cycle import run_research_cycle
+from cehuan.research.baseline_readiness import (
+    READINESS_CONTEXT_KEYS,
+    build_baseline_readiness,
+    readiness_input_hashes,
+)
 from cehuan.review.reconcile import (
     compare_plan_revisions,
     compare_plan_and_fills,
@@ -252,7 +257,19 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--mapping")
     plan.add_argument("--purpose", choices=["RESEARCH_ONLY", "MANUAL_REVIEW"], default="RESEARCH_ONLY")
     plan.add_argument("--positions-as-of", help="持仓快照时点，ISO-8601 且必须含时区")
-    plan.add_argument("--formal-readiness", help="正式基线 readiness JSON；人工审核模式必需且必须为 READY")
+    plan.add_argument("--formal-readiness", help="正式基线 readiness JSON；人工审核模式必需")
+    plan.add_argument("--readiness-inputs", help="历史 readiness 实际输入清单 JSON；人工审核模式必需，与报告分开提供")
+
+    research_cycle = subs.add_parser(
+        "research-cycle", help="运行结构化研究 Agent、受控合成对照、合成复盘和下一轮假设",
+    )
+    research_cycle.add_argument("--objective", required=True, help="本周期研究目标，不要包含账户凭据或原始账户记录")
+    research_cycle.add_argument("--output", default="outputs/research-cycles", help="私有研究产物根目录")
+    research_cycle.add_argument("--scenario", choices=[
+        "partial_fill", "no_fill", "duplicate_import", "partial_fill_cancelled", "modified_plan", "missing_positions",
+    ], default="partial_fill")
+    research_cycle.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
+    research_cycle.add_argument("--model-mode", choices=["auto", "stub", "llm"], help="覆盖模型模式；auto 仅在凭据齐全时调用配置模型")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
@@ -1057,6 +1074,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plan":
+            readiness_context = None
+            readiness_evaluation_window = None
+            readiness_manifest_path = Path(args.readiness_inputs).expanduser().resolve() if args.readiness_inputs else None
+            if readiness_manifest_path is not None:
+                readiness_manifest = json.loads(readiness_manifest_path.read_text(encoding="utf-8"))
+                if readiness_manifest.get("schema") != "cehuan.plan_readiness_inputs.v1":
+                    raise ValueError("readiness 输入清单 schema 必须是 cehuan.plan_readiness_inputs.v1")
+                raw_paths = readiness_manifest.get("paths")
+                if not isinstance(raw_paths, dict) or set(raw_paths) != set(READINESS_CONTEXT_KEYS):
+                    raise ValueError("readiness 输入清单 paths 必须逐项提供完整历史审计输入")
+                readiness_context = {
+                    key: (Path(value).expanduser() if Path(value).expanduser().is_absolute()
+                          else readiness_manifest_path.parent / Path(value).expanduser())
+                    for key, value in raw_paths.items()
+                }
+                window = readiness_manifest.get("evaluation_window")
+                if not isinstance(window, dict) or not {"start", "end"}.issubset(window):
+                    raise ValueError("readiness 输入清单必须包含 evaluation_window.start/end")
+                readiness_evaluation_window = {"start": str(window["start"]), "end": str(window["end"])}
             plan_input_paths = {
                 "bars": Path(args.data).expanduser().resolve(),
                 "config": Path(args.config).expanduser().resolve() if args.config else REPO_ROOT / "configs" / "default.toml",
@@ -1066,11 +1102,13 @@ def main(argv: list[str] | None = None) -> int:
                 "calendar": Path(args.calendar).expanduser().resolve() if args.calendar else None,
                 "universe": Path(args.universe).expanduser().resolve() if args.universe else None,
                 "formal_readiness": Path(args.formal_readiness).expanduser().resolve() if args.formal_readiness else None,
+                "readiness_inputs": readiness_manifest_path,
             }
             plan_input_hashes_before = {
                 label: sha256_file(path) for label, path in plan_input_paths.items()
                 if path is not None and path.is_file()
             }
+            readiness_hashes_before = readiness_input_hashes(**readiness_context) if readiness_context else None
             config = load_config(args.config)
             bars = read_bars(args.data)
             if args.security_master:
@@ -1086,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
                     universe=universe,
                     purpose=args.purpose, positions_as_of=positions_as_of,
                     formal_readiness=formal_readiness,
+                    readiness_context=readiness_context,
+                    readiness_evaluation_window=readiness_evaluation_window,
                 )
             except PlanReadinessError as exc:
                 folder = REPO_ROOT / "outputs" / "plans" / f"readiness-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
@@ -1094,6 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
                     label: {"path": str(plan_input_paths[label]), "sha256": digest}
                     for label, digest in plan_input_hashes_before.items()
                 }
+                exc.report["historical_baseline_input_hashes"] = readiness_hashes_before
                 _write_json(exc.report, folder / "plan-readiness.json")
                 print(f"未生成计划：准入检查未通过，报告已保存到 {folder / 'plan-readiness.json'}", file=sys.stderr)
                 return 1
@@ -1103,6 +1144,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if plan_input_hashes_after != plan_input_hashes_before:
                 raise ValueError("交易计划输入文件在生成过程中发生变化；没有发布计划文件")
+            if readiness_context is not None and readiness_input_hashes(**readiness_context) != readiness_hashes_before:
+                raise ValueError("历史 readiness 输入在计划生成期间发生变化；没有发布计划文件")
             plan_id = str(plan_frame["plan_id"].iloc[0]) if not plan_frame.empty else "empty-plan"
             folder = REPO_ROOT / "outputs" / "plans" / plan_id
             folder.mkdir(parents=True, exist_ok=False)
@@ -1120,6 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
                 label: {"path": str(plan_input_paths[label]), "sha256": digest}
                 for label, digest in plan_input_hashes_before.items()
             }
+            readiness_report["historical_baseline_input_hashes"] = readiness_hashes_before
             _write_json(readiness_report, folder / "plan-readiness.json")
             _write_json({
                 "schema": "cehuan.plan_input_manifest.v1",
@@ -1133,6 +1177,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"计划已保存：{plan_path}\n性质：{args.purpose}；本命令不会连接券商或下单。")
             if not plan_frame.empty:
                 print(plan_frame[["symbol", "action", "planned_shares", "reference_price", "major_risks"]].to_string(index=False))
+            return 0
+
+        if args.command == "research-cycle":
+            output_root = Path(args.output).expanduser()
+            if not output_root.is_absolute():
+                output_root = REPO_ROOT / output_root
+            run_dir = run_research_cycle(
+                output_root=output_root,
+                objective=args.objective,
+                scenario=args.scenario,
+                agent_config_path=args.agent_config,
+                model_mode=args.model_mode,
+            )
+            manifest = json.loads((run_dir / "research_cycle_manifest.json").read_text(encoding="utf-8"))
+            print(json.dumps({
+                "research_cycle_id": manifest["research_cycle_id"],
+                "output_dir": str(run_dir),
+                "classification": manifest["classification"],
+                "model_mode": manifest["model"]["selected_mode"],
+                "model": manifest["model"]["model"],
+                "model_calls": manifest["model"]["call_count"],
+                "candidate_experiment_status": manifest["candidate_experiment_status"],
+                "formal_baseline": manifest["formal_baseline"],
+                "broker_connected": manifest["broker_connected"],
+                "orders_generated": manifest["orders_generated"],
+            }, ensure_ascii=False, indent=2))
             return 0
 
         if args.command == "review":

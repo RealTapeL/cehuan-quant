@@ -626,12 +626,9 @@ def test_manual_review_blocks_when_formal_readiness_is_missing() -> None:
         generate_plan(bars(), 100_000, config, purpose="MANUAL_REVIEW")
 
 
-def test_manual_review_refuses_to_value_missing_holding_price_at_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manual_review_rejects_self_consistent_forged_ready_report_without_real_audit_inputs() -> None:
     import hashlib
     import json
-    import cehuan.signals.plan as plan_module
-
-    monkeypatch.setattr(plan_module, "require_baseline_ready", lambda *args, **kwargs: None)
 
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
@@ -650,9 +647,20 @@ def test_manual_review_refuses_to_value_missing_holding_price_at_cost(monkeypatc
     })
     formal_readiness = {
         "schema": "cehuan.baseline_readiness.v1", "schema_version": 1,
+        "audit_program_git_commit": "synthetic-forgery", "audit_program_worktree_clean": True,
         "ready": True, "decision": "READY", "blockers": [],
-        "checks": {"execution_engine": {"complete": True}},
-        "input_hashes": {}, "evaluation_window": {"start": "2025-01-01", "end": "2025-01-16"},
+        "checks": {
+            "point_in_time_quality": {"healthy": True, "data_sha256_matches": True,
+                "universe_sha256_matches": True, "identity_events_sha256_matches": True},
+            "point_in_time_recomputation": {"complete": True},
+            "out_date_evidence": {"healthy": True},
+            "unknown_types": {"complete_for_current_universe": True},
+            "corporate_actions": {"coverage": {"complete": True}, "evidence": {"complete": True}},
+            "market_rules": {"complete": True}, "fees": {"complete": True},
+            "benchmark": {"complete": True}, "execution_engine": {"complete": True},
+        },
+        "input_hashes": {"data": "a" * 64},
+        "evaluation_window": {"start": "2025-01-01", "end": "2025-01-16"},
     }
     formal_readiness["report_sha256"] = hashlib.sha256(
         json.dumps(formal_readiness, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
@@ -660,9 +668,9 @@ def test_manual_review_refuses_to_value_missing_holding_price_at_cost(monkeypatc
     positions = pd.DataFrame([{
         "symbol": "SIM001", "shares": 1000, "available_to_sell": 1000, "average_cost": 10.0,
     }])
-    with pytest.raises(PlanReadinessError, match="禁止用历史成本估算组合市值"):
+    with pytest.raises(PlanReadinessError, match="缺少实际历史 readiness 输入清单"):
         generate_plan(
-            data, 100_000, config, positions=positions,
+            bars(), 100_000, config, positions=positions,
             now=datetime(2025, 1, 16, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
             calendar=calendar, purpose="MANUAL_REVIEW",
             universe=universe,

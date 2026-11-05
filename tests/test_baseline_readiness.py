@@ -23,6 +23,7 @@ from cehuan.research.baseline_readiness import (
     _audit_fee_schedule,
     _audit_market_rules,
     build_baseline_readiness,
+    rebuild_baseline_readiness_from_context,
     readiness_input_hashes,
     require_report_matches_recomputed,
     require_baseline_ready,
@@ -172,6 +173,24 @@ def _formal_inputs(paths: dict[str, Path]):
         evaluation_start="2025-01-02", evaluation_end="2025-01-03",
     )
     return context, hashes, report
+
+
+@pytest.mark.parametrize(("path_key", "hash_key"), [("fees", "fees"), ("rules", "market_rules")])
+def test_actual_readiness_rebuild_detects_replaced_fee_or_rule_input(tmp_path, path_key, hash_key):
+    paths = _write_inputs(tmp_path / f"rebuild-{hash_key}")
+    context, _, saved = _formal_inputs(paths)
+    with paths[path_key].open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    rebuilt, actual_hashes = rebuild_baseline_readiness_from_context(
+        readiness_context=context,
+        evaluation_start="2025-01-02",
+        evaluation_end="2025-01-03",
+        runtime_config=load_config(paths["config"]),
+    )
+    assert actual_hashes[hash_key] != saved["input_hashes"][hash_key]
+    with pytest.raises(ValueError, match="重新审计结果不一致.*input_hashes"):
+        require_report_matches_recomputed(saved, rebuilt)
 
 
 def test_forged_healthy_quality_alone_never_marks_baseline_ready(tmp_path):
