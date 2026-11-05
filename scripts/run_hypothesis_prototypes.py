@@ -87,15 +87,22 @@ def _synthetic_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[
         ], start=1)
     ])
 
-    quote_columns = ["symbol", "trade_date", "open_price_cny", "available_at_utc", "is_suspended", "is_listed", "can_buy"]
+    quote_columns = [
+        "symbol", "trade_date", "open_price_cny", "price_available_at_utc", "price_source",
+        "status_available_at_utc", "status_source", "is_suspended", "is_listed", "can_buy",
+    ]
+    h2_calendar = pd.DataFrame([
+        {"trade_date": day, "is_open": True, "source": "synthetic_calendar"}
+        for day in pd.date_range("2025-02-04", "2025-02-06", freq="D").strftime("%Y-%m-%d")
+    ])
     decision_quotes = pd.DataFrame([
-        {"symbol": "SYN_PRIMARY", "trade_date": "2025-02-05", "open_price_cny": 12.0, "available_at_utc": "2025-02-05T01:30:00Z", "is_suspended": False, "is_listed": True, "can_buy": True},
-        {"symbol": "SYN_REPLACEMENT", "trade_date": "2025-02-05", "open_price_cny": 4.0, "available_at_utc": "2025-02-05T01:30:00Z", "is_suspended": False, "is_listed": True, "can_buy": True},
-        {"symbol": "SYN_FALLBACK", "trade_date": "2025-02-05", "open_price_cny": 3.0, "available_at_utc": "2025-02-05T01:30:00Z", "is_suspended": False, "is_listed": True, "can_buy": True},
+        {"symbol": "SYN_PRIMARY", "trade_date": "2025-02-05", "open_price_cny": 12.0, "price_available_at_utc": "2025-02-05T01:30:00Z", "price_source": "synthetic decision open", "status_available_at_utc": "2025-02-05T01:29:00Z", "status_source": "synthetic security status", "is_suspended": False, "is_listed": True, "can_buy": True},
+        {"symbol": "SYN_REPLACEMENT", "trade_date": "2025-02-05", "open_price_cny": 4.0, "price_available_at_utc": "2025-02-05T01:30:00Z", "price_source": "synthetic decision open", "status_available_at_utc": "2025-02-05T01:29:00Z", "status_source": "synthetic security status", "is_suspended": False, "is_listed": True, "can_buy": True},
+        {"symbol": "SYN_FALLBACK", "trade_date": "2025-02-05", "open_price_cny": 3.0, "price_available_at_utc": "2025-02-05T01:30:00Z", "price_source": "synthetic decision open", "status_available_at_utc": "2025-02-05T01:29:00Z", "status_source": "synthetic security status", "is_suspended": False, "is_listed": True, "can_buy": True},
     ], columns=quote_columns)
     execution_quotes = pd.DataFrame([
-        {"symbol": "SYN_REPLACEMENT", "trade_date": "2025-02-06", "open_price_cny": 4.5, "available_at_utc": "2025-02-06T01:30:00Z", "is_suspended": False, "is_listed": True, "can_buy": True},
-        {"symbol": "SYN_FALLBACK", "trade_date": "2025-02-06", "open_price_cny": 3.2, "available_at_utc": "2025-02-06T01:30:00Z", "is_suspended": False, "is_listed": True, "can_buy": True},
+        {"symbol": "SYN_REPLACEMENT", "trade_date": "2025-02-06", "open_price_cny": 4.5, "price_available_at_utc": "2025-02-06T01:30:00Z", "price_source": "synthetic execution open", "status_available_at_utc": "2025-02-06T01:29:00Z", "status_source": "synthetic security status", "is_suspended": False, "is_listed": True, "can_buy": True},
+        {"symbol": "SYN_FALLBACK", "trade_date": "2025-02-06", "open_price_cny": 3.2, "price_available_at_utc": "2025-02-06T01:30:00Z", "price_source": "synthetic execution open", "status_available_at_utc": "2025-02-06T01:29:00Z", "status_source": "synthetic security status", "is_suspended": False, "is_listed": True, "can_buy": True},
     ], columns=quote_columns)
     payload = {
         "data_status": "FULLY_SYNTHETIC_NO_REAL_MARKET_OR_ACCOUNT_DATA",
@@ -112,6 +119,7 @@ def _synthetic_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[
             "decision_at_utc": "2025-02-05T01:31:00Z",
             "execution_session_date": "2025-02-06",
             "execution_at_utc": "2025-02-06T01:31:00Z",
+            "calendar_open_dates": ["2025-02-04", "2025-02-05", "2025-02-06"],
             "budget": {
                 "max_positions": 1,
                 "target_amount_per_slot_cny": 500.0,
@@ -125,7 +133,10 @@ def _synthetic_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[
             },
         },
     }
-    return bars, calendar, baseline, {"input": payload, "decision_quotes": decision_quotes, "execution_quotes": execution_quotes}
+    return bars, calendar, baseline, {
+        "input": payload, "decision_quotes": decision_quotes,
+        "execution_quotes": execution_quotes, "trading_calendar": h2_calendar,
+    }
 
 
 def build_run(output_dir: Path) -> dict[str, Any]:
@@ -140,6 +151,7 @@ def build_run(output_dir: Path) -> dict[str, Any]:
         pd.DataFrame(candidate),
         h2_data["decision_quotes"],
         h2_data["execution_quotes"],
+        h2_data["trading_calendar"],
         signal_date=h2_data["input"]["h2"]["signal_date"],
         ranking_available_at_utc=h2_data["input"]["h2"]["ranking_available_at_utc"],
         decision_session_date=h2_data["input"]["h2"]["decision_session_date"],
@@ -159,6 +171,7 @@ def build_run(output_dir: Path) -> dict[str, Any]:
         baseline.to_csv(staging / "h1-baseline-candidates.csv", index=False)
         h2_data["decision_quotes"].to_csv(staging / "h2-decision-open-quotes.csv", index=False)
         h2_data["execution_quotes"].to_csv(staging / "h2-next-session-open-quotes.csv", index=False)
+        h2_data["trading_calendar"].to_csv(staging / "h2-trading-calendar.csv", index=False)
         h1.to_csv(staging / "h1-candidate-comparison.csv", index=False)
         _write_json(staging / "h2-delayed-replacement-plan.json", h2)
         h1_status = Counter(h1["h1_status"].astype(str))
@@ -172,16 +185,20 @@ def build_run(output_dir: Path) -> dict[str, Any]:
             "replacement_selected": False,
             "simulated_fill": False,
             "cash_retained_before_other_portfolio_activity_cny": budget["available_cash_cny"],
+            "matched_horizon_date": h2_data["input"]["h2"]["execution_session_date"],
+            "matched_horizon_cash_cny_if_no_other_activity": budget["available_cash_cny"],
         }
         candidate_result = h2["execution_results"][0] if h2["execution_results"] else None
         _write_json(staging / "h2-control-candidate-diff.json", {
-            "only_registered_rule_difference": "zero-share target keeps cash (control) vs. after observing the decision-session open, select a replacement and schedule it for the next session open (candidate)",
+            "whole_policy_comparison": "control keeps cash vs. candidate both selects a replacement after the decision-session open and delays it to the following open; the measured policy difference jointly includes candidate selection and execution delay",
+            "matched_horizon_comparison": "both paths are evaluated through the same next-session horizon; control keeps the zero-target cash uninvested and candidate carries a frozen replacement order",
             "control": control,
             "candidate": {
                 "replacement_orders": h2["replacement_orders"],
                 "execution_result": candidate_result,
                 "same_decision_session_open_fill_allowed": False,
                 "selection_uses_execution_quote": False,
+                "execution_price_is_fill_assumption_not_market_evidence": True,
             },
         })
         source_paths = [Path(__file__).resolve(), Path("src/cehuan/research/hypothesis_prototypes.py").resolve()]
@@ -189,6 +206,7 @@ def build_run(output_dir: Path) -> dict[str, Any]:
             staging / "synthetic-input.json", staging / "h1-synthetic-bars.csv",
             staging / "h1-synthetic-calendar.csv", staging / "h1-baseline-candidates.csv",
             staging / "h2-decision-open-quotes.csv", staging / "h2-next-session-open-quotes.csv",
+            staging / "h2-trading-calendar.csv",
         ]
         outputs = [p for p in staging.iterdir() if p.is_file()]
         manifest = {
@@ -204,10 +222,13 @@ def build_run(output_dir: Path) -> dict[str, Any]:
             "registered_design": {
                 "control_and_candidate_share_same_synthetic_inputs": True,
                 "h1_only_rule_difference": "candidate eligibility requires exactly 21 open sessions with one unique bar per session and known non-suspended status",
-                "h2_only_rule_difference": "control keeps zero-share slot as cash; candidate observes next-session decision open, freezes replacement quantity, and only schedules next-session-after-decision open",
+                "h2_joint_rule_difference": "candidate eligibility plus one-session execution delay; this experiment cannot attribute effects to selection alone",
+                "h2_matched_horizon_control": "at the same later horizon, retain the zero-target cash while the candidate holds a frozen replacement order",
                 "h2_ranking_available_at_utc": h2_data["input"]["h2"]["ranking_available_at_utc"],
                 "h2_decision_at_utc": h2_data["input"]["h2"]["decision_at_utc"],
                 "h2_execution_at_utc": h2_data["input"]["h2"]["execution_at_utc"],
+                "decision_price_and_status_availability_are_separate": True,
+                "execution_open_price_fill_is_synthetic_assumption": True,
                 "budget_fee_lot_and_existing_position_assumptions": budget,
                 "metrics": ["H1 eligible/excluded counts and reasons", "H2 selected replacement, frozen shares, simulated fill/block, fees, remaining cash"],
                 "stopping_conditions": ["unknown or unavailable statuses", "insufficient data", "budget/cash/fee failure", "no valid replacement"],
@@ -221,7 +242,7 @@ def build_run(output_dir: Path) -> dict[str, Any]:
                 "h1_eligible_rows": int(h1["h1_status"].eq("ELIGIBLE").sum()),
                 "h1_excluded_rows": int(h1["h1_status"].eq("EXCLUDED").sum()),
                 "h2_selected_orders": len(h2["replacement_orders"]),
-                "h2_simulated_fills": sum(item["status"] == "SIMULATED_FILL_NEXT_SESSION_OPEN" for item in h2["execution_results"]),
+                "h2_simulated_fills_under_open_assumption": sum(item["status"] == "SIMULATED_FILL_UNDER_OPEN_PRICE_ASSUMPTION" for item in h2["execution_results"]),
                 "result_scope": "No return, Sharpe, drawdown or strategy-performance claim; synthetic program behavior only.",
             },
             "release_status": {"formal_baseline": "NOT_READY", "can_continue": False, "independent_validation": "NOT_PERFORMED"},
@@ -245,7 +266,7 @@ def main() -> int:
         "output_dir": result["output_dir"],
         "experiment_id": result["manifest"]["experiment_id"],
         "h1_status_counts": result["manifest"]["results"]["h1_status_counts"],
-        "h2_simulated_fills": result["manifest"]["results"]["h2_simulated_fills"],
+        "h2_simulated_fills_under_open_assumption": result["manifest"]["results"]["h2_simulated_fills_under_open_assumption"],
         "formal_baseline": "NOT_READY",
         "can_continue": False,
     }, ensure_ascii=False, indent=2))

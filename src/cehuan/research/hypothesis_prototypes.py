@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from cehuan.data.canonical import parse_optional_bool
+from cehuan.data.calendar import normalize_trading_calendar
 
 
 def _date_text(value: object) -> str:
@@ -195,7 +196,10 @@ def _round_lot(shares: int, minimum: int, step: int) -> int:
 
 
 def _quote_lookup(frame: pd.DataFrame, *, trade_date: str, field: str) -> dict[str, dict[str, Any]]:
-    required = {"symbol", "trade_date", "open_price_cny", "available_at_utc", "is_suspended", "is_listed", "can_buy"}
+    required = {
+        "symbol", "trade_date", "open_price_cny", "price_available_at_utc", "price_source",
+        "status_available_at_utc", "status_source", "is_suspended", "is_listed", "can_buy",
+    }
     if not required.issubset(frame.columns):
         raise ValueError(f"{field} quotes 缺少字段：{', '.join(sorted(required - set(frame.columns)))}")
     data = frame.copy()
@@ -209,11 +213,18 @@ def _quote_lookup(frame: pd.DataFrame, *, trade_date: str, field: str) -> dict[s
 
 
 def _quote_block_reason(quote: Mapping[str, Any], *, decision_at: pd.Timestamp) -> str | None:
-    available = _aware_utc(quote["available_at_utc"], field="quote.available_at_utc")
-    if available > decision_at:
+    price_available = _aware_utc(quote["price_available_at_utc"], field="quote.price_available_at_utc")
+    status_available = _aware_utc(quote["status_available_at_utc"], field="quote.status_available_at_utc")
+    if price_available > decision_at:
         return "PRICE_NOT_AVAILABLE_AT_DECISION"
-    if available.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != _date_text(quote.get("trade_date")):
+    if price_available.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != _date_text(quote.get("trade_date")):
         return "QUOTE_AVAILABILITY_DATE_MISMATCH"
+    if status_available > decision_at:
+        return "SECURITY_STATUS_NOT_AVAILABLE_AT_DECISION"
+    if not str(quote.get("price_source", "")).strip():
+        return "PRICE_SOURCE_UNKNOWN"
+    if not str(quote.get("status_source", "")).strip():
+        return "SECURITY_STATUS_SOURCE_UNKNOWN"
     listed = _optional_flag(quote["is_listed"])
     if listed is None:
         return "LISTING_STATUS_UNKNOWN"
@@ -237,13 +248,20 @@ def _quote_block_reason(quote: Mapping[str, Any], *, decision_at: pd.Timestamp) 
 def _execution_block_reason(
     quote: Mapping[str, Any], *, decision_at: pd.Timestamp, execution_at: pd.Timestamp,
 ) -> str | None:
-    available = _aware_utc(quote["available_at_utc"], field="execution_quote.available_at_utc")
-    if available <= decision_at:
+    price_available = _aware_utc(quote["price_available_at_utc"], field="execution_quote.price_available_at_utc")
+    status_available = _aware_utc(quote["status_available_at_utc"], field="execution_quote.status_available_at_utc")
+    if price_available <= decision_at:
         return "EXECUTION_QUOTE_NOT_FUTURE_RELATIVE_TO_DECISION"
-    if available > execution_at:
+    if price_available > execution_at:
         return "EXECUTION_PRICE_NOT_AVAILABLE_AT_EXECUTION"
-    if available.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != _date_text(quote.get("trade_date")):
+    if price_available.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != _date_text(quote.get("trade_date")):
         return "EXECUTION_QUOTE_AVAILABILITY_DATE_MISMATCH"
+    if status_available > execution_at:
+        return "EXECUTION_SECURITY_STATUS_NOT_AVAILABLE"
+    if not str(quote.get("price_source", "")).strip():
+        return "EXECUTION_PRICE_SOURCE_UNKNOWN"
+    if not str(quote.get("status_source", "")).strip():
+        return "EXECUTION_SECURITY_STATUS_SOURCE_UNKNOWN"
     listed = _optional_flag(quote["is_listed"])
     if listed is None:
         return "EXECUTION_LISTING_STATUS_UNKNOWN"
@@ -264,10 +282,52 @@ def _execution_block_reason(
     return None
 
 
+def validate_h2_session_sequence(
+    trading_calendar: pd.DataFrame,
+    *,
+    signal_date: str,
+    decision_session_date: str,
+    execution_session_date: str,
+) -> list[str]:
+    """Require three consecutive open sessions using the canonical calendar."""
+    signal_day = _date_text(signal_date)
+    decision_day = _date_text(decision_session_date)
+    execution_day = _date_text(execution_session_date)
+    if not signal_day or not decision_day or not execution_day:
+        raise ValueError("H2 信号日、决策日和执行日必须是有效日期")
+    if not signal_day < decision_day < execution_day:
+        raise ValueError("H2 日期必须满足 signal_date < decision_session_date < execution_session_date")
+    try:
+        normalized = normalize_trading_calendar(trading_calendar)
+    except ValueError as exc:
+        raise ValueError(f"H2 交易日历无效或状态不明确：{exc}") from exc
+    dates = normalized["trade_date"].map(lambda value: value.isoformat())
+    is_open_by_date = dict(zip(dates, normalized["is_open"].astype(bool)))
+    required_days = pd.date_range(signal_day, execution_day, freq="D").strftime("%Y-%m-%d").tolist()
+    missing = [day for day in required_days if day not in is_open_by_date]
+    if missing:
+        raise ValueError("H2 交易日历日覆盖不完整：" + ", ".join(missing))
+    if not is_open_by_date[signal_day]:
+        raise ValueError("signal_date 必须是已知开市日")
+    if not is_open_by_date[decision_day]:
+        raise ValueError("decision_session_date 必须是已知开市日")
+    if not is_open_by_date[execution_day]:
+        raise ValueError("execution_session_date 必须是已知开市日")
+    open_days = [day for day in required_days if is_open_by_date[day]]
+    if len(open_days) < 3:
+        raise ValueError("交易日历未覆盖信号、决策和执行所需的三个开市日")
+    if decision_day != open_days[1]:
+        raise ValueError(f"decision_session_date 必须是信号后的下一开市日：expected={open_days[1]}")
+    if execution_day != open_days[2]:
+        raise ValueError(f"execution_session_date 必须是决策后的下一开市日：expected={open_days[2]}")
+    return open_days[:3]
+
+
 def build_h2_open_based_replacement_plan(
     ranked_candidates: pd.DataFrame,
     decision_open_quotes: pd.DataFrame,
     next_session_open_quotes: pd.DataFrame,
+    trading_calendar: pd.DataFrame,
     *,
     signal_date: str,
     ranking_available_at_utc: str,
@@ -288,11 +348,10 @@ def build_h2_open_based_replacement_plan(
 ) -> dict[str, Any]:
     """Prototype H2 with an explicit delayed execution boundary.
 
-    The opening price is observed on the decision session. A replacement is
-    selected only after that quote is available and can execute no earlier
-    than the following session's open. The next-session quote is used only to
-    evaluate the already-frozen order; it never changes the selected symbol or
-    planned share count.
+    The trading calendar proves that signal, decision, and execution sessions
+    are consecutive open sessions. Price and status availability are checked
+    separately. The execution open is an explicit synthetic fill assumption,
+    not evidence that a real order could fill at that price.
     """
     if max_positions < 1:
         raise ValueError("max_positions 必须大于 0")
@@ -318,8 +377,17 @@ def build_h2_open_based_replacement_plan(
     signal_day = _date_text(signal_date)
     decision_day = _date_text(decision_session_date)
     execution_day = _date_text(execution_session_date)
+    open_days = validate_h2_session_sequence(
+        trading_calendar,
+        signal_date=signal_day,
+        decision_session_date=decision_day,
+        execution_session_date=execution_day,
+    )
     if ranking_available_at.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != signal_day:
         raise ValueError("候选排名必须在 signal_date 当日可得，不能由后续数据生成")
+    signal_close_assumption = pd.Timestamp(f"{signal_day} 15:00:00", tz="Asia/Shanghai").tz_convert("UTC")
+    if ranking_available_at < signal_close_assumption:
+        raise ValueError("日线收盘信号的候选排名不能早于 signal_date 15:00 Asia/Shanghai")
     if ranking_available_at > decision_at:
         raise ValueError("候选排名在替补决策时点尚不可得")
     if decision_at.tz_convert("Asia/Shanghai").strftime("%Y-%m-%d") != decision_day:
@@ -328,8 +396,6 @@ def build_h2_open_based_replacement_plan(
         raise ValueError("execution_at_utc 必须落在 execution_session_date")
     if execution_at <= decision_at:
         raise ValueError("替补执行时点必须晚于开盘观察后的决策时点")
-    if not (signal_day < decision_day < execution_day):
-        raise ValueError("H2 时间顺序必须是信号日 < 决策开市日 < 替补执行开市日")
     required = {"symbol", "rank", "momentum"}
     if not required.issubset(ranked_candidates.columns):
         raise ValueError("ranked_candidates 缺少 symbol/rank/momentum")
@@ -350,22 +416,38 @@ def build_h2_open_based_replacement_plan(
         quote = decision_quotes.get(symbol)
         reason = "DECISION_OPEN_QUOTE_MISSING" if quote is None else _quote_block_reason(quote, decision_at=decision_at)
         if reason:
-            primary_reviews.append({"symbol": symbol, "rank": int(row["rank"]), "status": "NOT_EVALUATED_FOR_ZERO", "reason": reason})
+            primary_reviews.append({
+                "symbol": symbol, "rank": int(row["rank"]), "status": "NOT_EVALUATED_FOR_ZERO", "reason": reason,
+                "decision_price_available_at_utc": quote.get("price_available_at_utc") if quote is not None else None,
+                "decision_status_available_at_utc": quote.get("status_available_at_utc") if quote is not None else None,
+            })
             continue
         price = float(quote["open_price_cny"])
         target_shares = _round_lot(floor(target_amount_per_slot_cny / price), buy_min_shares, buy_step_shares)
         if target_shares > 0:
-            primary_reviews.append({"symbol": symbol, "rank": int(row["rank"]), "status": "PRIMARY_TARGET_HAS_VALID_QUANTITY", "planned_shares": target_shares})
+            primary_reviews.append({
+                "symbol": symbol, "rank": int(row["rank"]), "status": "PRIMARY_TARGET_HAS_VALID_QUANTITY",
+                "planned_shares": target_shares,
+                "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+                "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
+            })
             continue
         if held.get(symbol, 0) > 0:
             primary_reviews.append({
                 "symbol": symbol, "rank": int(row["rank"]),
                 "status": "EXISTING_POSITION_ZERO_TARGET_REBALANCE_OUT_OF_SCOPE",
                 "held_shares": held[symbol],
+                "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+                "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
             })
             continue
         initial_zero_slots.append({"primary_symbol": symbol, "primary_rank": int(row["rank"])})
-        primary_reviews.append({"symbol": symbol, "rank": int(row["rank"]), "status": "ZERO_TARGET_REPLACEMENT_SLOT", "reference_price_cny": price})
+        primary_reviews.append({
+            "symbol": symbol, "rank": int(row["rank"]), "status": "ZERO_TARGET_REPLACEMENT_SLOT",
+            "reference_price_cny": price,
+            "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+            "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
+        })
 
     candidate_evaluations: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
@@ -385,7 +467,14 @@ def build_h2_open_based_replacement_plan(
                 continue
             block_reason = _quote_block_reason(quote, decision_at=decision_at)
             if block_reason:
-                candidate_evaluations.append({"replacement_slot": slot_index, "symbol": symbol, "rank": int(row["rank"]), "status": "SKIPPED", "reason": block_reason})
+                candidate_evaluations.append({
+                    "replacement_slot": slot_index, "symbol": symbol, "rank": int(row["rank"]),
+                    "status": "SKIPPED", "reason": block_reason,
+                    "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+                    "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
+                    "decision_price_source": str(quote["price_source"]),
+                    "decision_status_source": str(quote["status_source"]),
+                })
                 continue
             reference_price = float(quote["open_price_cny"])
             quantity = _round_lot(floor(target_amount_per_slot_cny / reference_price), buy_min_shares, buy_step_shares)
@@ -416,15 +505,26 @@ def build_h2_open_based_replacement_plan(
                 "rank": int(row["rank"]),
                 "planned_shares": quantity,
                 "decision_reference_price_cny": reference_price,
-                "decision_quote_available_at_utc": str(quote["available_at_utc"]),
+                "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+                "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
+                "decision_price_source": str(quote["price_source"]),
+                "decision_status_source": str(quote["status_source"]),
+                "ranking_available_at_utc": ranking_available_at.isoformat(),
                 "decision_at_utc": decision_at.isoformat(),
-                "order_status": "SIMULATED_ORDER_SCHEDULED_NEXT_SESSION_OPEN",
+                "order_status": "SCHEDULED_SIMULATED_ORDER",
+                "fill_assumption": "NEXT_SESSION_OPEN_PRICE_ASSUMPTION",
+                "real_market_fill_proven": False,
                 "execution_session_date": _date_text(execution_session_date),
                 "execution_at_utc": execution_at.isoformat(),
                 "same_decision_session_open_fill_allowed": False,
                 "selection_uses_execution_quote": False,
             }
-            candidate_evaluations.append({"replacement_slot": slot_index, "symbol": symbol, "rank": int(row["rank"]), "status": "SELECTED_FOR_NEXT_SESSION_OPEN", "planned_shares": quantity})
+            candidate_evaluations.append({
+                "replacement_slot": slot_index, "symbol": symbol, "rank": int(row["rank"]),
+                "status": "SELECTED_FOR_NEXT_SESSION_OPEN", "planned_shares": quantity,
+                "decision_price_available_at_utc": str(quote["price_available_at_utc"]),
+                "decision_status_available_at_utc": str(quote["status_available_at_utc"]),
+            })
             used_symbols.add(symbol)
             estimated_cash_remaining -= estimated_notional + estimated_fee
             estimated_risk_remaining -= estimated_notional
@@ -444,7 +544,7 @@ def build_h2_open_based_replacement_plan(
     remaining_cash = float(available_cash_cny)
     execution_results: list[dict[str, Any]] = []
     for order in orders:
-        if order.get("order_status") != "SIMULATED_ORDER_SCHEDULED_NEXT_SESSION_OPEN":
+        if order.get("order_status") != "SCHEDULED_SIMULATED_ORDER":
             continue
         symbol = str(order["symbol"])
         quote = execution_quotes.get(symbol)
@@ -452,7 +552,15 @@ def build_h2_open_based_replacement_plan(
             quote, decision_at=decision_at, execution_at=execution_at,
         )
         if reason:
-            execution_results.append({"symbol": symbol, "status": "BLOCKED", "reason": reason, "filled_shares": 0})
+            execution_results.append({
+                "symbol": symbol, "status": "BLOCKED", "reason": reason, "filled_shares": 0,
+                "execution_price_available_at_utc": str(quote["price_available_at_utc"]) if quote is not None else None,
+                "execution_status_available_at_utc": str(quote["status_available_at_utc"]) if quote is not None else None,
+                "execution_price_source": str(quote["price_source"]) if quote is not None else None,
+                "execution_status_source": str(quote["status_source"]) if quote is not None else None,
+                "fill_assumption": "NEXT_SESSION_OPEN_PRICE_ASSUMPTION",
+                "real_market_fill_proven": False,
+            })
             continue
         price = float(quote["open_price_cny"])
         quantity = int(order["planned_shares"])
@@ -472,13 +580,19 @@ def build_h2_open_based_replacement_plan(
         remaining_cash -= total_cost
         execution_results.append({
             "symbol": symbol,
-            "status": "SIMULATED_FILL_NEXT_SESSION_OPEN",
-            "reason": "PRECOMMITTED_QUANTITY_EXECUTED_AT_LATER_OPEN",
+            "status": "SIMULATED_FILL_UNDER_OPEN_PRICE_ASSUMPTION",
+            "reason": "PRECOMMITTED_QUANTITY_PRICED_USING_SYNTHETIC_NEXT_OPEN_ASSUMPTION",
             "filled_shares": quantity,
             "execution_price_cny": price,
             "execution_notional_cny": notional,
             "estimated_commission_cny": commission,
             "execution_cost_cny": total_cost,
+            "execution_price_source": str(quote["price_source"]),
+            "execution_price_observed_at_utc": str(quote["price_available_at_utc"]),
+            "execution_status_source": str(quote["status_source"]),
+            "execution_status_available_at_utc": str(quote["status_available_at_utc"]),
+            "fill_assumption": "NEXT_SESSION_OPEN_PRICE_ASSUMPTION",
+            "real_market_fill_proven": False,
             "cash_remaining_cny": remaining_cash,
             "risk_budget_remaining_cny": remaining_risk,
             "actual_execution_quote_used_for_reselection": False,
@@ -492,10 +606,16 @@ def build_h2_open_based_replacement_plan(
         "ranking_available_at_utc": ranking_available_at.isoformat(),
         "decision_session_date": _date_text(decision_session_date),
         "decision_at_utc": decision_at.isoformat(),
+        "decision_quote_availability_fields": ["price_available_at_utc", "status_available_at_utc"],
+        "decision_status_observation_at_utc": decision_at.isoformat(),
         "execution_session_date": _date_text(execution_session_date),
         "execution_at_utc": execution_at.isoformat(),
-        "decision_price_source": "decision-session open quote available by decision_at_utc",
-        "replacement_execution_price_source": "later next-session open quote; not used for candidate selection or planned quantity",
+        "validated_open_sessions": open_days,
+        "decision_price_source": "per-quote price_source; must be available by decision_at_utc",
+        "decision_security_status_source": "per-quote status_source; must be available by decision_at_utc",
+        "replacement_execution_price_source": "per-quote source; explicitly treated as an open-price fill assumption only",
+        "execution_fill_model": "SIMULATED_FILL_UNDER_OPEN_PRICE_ASSUMPTION",
+        "real_market_fill_evidence": False,
         "same_session_open_replacement_fill_allowed": False,
         "max_positions": int(max_positions),
         "target_amount_per_slot_cny": float(target_amount_per_slot_cny),

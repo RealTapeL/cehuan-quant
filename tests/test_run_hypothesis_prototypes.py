@@ -20,7 +20,7 @@ def test_synthetic_hypothesis_run_is_registered_and_reproducible(tmp_path: Path)
     assert manifest["input_data_status"] == "SYNTHETIC_ONLY"
     assert manifest["results"]["h1_eligible_rows"] == 1
     assert manifest["results"]["h1_excluded_rows"] == 4
-    assert manifest["results"]["h2_simulated_fills"] == 1
+    assert manifest["results"]["h2_simulated_fills_under_open_assumption"] == 1
     assert manifest["release_status"] == {
         "formal_baseline": "NOT_READY",
         "can_continue": False,
@@ -34,6 +34,7 @@ def test_synthetic_hypothesis_run_is_registered_and_reproducible(tmp_path: Path)
     assert control_candidate["candidate"]["same_decision_session_open_fill_allowed"] is False
     assert (output / "h2-decision-open-quotes.csv").is_file()
     assert (output / "h2-next-session-open-quotes.csv").is_file()
+    assert (output / "h2-trading-calendar.csv").is_file()
 
 
 def test_synthetic_hypothesis_run_refuses_to_overwrite(tmp_path: Path) -> None:
