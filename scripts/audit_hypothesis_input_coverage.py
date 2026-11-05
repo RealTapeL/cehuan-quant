@@ -115,6 +115,41 @@ def _markdown(report: dict[str, Any], input_records: list[dict[str, Any]]) -> st
     return "\n".join(lines)
 
 
+def _h1_candidate_changes_markdown(frame: pd.DataFrame, report: dict[str, Any]) -> str:
+    detail = frame.loc[frame.scope.eq("ORIGINAL_CANDIDATE_POOL")].copy()
+    impacted = detail.loc[
+        ~detail.h1_status.eq("ELIGIBLE_FOR_H1_DIAGNOSTIC")
+        | detail.top_n_change.isin({"NEW_TOP_N_MEMBER_AFTER_RERANK", "DROPPED_FROM_TOP_N_AFTER_FILTER"})
+    ].copy()
+    lines = [
+        "# H1 原候选池变化说明", "",
+        "**口径：** 仅对冻结输入事后重建的原候选池做窗口过滤与排名重算；不是历史点时可得性证明，不计算收益，不是独立样本外结果。", "",
+        "| 信号日 | 证券 | 原排名 | H1 状态 | 排除原因 | H1 新排名 | Top-N 变化 |", "|---|---|---:|---|---|---:|---|",
+    ]
+    for row in impacted.sort_values(["signal_date", "rank", "symbol"], kind="stable").itertuples(index=False):
+        h1_rank = "—" if pd.isna(row.h1_rank) else int(row.h1_rank)
+        reasons = "—" if pd.isna(row.reasons) or not str(row.reasons).strip() else str(row.reasons)
+        reasons = reasons.replace("|", "\\|")
+        change = str(row.top_n_change).replace("|", "\\|")
+        lines.append(
+            f"| {row.signal_date} | `{row.symbol}` | {int(row.rank)} | `{row.h1_status}` | {reasons} | {h1_rank} | `{change}` |"
+        )
+    lines.extend([
+        "", "## 每日汇总", "", "| 信号日 | 原候选 | H1 保留 | 排除/未知 | 原 Top-N 被排除 | 新进入 Top-N |", "|---|---:|---:|---:|---:|---:|",
+    ])
+    for row in report["h1"]["candidate_rank_diagnostics_by_signal"]:
+        lines.append(
+            f"| {row['signal_date']} | {row['candidate_rows']} | {row['h1_retained_candidate_rows']} | "
+            f"{row['h1_excluded_or_unverified_candidate_rows']} | {row['original_top_n_excluded']} | "
+            f"{row['new_top_n_members_after_rerank']} |"
+        )
+    lines.extend([
+        "", f"完整逐候选结果见同目录 `h1-candidate-rank-diagnostic.csv`。原候选重建状态：`{report['candidate_reconstruction']['status']}`；",
+        f"原运行时排名锚点：`{report['candidate_original_run_time_anchor']['status']}`；历史状态可得性：`UNVERIFIED`。", "",
+    ])
+    return "\n".join(lines)
+
+
 def build_report(
     *, bars_path: Path, bars_manifest_path: Path, universe_dir: Path,
     candidates_path: Path, audit_dir: Path | None, config_path: Path,
@@ -295,6 +330,9 @@ def build_report(
         h1_detail.loc[h1_detail.scope.eq("ORIGINAL_CANDIDATE_POOL")].to_csv(
             staging / "h1-candidate-rank-diagnostic.csv", index=False,
         )
+        (staging / "h1-candidate-changes.md").write_text(
+            _h1_candidate_changes_markdown(h1_detail, report), encoding="utf-8",
+        )
         h2_detail.to_csv(staging / "h2-candidate-input-coverage.csv", index=False)
         # Read every input hash again before publication to detect concurrent replacement.
         after = {str(path): (sha256_file(path) if path.is_file() else None) for path in input_paths}
@@ -304,7 +342,7 @@ def build_report(
         (staging / "research-task-registration.json").write_text(json.dumps(registration_output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         report["output_sha256"] = {
             name: sha256_file(staging / name)
-            for name in ("h1-window-coverage.csv", "h1-candidate-rank-diagnostic.csv", "h2-candidate-input-coverage.csv", "research-task-registration.json")
+            for name in ("h1-window-coverage.csv", "h1-candidate-rank-diagnostic.csv", "h1-candidate-changes.md", "h2-candidate-input-coverage.csv", "research-task-registration.json")
         }
         report["summary_markdown"] = "summary.md"
         (staging / "coverage-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

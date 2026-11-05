@@ -1,11 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cehuan-quant.local/schemas/paper-observation-v1.json",
-  "title": "Cehuan forward paper observation",
+  "$id": "https://cehuan-quant.local/schemas/paper-observation-v2.json",
+  "title": "Cehuan paper observation",
+  "description": "Version 2 binds each normalized payload to archived response bytes and separates market, provider, request, and receive times. The Python reader remains backward-compatible with v1 but marks its payload binding unverified.",
   "type": "object",
-  "required": ["schema_version", "record_type", "classification", "observation_id", "signal", "observations"],
+  "required": ["schema_version", "record_type", "classification", "observation_id", "signal", "observation_schedule", "observations"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "record_type": {"const": "PAPER_OBSERVATION"},
     "classification": {"enum": ["SYNTHETIC", "FORWARD_PAPER"]},
     "observation_id": {"type": "string", "minLength": 1},
@@ -17,42 +18,70 @@
         "generated_at_utc": {"type": "string", "format": "date-time"},
         "ranking_artifact": {"$ref": "#/$defs/fileBinding"},
         "code_revision": {"type": "string", "minLength": 1},
-        "config_sha256": {"$ref": "#/$defs/sha256"}
+        "config_sha256": {"$ref": "#/$defs/sha256"},
+        "input_data_sha256": {"$ref": "#/$defs/sha256"},
+        "worktree_dirty": {"type": ["boolean", "null"]}
       },
       "additionalProperties": true
     },
+    "observation_schedule": {
+      "type": "object",
+      "required": ["decision_at_utc", "execution_at_utc"],
+      "properties": {
+        "decision_at_utc": {"type": "string", "format": "date-time"},
+        "execution_at_utc": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "eligibility_inputs": {"type": "object"},
     "observations": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["symbol", "phase", "observation_type", "attempt_no", "attempt_id", "outcome", "source", "captured_at_utc", "raw_response", "payload"],
+        "required": ["symbol", "phase", "observation_type", "attempt_no", "attempt_id", "outcome", "source", "request_started_at_utc", "response_received_at_utc", "planned_observation_at_utc", "raw_response", "payload"],
         "properties": {
           "symbol": {"type": "string", "pattern": "^(SH|SZ|BJ)[0-9]{6}$"},
           "phase": {"enum": ["DECISION", "EXECUTION"]},
           "observation_type": {"enum": ["QUOTE", "STATUS"]},
           "attempt_no": {"type": "integer", "minimum": 1},
           "attempt_id": {"type": "string", "minLength": 1},
-          "outcome": {"enum": ["AVAILABLE", "MISSING", "ERROR"]},
+          "outcome": {"enum": ["AVAILABLE", "MISSING", "ERROR", "PARSE_FAILED"]},
           "source": {
             "type": "object",
-            "required": ["name", "event_time_utc", "provider_published_at_utc"],
+            "required": ["name", "event_time_utc", "provider_published_at_utc", "parser_name", "parser_version"],
             "properties": {
               "name": {"type": "string", "minLength": 1},
               "event_time_utc": {"type": ["string", "null"], "format": "date-time"},
-              "provider_published_at_utc": {"type": ["string", "null"], "format": "date-time"}
+              "provider_published_at_utc": {"type": ["string", "null"], "format": "date-time"},
+              "parser_name": {"type": "string", "minLength": 1},
+              "parser_version": {"type": "string", "minLength": 1},
+              "parser_metadata": {"type": "object"}
             },
             "additionalProperties": true
           },
-          "captured_at_utc": {"type": "string", "format": "date-time"},
-          "raw_response": {"$ref": "#/$defs/fileBinding"},
+          "request_started_at_utc": {"type": "string", "format": "date-time"},
+          "response_received_at_utc": {"type": "string", "format": "date-time"},
+          "planned_observation_at_utc": {"type": "string", "format": "date-time"},
+          "captured_at_utc": {"type": "string", "format": "date-time", "deprecated": true},
+          "raw_response": {"$ref": "#/$defs/rawResponse"},
           "payload": {"type": ["object", "null"]},
-          "error_code": {"type": ["string", "null"]}
+          "normalized_payload_sha256": {"$ref": "#/$defs/sha256"},
+          "error_code": {"type": ["string", "null"]},
+          "parse_error": {"type": ["string", "null"]}
         },
+        "allOf": [
+          {
+            "if": {"properties": {"outcome": {"const": "AVAILABLE"}}},
+            "then": {"required": ["normalized_payload_sha256"], "properties": {"payload": {"type": "object"}}},
+            "else": {"properties": {"payload": {"type": "null"}}}
+          }
+        ],
         "additionalProperties": true
       }
     },
-    "limitations": {"type": "array", "items": {"type": "string"}}
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "trusted_external_timestamp": {"const": "UNVERIFIED"}
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
@@ -63,7 +92,20 @@
         "path": {"type": "string", "minLength": 1, "not": {"pattern": "(^/|(^|/)\\.\\.(/|$))"}},
         "sha256": {"$ref": "#/$defs/sha256"}
       },
-      "additionalProperties": false
+      "additionalProperties": true
+    },
+    "rawResponse": {
+      "allOf": [
+        {"$ref": "#/$defs/fileBinding"},
+        {
+          "type": "object",
+          "required": ["format", "capture_layer"],
+          "properties": {
+            "format": {"enum": ["JSON"]},
+            "capture_layer": {"enum": ["SDK_SERIALIZED_RETURN", "HTTP_BODY", "SYNTHETIC_RESPONSE", "LOCAL_ERROR_RECORD"]}
+          }
+        }
+      ]
     }
   },
   "additionalProperties": true

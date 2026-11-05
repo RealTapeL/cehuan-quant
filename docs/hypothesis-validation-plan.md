@@ -116,6 +116,16 @@ uv run python scripts/audit_hypothesis_input_coverage.py \
 
 脚本只读输入，在运行前后比对源文件哈希，并拒绝覆盖已有结果目录。逐证券 CSV、JSON 和摘要 Markdown 都留在 `data/private/`，不计算策略收益、不运行交易策略，也不产生交易计划。此 68 开市日开发窗口不能作为独立留出；本轮发现的数据缺口与实验登记口径见 [`hypothesis-data-gaps.md`](hypothesis-data-gaps.md) 和 [`hypothesis-experiment-registration.md`](hypothesis-experiment-registration.md)。
 
+### 本机 H1 输入诊断与逐证券差异
+
+2026-11-05 在持有私有历史数据的本机运行后，H1 的三个已审计信号日分别发现 24、22、4 个原候选含有窗口停牌状态；原 Top-5 中分别有 3、1、0 个被排除，候选重排后的新 Top-5 分别补入 3、1、0 个证券。报告为逐证券列出代码、原排名、过滤原因和重排位置，位于本机 `data/private/experiments/hypothesis-input-coverage-36ca6d5-20261105-v1/h1-candidate-changes.md`。这些是同一开发窗口上的事后筛选诊断，不计算收益，不是点时验证或独立样本外结果；私有逐证券文件不提交 Git。
+
+### 纸面观察与前瞻排名
+
+纸面观察 schema v2 要求从归档原始响应重新解析并比较规范 payload；v1 可以读取，但标记为 payload 绑定未核验。验证分别报告文件哈希、规范 payload 摘要、payload 来源重建、时间证据和研究资格。供应商发布时间或独立状态来源缺失时，资格为 `UNKNOWN`，不将 `can_buy` 当作上游事实。细节和一次本机只读分钟探测记录见 [`h2-data-source-matrix.md`](h2-data-source-matrix.md)。
+
+`scripts/run_paper_ranking.py` 仅保存冻结配置下的候选排名及输入清单，不计算策略回报或订单。`FORWARD_PAPER` 模式需要同日收盘后抓取记录、行情文件散列绑定和完整动量窗口可得时间；缺项时只生成 `NEEDS_DATA` 记录。当前没有真实前瞻排名记录，H2 仍为 `NEEDS_DATA`，正式基线仍为 `NOT_READY`。
+
 ## 登记日权益证据范围
 
 这轮仅将证据范围整理到 [`evidence/record-date-entitlement-evidence.csv`](evidence/record-date-entitlement-evidence.csv)。它按来源、市场范围和能否明确回答登记日当日交易来记录证据边界；不更改现有账本政策，也不确认任何个人账户实际权益。来源文件链接或哈希本身不能代替适用性审查与账户结算记录。
