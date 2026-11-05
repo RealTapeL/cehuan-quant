@@ -107,6 +107,8 @@ uv run python scripts/run_hypothesis_prototypes.py \
 
 本地只读预检入口为 `scripts/audit_hypothesis_input_coverage.py`。它复用项目规范行情和交易日历适配器，分别检查 H1 全股票池、H1 原候选的 21 开市日窗口，以及 H2 候选在下一两个开市日的报价、证券状态和交易规则字段。文件清单哈希、当前文件哈希、原运行时锚点、字段是否存在、历史可得时点证据会分开记录。
 
+更新后的预检另外从冻结候选生成行情与策略配置事后重建排名；重建一致只证明代码和输入能复现该候选表，不能证明原运行时已经保存它。H1 报告会列出原候选池内的保留/排除原因和前 N 名变动，不计算收益。市场规则与费率表是可选明确输入；未提供时报 `NOT_PROVIDED`，提供且适配器及本范围覆盖通过时最多标记 `VERIFIED_FOR_SCOPE`，来源语义仍单独核查。H2 来源矩阵和未来纸面采集记录方案见 [h2-data-source-matrix.md](h2-data-source-matrix.md)。
+
 ```bash
 uv run python scripts/audit_hypothesis_input_coverage.py \
   --output-dir data/private/experiments/hypothesis-input-coverage-<unique-id>

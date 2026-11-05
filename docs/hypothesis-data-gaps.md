@@ -9,6 +9,8 @@
 | `AVAILABLE_AND_BOUND` | 输入存在，且由版本化 manifest / 原运行清单绑定。仅证明文件绑定，不证明内容正确或历史来源完整。 |
 | `AVAILABLE_BUT_UNVERIFIED` | 有数据或假设值，但来源、时点、适用范围或规则尚未独立核实。 |
 | `MISSING` | 研究所需输入不存在。 |
+| `NOT_PROVIDED` | 本次命令没有提供该输入；不推断整个项目或机器中不存在此文件。 |
+| `VERIFIED_FOR_SCOPE` | 适配器、来源复核字段和本实验所需有效日期覆盖均通过；不证明来源解释、历史点时可得性或实验范围外的完整性。 |
 | `FAILED` | 哈希、规范化、时间边界或字段约束出现明确冲突。 |
 | `NOT_APPLICABLE` | 对该实验确实不适用，需记录理由。 |
 
@@ -33,6 +35,11 @@
 - 配置中的手数、涨跌幅阈值、佣金和滑点是回退/情景假设，不是历史规则或个人券商费率。
 - 股票池每日名单、后来取得的证券类型资料、点时 ST/停牌状态是不同证据，不能合并成一个“历史状态已验证”。
 - 已用于开发和问题发现的窗口不能再称为独立留出；有覆盖报告也不表示策略已经过样本外验证。
+- 候选文件的当前 SHA 与事后清单匹配、从冻结行情和配置重建一致、原运行时存在候选文件哈希锚点，是三类独立证据。只有后两者之一或清单匹配，不能推断原运行时锚点已验证。
+- 规则和费用表状态为 `NOT_PROVIDED` 时，只表示当前预检命令没有传入文件。仅当命令给出具体路径且该路径不存在，才标为 `MISSING`。
+- 规则/费率状态 `VERIFIED_FOR_SCOPE` 只表示规范化校验、审核字段和指定证券日/日期覆盖通过；来源内容和规则适用解释仍可为 `UNVERIFIED`。
+- H1 候选重排诊断仅在已重建的原候选池内部过滤和重排，不引入池外证券、不计算收益，也不构成历史点时可得性或独立样本外证据。
+- H2 供应商、接口权限、时间戳和本机验证边界见[数据来源矩阵](h2-data-source-matrix.md)。当前分钟报价/状态的历史发布时点没有证据时，H2 保持 `NEEDS_DATA`。
 
 本地只读预检命令（输出目录需唯一且处于 `data/private/`）：
 
@@ -40,5 +47,16 @@
 uv run python scripts/audit_hypothesis_input_coverage.py \
   --output-dir data/private/experiments/hypothesis-input-coverage-<unique-id>
 ```
+
+可选提供规则和费用输入：
+
+```bash
+uv run python scripts/audit_hypothesis_input_coverage.py \
+  --market-rules path/to/market-rules.csv \
+  --fee-schedule path/to/fee-schedule.csv \
+  --output-dir data/private/experiments/hypothesis-input-coverage-<unique-id>
+```
+
+预检会按 H2 候选证券和决策/执行日期核对规则覆盖，并按日期核对费率。仅有有效日期覆盖不等于真实市场规则或华泰账户佣金已经独立核实。
 
 脚本不计算收益、不运行策略，也不生成交易计划。真实预检数字、证券明细和文件散列只保存在本机私有输出中。

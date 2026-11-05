@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cehuan-quant.local/schemas/paper-observation-v1.json",
+  "title": "Cehuan forward paper observation",
+  "type": "object",
+  "required": ["schema_version", "record_type", "classification", "observation_id", "signal", "observations"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_type": {"const": "PAPER_OBSERVATION"},
+    "classification": {"enum": ["SYNTHETIC", "FORWARD_PAPER"]},
+    "observation_id": {"type": "string", "minLength": 1},
+    "signal": {
+      "type": "object",
+      "required": ["signal_date", "generated_at_utc", "ranking_artifact", "code_revision", "config_sha256"],
+      "properties": {
+        "signal_date": {"type": "string", "format": "date"},
+        "generated_at_utc": {"type": "string", "format": "date-time"},
+        "ranking_artifact": {"$ref": "#/$defs/fileBinding"},
+        "code_revision": {"type": "string", "minLength": 1},
+        "config_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": true
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["symbol", "phase", "observation_type", "attempt_no", "attempt_id", "outcome", "source", "captured_at_utc", "raw_response", "payload"],
+        "properties": {
+          "symbol": {"type": "string", "pattern": "^(SH|SZ|BJ)[0-9]{6}$"},
+          "phase": {"enum": ["DECISION", "EXECUTION"]},
+          "observation_type": {"enum": ["QUOTE", "STATUS"]},
+          "attempt_no": {"type": "integer", "minimum": 1},
+          "attempt_id": {"type": "string", "minLength": 1},
+          "outcome": {"enum": ["AVAILABLE", "MISSING", "ERROR"]},
+          "source": {
+            "type": "object",
+            "required": ["name", "event_time_utc", "provider_published_at_utc"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "event_time_utc": {"type": ["string", "null"], "format": "date-time"},
+              "provider_published_at_utc": {"type": ["string", "null"], "format": "date-time"}
+            },
+            "additionalProperties": true
+          },
+          "captured_at_utc": {"type": "string", "format": "date-time"},
+          "raw_response": {"$ref": "#/$defs/fileBinding"},
+          "payload": {"type": ["object", "null"]},
+          "error_code": {"type": ["string", "null"]}
+        },
+        "additionalProperties": true
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+    "fileBinding": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "not": {"pattern": "(^/|(^|/)\\.\\.(/|$))"}},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

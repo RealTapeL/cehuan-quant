@@ -83,6 +83,11 @@ def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
     assert trust["market_rule_coverage"]["status"] == "FALLBACK_USED"
     assert trust["corporate_action_coverage"]["status"] == "UNVERIFIED_COVERAGE"
     assert trust["formal_baseline"]["status"] == "NOT_READY"
+    candidate_pool = result["candidate_pool"]
+    assert not candidate_pool.empty
+    assert {"signal_date", "execution_date", "symbol", "momentum", "rank", "selected_target"}.issubset(candidate_pool.columns)
+    assert candidate_pool["rank"].gt(0).all()
+    assert (candidate_pool["selected_target"] == candidate_pool["rank"].le(1)).all()
 
 
 def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events():

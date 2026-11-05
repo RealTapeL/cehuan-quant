@@ -255,6 +255,83 @@ def compute_hypothesis_input_coverage(
                 "candidate_rank_unique": bool(signal_candidates["rank"].is_unique) if scope == "ORIGINAL_CANDIDATE_POOL" else None,
             })
 
+    # H1 is only compared within the already reconstructed original candidate
+    # pool. It does not introduce securities absent from that pool and does not
+    # calculate performance. Keep every candidate row visible with its filter
+    # reason and pre/post-filter ranks.
+    max_positions = int(((config or {}).get("strategy") or {}).get("max_positions", 5))
+    candidate_detail_rows = [
+        row for row in h1_rows if row["scope"] == "ORIGINAL_CANDIDATE_POOL"
+    ]
+    h1_candidate_summary: list[dict[str, Any]] = []
+    for signal_day in signal_days:
+        rows_for_day = [row for row in candidate_detail_rows if row["signal_date"] == signal_day]
+        source_rows = candidates.loc[candidates.signal_date.eq(signal_day)]
+        symbols = [str(row["symbol"]) for row in rows_for_day]
+        unique_symbols = bool(source_rows["symbol"].is_unique)
+        unique_ranks = bool(source_rows["rank"].is_unique)
+        original_top_symbols: set[str] = set()
+        for row in rows_for_day:
+            selected = _flag(row.get("selected_target"))
+            row["original_top_n"] = selected if selected is not None else (
+                int(row["rank"]) <= max_positions if row.get("rank") is not None else None
+            )
+            row["h1_rank"] = None
+            row["h1_top_n"] = None
+            row["top_n_change"] = "UNVERIFIED"
+            if row["original_top_n"]:
+                original_top_symbols.add(str(row["symbol"]))
+        eligible_rows = [
+            row for row in rows_for_day
+            if row["h1_status"] == "ELIGIBLE_FOR_H1_DIAGNOSTIC"
+            and _number_present(row.get("momentum"))
+        ]
+        ranking_valid = unique_symbols and unique_ranks and all(_number_present(row.get("momentum")) for row in eligible_rows)
+        if ranking_valid:
+            eligible_rows.sort(key=lambda row: (-float(row["momentum"]), str(row["symbol"])))
+            for rank, row in enumerate(eligible_rows, start=1):
+                row["h1_rank"] = rank
+                row["h1_top_n"] = rank <= max_positions
+            for row in rows_for_day:
+                if row["h1_status"] != "ELIGIBLE_FOR_H1_DIAGNOSTIC":
+                    row["top_n_change"] = "FILTERED_BY_H1" if row["original_top_n"] else "REMAINS_OUTSIDE_TOP_N"
+                elif row["h1_top_n"] and not row["original_top_n"]:
+                    row["top_n_change"] = "NEW_TOP_N_MEMBER_AFTER_RERANK"
+                elif row["original_top_n"] and not row["h1_top_n"]:
+                    row["top_n_change"] = "DROPPED_FROM_TOP_N_AFTER_FILTER"
+                elif row["h1_top_n"]:
+                    row["top_n_change"] = "RETAINED_IN_TOP_N"
+                else:
+                    row["top_n_change"] = "REMAINS_OUTSIDE_TOP_N"
+        else:
+            for row in rows_for_day:
+                row["top_n_change"] = "UNVERIFIED_DUPLICATE_OR_INVALID_CANDIDATE_RANKING"
+        original_top_retained = sum(
+            bool(row["original_top_n"]) and row["h1_status"] == "ELIGIBLE_FOR_H1_DIAGNOSTIC"
+            for row in rows_for_day
+        )
+        retained_top_symbols = {
+            str(row["symbol"]) for row in rows_for_day if row.get("h1_top_n") is True
+        }
+        h1_candidate_summary.append({
+            "signal_date": signal_day,
+            "candidate_rows": int(len(source_rows)),
+            "candidate_symbols_represented_in_detail": len(rows_for_day),
+            "original_candidate_symbols_unique": unique_symbols,
+            "original_ranks_unique": unique_ranks,
+            "original_top_n_limit": max_positions,
+            "original_top_n_count": len(original_top_symbols),
+            "h1_retained_candidate_rows": len(eligible_rows),
+            "h1_excluded_or_unverified_candidate_rows": len(rows_for_day) - len(eligible_rows),
+            "original_top_n_retained": original_top_retained,
+            "original_top_n_excluded": len(original_top_symbols) - original_top_retained,
+            "h1_top_n_count": len(retained_top_symbols) if ranking_valid else None,
+            "new_top_n_members_after_rerank": len(retained_top_symbols - original_top_symbols) if ranking_valid else None,
+            "original_top_n_dropped_after_filter": len((original_top_symbols & set(symbols)) - retained_top_symbols) if ranking_valid else None,
+            "rank_comparison_status": "DIAGNOSTIC_ONLY" if ranking_valid else "UNVERIFIED_DUPLICATE_OR_INVALID_CANDIDATE_RANKING",
+            "ranking_scope": "RETAINED_ROWS_WITHIN_RECONSTRUCTED_ORIGINAL_CANDIDATE_POOL_ONLY",
+        })
+
     h2_rows: list[dict[str, Any]] = []
     h2_summary: list[dict[str, Any]] = []
     availability_cache: dict[str, pd.Timestamp | None] = {}
@@ -358,9 +435,14 @@ def compute_hypothesis_input_coverage(
             "data_scope": "Existing 68-open-session Shanghai/Shenzhen development snapshot; not an independent holdout and not a full-A-share completeness claim.",
         },
         "h1": {
+            "result_type": "DEVELOPMENT_DIAGNOSTIC",
+            "historical_availability_status": "UNVERIFIED",
+            "independent_holdout": False,
             "lookback_sessions": H1_LOOKBACK_SESSIONS,
             "required_open_sessions_including_signal_day": H1_LOOKBACK_SESSIONS + 1,
             "summary_by_signal_and_scope": h1_summary,
+            "candidate_rank_diagnostics_by_signal": h1_candidate_summary,
+            "candidate_rank_scope": "The H1 rerank is restricted to the reconstructed original candidate pool; securities outside that pool are not introduced.",
             "detail_file": "h1-window-coverage.csv",
         },
         "h2": {
@@ -374,7 +456,8 @@ def compute_hypothesis_input_coverage(
         "rules_fees_and_status": {
             "market_rule_complete_bar_rows": int(rule_complete.sum()),
             "market_rule_missing_or_incomplete_bar_rows": int(bar_count - rule_complete.sum()),
-            "historical_fee_schedule": "MISSING",
+            "historical_fee_schedule": "NOT_PROVIDED_TO_COVERAGE_FUNCTION",
+            "market_rule_schedule": "NOT_PROVIDED_TO_COVERAGE_FUNCTION",
             "config_fallback_available_but_unverified": True,
             "config_fallback_values": (config or {}).get("costs", {}),
             "market_fallback_values": (config or {}).get("market", {}),

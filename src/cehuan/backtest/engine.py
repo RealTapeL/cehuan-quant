@@ -1045,6 +1045,7 @@ def run_backtest(
         dict(backtest_checkpoint.transition_signal_ready_index) if backtest_checkpoint is not None else {}
     )
     equity_rows: list[dict[str, Any]] = []
+    candidate_pool_rows: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     security_events: list[dict[str, Any]] = []
     blocked_orders: list[dict[str, Any]] = []
@@ -1649,6 +1650,22 @@ def run_backtest(
             and (index + 1 < len(dates) or create_final_pending_signal)
         ):
             ranked = rank_precomputed_day(day, strategy, market, require_order_rules=use_effective_schedules)
+            execution_session = next_open_session_by_date.get(day_date)
+            if execution_session is None and index + 1 < len(dates):
+                execution_session = pd.Timestamp(dates[index + 1]).date()
+            for candidate_row in ranked.itertuples(index=False):
+                rank_value = int(getattr(candidate_row, "rank"))
+                candidate_pool_rows.append({
+                    "signal_date": day_date,
+                    "execution_date": execution_session.isoformat() if execution_session else "",
+                    "symbol": str(getattr(candidate_row, "symbol")),
+                    "momentum": float(getattr(candidate_row, "momentum")),
+                    "rank": rank_value,
+                    "selected_target": rank_value <= int(strategy["max_positions"]),
+                    "is_listed": getattr(candidate_row, "is_listed", pd.NA),
+                    "is_suspended": getattr(candidate_row, "is_suspended", pd.NA),
+                    "is_st": getattr(candidate_row, "is_st", pd.NA),
+                })
             selected = ranked.head(int(strategy["max_positions"]))
             if not selected.empty:
                 target_weight = min(
@@ -2117,6 +2134,10 @@ def run_backtest(
     result = {
         "metrics": metrics,
         "equity_curve": curve,
+        "candidate_pool": pd.DataFrame(candidate_pool_rows, columns=[
+            "signal_date", "execution_date", "symbol", "momentum", "rank", "selected_target",
+            "is_listed", "is_suspended", "is_st",
+        ]),
         "trades": trade_frame.reindex(columns=[
             "trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price",
             "notional_cny", "fees_cny", "commission_cny", "stamp_duty_cny", "transfer_fee_cny",

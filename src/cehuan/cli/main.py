@@ -891,6 +891,7 @@ def main(argv: list[str] | None = None) -> int:
                 research_fee_schedule_sha256 = sha256_file(research_fee_schedule_path)
                 research_market_rules = pd.read_csv(rules_path, dtype=str, keep_default_na=False)
                 research_fee_schedule = pd.read_csv(fees_path, dtype=str, keep_default_na=False)
+            run_started_at_utc = datetime.now(timezone.utc).isoformat()
             result = run_backtest(
                 bars,
                 args.cash,
@@ -930,6 +931,7 @@ def main(argv: list[str] | None = None) -> int:
                 trading_calendar=trading_calendar,
                 source_data_path=bars_path,
             )
+            run_completed_at_utc = datetime.now(timezone.utc).isoformat()
             if sha256_file(bars_path) != source_data_sha256:
                 raise ValueError("回测期间当前窗口行情文件发生变化；本次实验结果不予保存")
             if opening_snapshot_path is not None:
@@ -985,6 +987,11 @@ def main(argv: list[str] | None = None) -> int:
                 shutil.copyfile(research_fee_schedule_path, folder / "fee_schedule.csv")
             _write_json(result["metrics"], folder / "metrics.json")
             result["equity_curve"].to_csv(folder / "equity_curve.csv", index=False)
+            candidate_pool_path = folder / "candidate-pool-by-signal.csv"
+            result["candidate_pool"].to_csv(candidate_pool_path, index=False)
+            candidate_pool_sha256 = sha256_file(candidate_pool_path)
+            result["metrics"]["candidate_pool_file_sha256"] = candidate_pool_sha256
+            _write_json(result["metrics"], folder / "metrics.json")
             result["trades"].to_csv(folder / "trades.csv", index=False)
             result["blocked_orders"].to_csv(folder / "blocked_orders.csv", index=False)
             result["security_events"].to_csv(folder / "security_events.csv", index=False)
@@ -1003,6 +1010,39 @@ def main(argv: list[str] | None = None) -> int:
                 _write_json(universe_summary, folder / "point_in_time_universe_audit.json")
                 universe_discrepancies.to_csv(folder / "point_in_time_universe_discrepancies.csv", index=False)
             (folder / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            _write_json({
+                "schema_version": 1,
+                "manifest_type": "BACKTEST_RUNTIME_ARTIFACT_MANIFEST",
+                "experiment_id": experiment,
+                "run_started_at_utc": run_started_at_utc,
+                "run_completed_at_utc": run_completed_at_utc,
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "runtime_artifacts": {
+                    "candidate-pool-by-signal.csv": {
+                        "path": "candidate-pool-by-signal.csv",
+                        "sha256": candidate_pool_sha256,
+                        "row_count": int(len(result["candidate_pool"])),
+                        "signal_dates": sorted(result["candidate_pool"]["signal_date"].astype(str).unique().tolist()),
+                        "generation_source": "candidate rows captured from rank_precomputed_day inside run_backtest and sealed by this CLI run output manifest",
+                        "generation_timestamp_precision": "within_run_interval_only; per-row historical publication time is not proved",
+                    }
+                },
+                "input_bindings": {
+                    "source_input_file_sha256": result["metrics"].get("current_window_input_file_sha256"),
+                    "normalized_data_version_sha256": result["metrics"].get("data_version_sha256"),
+                    "config_sha256": result["metrics"].get("config_sha256"),
+                    "code_commit": result["metrics"].get("git_commit"),
+                    "code_worktree_dirty": result["metrics"].get("git_dirty"),
+                },
+                "authenticity": {
+                    "manifest_signature": "UNSIGNED",
+                    "trusted_external_timestamp": "UNVERIFIED",
+                    "meaning": "The manifest binds the candidate artifact produced by this CLI run; it is not tamper-proof proof of wall-clock creation time or vendor availability.",
+                },
+                "result_type": result["metrics"].get("result_type"),
+                "broker_connected": False,
+                "orders_generated": False,
+            }, folder / "experiment-manifest.json")
             _write_json(result["metrics"], REPO_ROOT / "outputs" / "backtest_metrics.json")
             shutil.copyfile(folder / "trades.csv", REPO_ROOT / "outputs" / "trades.csv")
             shutil.copyfile(folder / "equity_curve.csv", REPO_ROOT / "outputs" / "equity_curve.csv")
