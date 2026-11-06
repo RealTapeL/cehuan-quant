@@ -26,6 +26,53 @@ from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _build_h1_ranking_comparison(
+    ranking: pd.DataFrame,
+    window_audit: pd.DataFrame,
+    *,
+    max_positions: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Re-rank the frozen baseline candidate set after the existing H1 window audit."""
+    required = {"signal_date", "symbol", "momentum", "rank", "selected_target"}
+    if not required.issubset(ranking.columns) or not {"symbol", "window_status"}.issubset(window_audit.columns):
+        raise ValueError("H1 重排输入缺少排名或窗口审计字段")
+    if window_audit["symbol"].astype(str).duplicated().any():
+        raise ValueError("H1 窗口审计存在重复证券")
+    status_by_symbol = window_audit.set_index(window_audit["symbol"].astype(str))["window_status"]
+    comparison = ranking.copy()
+    comparison["symbol"] = comparison["symbol"].astype(str)
+    comparison["window_status"] = comparison["symbol"].map(status_by_symbol).fillna("UNKNOWN_WINDOW_STATUS")
+    comparison["h1_eligible"] = comparison["window_status"].eq("COMPLETE")
+    h1 = comparison.loc[comparison["h1_eligible"]].sort_values(
+        ["momentum", "symbol"], ascending=[False, True], kind="stable",
+    ).copy().reset_index(drop=True)
+    h1["rank"] = range(1, len(h1) + 1)
+    h1["selected_target"] = h1["rank"].le(max_positions)
+    h1 = h1[list(ranking.columns)]
+
+    original_top = comparison.loc[comparison["rank"].le(max_positions), "symbol"].tolist()
+    h1_top = h1.loc[h1["rank"].le(max_positions), "symbol"].tolist()
+    h1_rank_by_symbol = h1.set_index("symbol")["rank"] if not h1.empty else pd.Series(dtype="Int64")
+    difference = comparison[["signal_date", "symbol", "momentum", "rank", "window_status", "h1_eligible"]].rename(
+        columns={"rank": "original_rank"},
+    ).copy()
+    difference["h1_rank"] = difference["symbol"].map(h1_rank_by_symbol).astype("Int64")
+    difference["top_n_change"] = "REMAINS_OUTSIDE_TOP_N"
+    difference.loc[difference["original_rank"].le(max_positions) & ~difference["h1_eligible"], "top_n_change"] = "FILTERED_BY_H1"
+    difference.loc[difference["original_rank"].le(max_positions) & difference["h1_eligible"] & difference["h1_rank"].gt(max_positions), "top_n_change"] = "RANKED_OUT_AFTER_H1"
+    difference.loc[difference["original_rank"].gt(max_positions) & difference["h1_rank"].le(max_positions), "top_n_change"] = "NEW_TOP_N_MEMBER_AFTER_RERANK"
+    difference["direct_reason"] = difference["window_status"].map({
+        "COMPLETE_WITH_SUSPENSION": "21 日窗口含停牌记录",
+        "COMPLETE": "未因 H1 停牌筛选排除",
+    }).fillna("窗口数据/状态未通过完整性校验")
+    metadata = {
+        "top_n_changed": set(original_top) != set(h1_top),
+        "removed_from_original_top_n": [symbol for symbol in original_top if symbol not in set(h1_top)],
+        "added_to_h1_top_n": [symbol for symbol in h1_top if symbol not in set(original_top)],
+    }
+    return h1, difference, metadata
+
+
 def create_paper_ranking_artifact(
     *,
     bars_path: str | Path,
@@ -75,6 +122,9 @@ def create_paper_ranking_artifact(
         "trading_calendar_sha256": _sha256(calendar_file) if calendar_file and calendar_file.is_file() else None,
         "universe_sha256": _sha256(universe_file) if universe_file and universe_file.is_file() else None,
         "source_data_capture_time_utc": None,
+        "provider_published_at_utc": None,
+        "provider_publication_evidence": "UNVERIFIED",
+        "data_field_available_at_semantics": "输入行情字段；不等同于供应商发布时间证据",
         "data_trust": "UNVERIFIED",
         "code_commit": _git_revision(),
         "worktree_dirty": _git_dirty(),
@@ -86,6 +136,30 @@ def create_paper_ranking_artifact(
         "orders_generated": False,
         "formal_baseline": "NOT_READY",
     }
+    try:
+        config_for_rules = load_config(config_file) if config_file.is_file() else None
+    except Exception as exc:
+        config_for_rules = None
+        report["research_rules_status"] = f"UNAVAILABLE_{type(exc).__name__}"
+    if config_for_rules is not None:
+        strategy_rules = config_for_rules["strategy"]
+        lookback = int(strategy_rules["lookback_sessions"])
+        report["research_rules_status"] = "RECORDED_FROM_CONFIG_AND_IMPLEMENTATION"
+        report["research_rules"] = {
+            "baseline_ranking": {
+                "metric": "momentum",
+                "sort_order": ["momentum DESC", "symbol ASC"],
+                "minimum_momentum": float(strategy_rules.get("min_momentum", 0.0)),
+                "max_positions": int(strategy_rules["max_positions"]),
+            },
+            "h1_filter": {
+                "rule": "同一原候选池中仅保留 H1 窗口状态为 COMPLETE 的证券；排除窗口含停牌记录的候选后按相同顺序重排",
+                "lookback_sessions": lookback,
+                "required_open_session_count": lookback + 1,
+                "suspension_policy": "有停牌记录即排除；状态未知、窗口不完整或价格口径无效不得视为非停牌",
+                "scope": "只在冻结配置生成的原候选池内筛选，不引入池外证券",
+            },
+        }
     try:
         readiness = _forward_input_readiness(
             classification=classification,
@@ -100,6 +174,8 @@ def create_paper_ranking_artifact(
         report["readiness_checks"] = readiness["checks"]
         report["data_trust"] = readiness["data_trust"]
         report["source_data_capture_time_utc"] = readiness.get("source_data_capture_time_utc")
+        report["provider_published_at_utc"] = readiness.get("provider_published_at_utc")
+        report["provider_publication_evidence"] = readiness.get("provider_publication_evidence", "UNVERIFIED")
         if readiness["blocking_reasons"]:
             report["status"] = "NEEDS_DATA" if classification == "FORWARD_PAPER" else "FAILED_INPUT"
             report["blocking_reasons"] = readiness["blocking_reasons"]
@@ -148,6 +224,7 @@ def create_paper_ranking_artifact(
                     "excluded_by_status": audit.loc[~audit["included_in_ranking_scope"], "window_status"].value_counts().to_dict(),
                     "suspended_window_symbols": int(audit["window_status"].eq("COMPLETE_WITH_SUSPENSION").sum()),
                 }
+                report["h1_filter_rule"] = report.get("research_rules", {}).get("h1_filter")
                 rank_symbols = set(audit.loc[audit["included_in_ranking_scope"], "symbol"].astype(str))
                 bars = bars.loc[bars["symbol"].astype(str).isin(rank_symbols)].copy()
                 if not rank_symbols:
@@ -179,6 +256,23 @@ def create_paper_ranking_artifact(
             ranking.to_csv(ranking_path, index=False)
             report["ranking_file_sha256"] = _sha256(ranking_path)
             report["ranking_file"] = "ranking.csv"
+            if classification == "FORWARD_PAPER":
+                assert audit is not None
+                h1_ranking, ranking_difference, h1_summary = _build_h1_ranking_comparison(
+                    ranking, audit, max_positions=int(config["strategy"]["max_positions"]),
+                )
+                h1_path = staging / "h1-ranking.csv"
+                difference_path = staging / "ranking-difference.csv"
+                h1_ranking.to_csv(h1_path, index=False)
+                ranking_difference.to_csv(difference_path, index=False)
+                report["h1_ranking_file"] = "h1-ranking.csv"
+                report["h1_ranking_file_sha256"] = _sha256(h1_path)
+                report["ranking_difference_file"] = "ranking-difference.csv"
+                report["ranking_difference_file_sha256"] = _sha256(difference_path)
+                report["h1_candidate_count"] = int(len(h1_ranking))
+                report["h1_top_n_changed"] = h1_summary["top_n_changed"]
+                report["removed_from_original_top_n"] = h1_summary["removed_from_original_top_n"]
+                report["added_to_h1_top_n"] = h1_summary["added_to_h1_top_n"]
             report["strategy_config"] = {
                 "name": config.get("strategy", {}).get("name"),
                 "lookback_sessions": config.get("strategy", {}).get("lookback_sessions"),
@@ -190,12 +284,16 @@ def create_paper_ranking_artifact(
             report.pop("ranking_file", None)
             report["ranking_file_sha256"] = None
             (staging / "ranking.csv").unlink(missing_ok=True)
+            (staging / "h1-ranking.csv").unlink(missing_ok=True)
+            (staging / "ranking-difference.csv").unlink(missing_ok=True)
         if config_file.is_file() and report["config_sha256"] != _sha256(config_file):
             report["status"] = "FAILED_INPUT_CHANGED_DURING_RUN"
             report.setdefault("blocking_reasons", []).append("配置文件在生成排名期间发生变化")
             report.pop("ranking_file", None)
             report["ranking_file_sha256"] = None
             (staging / "ranking.csv").unlink(missing_ok=True)
+            (staging / "h1-ranking.csv").unlink(missing_ok=True)
+            (staging / "ranking-difference.csv").unlink(missing_ok=True)
         if capture_file is not None:
             current_capture_hash = _sha256(capture_file) if capture_file.is_file() else None
             if report["source_capture_manifest_sha256"] != current_capture_hash:
@@ -204,6 +302,8 @@ def create_paper_ranking_artifact(
                 report.pop("ranking_file", None)
                 report["ranking_file_sha256"] = None
                 (staging / "ranking.csv").unlink(missing_ok=True)
+                (staging / "h1-ranking.csv").unlink(missing_ok=True)
+                (staging / "ranking-difference.csv").unlink(missing_ok=True)
         for label, input_file, key in (
             ("交易日历", calendar_file, "trading_calendar_sha256"),
             ("点时股票池", universe_file, "universe_sha256"),
@@ -216,6 +316,8 @@ def create_paper_ranking_artifact(
                     report.pop("ranking_file", None)
                     report["ranking_file_sha256"] = None
                     (staging / "ranking.csv").unlink(missing_ok=True)
+                    (staging / "h1-ranking.csv").unlink(missing_ok=True)
+                    (staging / "ranking-difference.csv").unlink(missing_ok=True)
         report["finished_at_utc"] = _iso_utc(datetime.now(timezone.utc))
         manifest_path = staging / "paper-ranking-manifest.json"
         manifest_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -230,6 +332,8 @@ def create_paper_ranking_artifact(
         report.pop("ranking_file", None)
         report["ranking_file_sha256"] = None
         (staging / "ranking.csv").unlink(missing_ok=True)
+        (staging / "h1-ranking.csv").unlink(missing_ok=True)
+        (staging / "ranking-difference.csv").unlink(missing_ok=True)
         report["finished_at_utc"] = _iso_utc(datetime.now(timezone.utc))
         (staging / "paper-ranking-manifest.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         try:
@@ -286,10 +390,14 @@ def _forward_input_readiness(
         checks["after_daily_close"] = "VERIFIED_AT_RUNTIME_ONLY"
     if capture_file is None:
         checks["source_capture_manifest"] = "NOT_PROVIDED"
+        checks["local_capture_time"] = "NOT_AVAILABLE"
+        checks["provider_publication_time"] = "UNVERIFIED"
         reasons.append("缺少绑定行情文件与本机抓取时间的数据清单")
         return {"checks": checks, "blocking_reasons": reasons, "data_trust": "UNVERIFIED"}
     if not capture_file.is_file():
         checks["source_capture_manifest"] = "MISSING"
+        checks["local_capture_time"] = "NOT_AVAILABLE"
+        checks["provider_publication_time"] = "UNVERIFIED"
         reasons.append("行情抓取清单文件不存在")
         return {"checks": checks, "blocking_reasons": reasons, "data_trust": "UNVERIFIED"}
     try:
@@ -322,11 +430,14 @@ def _forward_input_readiness(
         else:
             checks["external_timestamp_claim"] = "UNVERIFIED"
         checks["provider_publication_time"] = "UNVERIFIED" if not capture.get("provider_published_at_utc") else "RECORDED_SOURCE_UNVERIFIED"
+        checks["local_capture_time"] = "RECORDED_IN_CAPTURE_MANIFEST"
         return {
             "checks": checks,
             "blocking_reasons": reasons,
             "data_trust": "LOCAL_CAPTURE_TIME_BOUND_PROVIDER_PUBLICATION_UNVERIFIED",
             "source_data_capture_time_utc": _iso_utc(captured),
+            "provider_published_at_utc": capture.get("provider_published_at_utc"),
+            "provider_publication_evidence": checks["provider_publication_time"],
         }
     except Exception as exc:
         checks["source_capture_manifest"] = "FAILED"

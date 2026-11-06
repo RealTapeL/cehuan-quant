@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from cehuan.research.forward_ranking import create_paper_ranking_artifact
+from cehuan.research.forward_ranking import _build_h1_ranking_comparison, create_paper_ranking_artifact
 
 
 def _bars_csv(path: Path) -> tuple[Path, str]:
@@ -77,6 +77,11 @@ def test_forward_ranking_without_capture_manifest_creates_needs_data_record(tmp_
     manifest = result["manifest"]
     assert manifest["status"] == "NEEDS_DATA"
     assert manifest["candidate_count"] == 0
+    assert manifest["research_rules_status"] == "RECORDED_FROM_CONFIG_AND_IMPLEMENTATION"
+    assert manifest["research_rules"]["h1_filter"]["required_open_session_count"] == 21
+    assert manifest["readiness_checks"]["local_capture_time"] == "NOT_AVAILABLE"
+    assert manifest["readiness_checks"]["provider_publication_time"] == "UNVERIFIED"
+    assert manifest["provider_published_at_utc"] is None
     assert not (Path(result["output_dir"]) / "ranking.csv").exists()
     assert "尚未到收盘数据稳定等待时间" in " ".join(manifest["blocking_reasons"])
 
@@ -105,7 +110,77 @@ def test_forward_ranking_requires_bound_same_day_capture_and_marks_unsigned_time
     assert manifest["readiness_checks"]["capture_manifest_data_hash"] == "VERIFIED"
     assert manifest["data_trust"] == "LOCAL_CAPTURE_TIME_BOUND_PROVIDER_PUBLICATION_UNVERIFIED"
     assert manifest["trusted_external_timestamp"] == "UNVERIFIED"
+    assert manifest["readiness_checks"]["local_capture_time"] == "RECORDED_IN_CAPTURE_MANIFEST"
+    assert manifest["provider_publication_evidence"] == "UNVERIFIED"
+    assert manifest["provider_published_at_utc"] is None
     assert manifest["independent_holdout"] is False
+
+
+def test_h1_forward_comparison_excludes_suspension_and_reranks_same_pool() -> None:
+    baseline = pd.DataFrame([
+        {"signal_date": "2026-11-05", "symbol": "SH600001", "momentum": 0.2, "rank": 1, "selected_target": True},
+        {"signal_date": "2026-11-05", "symbol": "SZ000001", "momentum": 0.1, "rank": 2, "selected_target": False},
+    ])
+    audit = pd.DataFrame([
+        {"symbol": "SH600001", "window_status": "COMPLETE_WITH_SUSPENSION"},
+        {"symbol": "SZ000001", "window_status": "COMPLETE"},
+    ])
+
+    h1, difference, metadata = _build_h1_ranking_comparison(baseline, audit, max_positions=1)
+
+    assert h1["symbol"].tolist() == ["SZ000001"]
+    assert h1["rank"].tolist() == [1]
+    assert metadata == {
+        "top_n_changed": True,
+        "removed_from_original_top_n": ["SH600001"],
+        "added_to_h1_top_n": ["SZ000001"],
+    }
+    removed = difference.loc[difference["symbol"].eq("SH600001")].iloc[0]
+    assert removed["top_n_change"] == "FILTERED_BY_H1"
+    assert removed["direct_reason"] == "21 日窗口含停牌记录"
+
+
+def test_forward_capture_writes_baseline_h1_and_difference_artifacts(tmp_path: Path) -> None:
+    bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
+    bars = pd.read_csv(bars_path)
+    suspension_date = sorted(bars["trade_date"].unique())[-2]
+    bars.loc[bars["symbol"].eq("SH600001") & bars["trade_date"].eq(suspension_date), "is_suspended"] = True
+    bars.to_csv(bars_path, index=False)
+    config_source = Path(__file__).resolve().parents[1] / "configs/default.toml"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(config_source.read_text(encoding="utf-8").replace("max_positions = 5", "max_positions = 1"), encoding="utf-8")
+    capture = tmp_path / "capture.json"
+    capture.write_text(json.dumps({
+        "source_id": "synthetic-provider-fixture",
+        "captured_at_utc": "2026-11-05T07:05:00Z",
+        "data_file_sha256": _sha(bars_path),
+        "trusted_external_timestamp": "UNVERIFIED",
+        "provider_published_at_utc": None,
+    }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars_path, signal_date)
+
+    result = create_paper_ranking_artifact(
+        bars_path=bars_path, config_path=config_path, signal_date=signal_date,
+        output_dir=tmp_path / "forward-with-h1", classification="FORWARD_PAPER",
+        source_capture_manifest_path=capture, trading_calendar_path=calendar,
+        universe_path=universe,
+        now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
+    )
+    out = Path(result["output_dir"])
+    manifest = result["manifest"]
+    baseline = pd.read_csv(out / "ranking.csv")
+    h1 = pd.read_csv(out / "h1-ranking.csv")
+    diff = pd.read_csv(out / "ranking-difference.csv")
+
+    assert manifest["status"] == "CAPTURED"
+    assert manifest["h1_top_n_changed"] is True
+    assert manifest["removed_from_original_top_n"] == ["SH600001"]
+    assert manifest["added_to_h1_top_n"] == ["SZ000001"]
+    assert baseline.loc[0, "symbol"] == "SH600001"
+    assert h1.loc[0, "symbol"] == "SZ000001"
+    assert manifest["h1_ranking_file_sha256"] == _sha(out / "h1-ranking.csv")
+    assert manifest["ranking_difference_file_sha256"] == _sha(out / "ranking-difference.csv")
+    assert diff.loc[diff["symbol"].eq("SH600001"), "direct_reason"].iloc[0] == "21 日窗口含停牌记录"
 
 
 def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

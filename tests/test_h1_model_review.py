@@ -4,6 +4,7 @@ import json
 
 from cehuan.research.h1_model_review import (
     ReviewResponseFailure,
+    audit_saved_review_quality,
     _build_review_prompt,
     _parse_and_validate_review,
     _request_failure_audit,
@@ -58,14 +59,36 @@ def test_h1_summary_keeps_unknown_suspension_separate_from_non_suspension() -> N
     assert counts["unknown_suspension_windows"] == 1
     assert summary["removed_from_top5"] == ["SH603268"]
     assert summary["added_to_top5"] == ["SH600001"]
+    assert summary["removed_from_top5_details"] == [{
+        "symbol": "SH603268", "original_rank": 1,
+        "reason_codes": ["SUSPENDED_IN_WINDOW"],
+        "direct_reason": "21 日窗口含停牌记录",
+    }]
 
 
 def _review_facts() -> dict:
     return {
         "signal_days": [
-            {"signal_date": "2024-11-05", "top5_changed": True},
-            {"signal_date": "2024-12-03", "top5_changed": True},
-            {"signal_date": "2024-12-31", "top5_changed": False},
+            {
+                "signal_date": "2024-11-05", "top5_changed": True,
+                "original_top5": [{"symbol": "SH603268"}, {"symbol": "SZ300489"}],
+                "h1_top5": [{"symbol": "SZ002094"}, {"symbol": "SZ002583"}],
+                "removed_from_top5": ["SH603268", "SZ300489"],
+                "added_to_top5": ["SZ002094", "SZ002583"],
+                "removed_from_top5_details": [{"symbol": "SH603268", "reason_codes": ["SUSPENDED_IN_WINDOW"]}],
+            },
+            {
+                "signal_date": "2024-12-03", "top5_changed": True,
+                "original_top5": [{"symbol": "SH600889"}, {"symbol": "SZ000833"}],
+                "h1_top5": [{"symbol": "SH603955"}, {"symbol": "SZ000833"}],
+                "removed_from_top5": ["SH600889"], "added_to_top5": ["SH603955"],
+                "removed_from_top5_details": [{"symbol": "SH600889", "reason_codes": ["SUSPENDED_IN_WINDOW"]}],
+            },
+            {
+                "signal_date": "2024-12-31", "top5_changed": False,
+                "original_top5": [{"symbol": "SH600001"}], "h1_top5": [{"symbol": "SH600001"}],
+                "removed_from_top5": [], "added_to_top5": [], "removed_from_top5_details": [],
+            },
         ],
         "evidence_catalog": {
             "H1_RANK_EFFECT_20241105": {},
@@ -79,13 +102,20 @@ def _review_facts() -> dict:
 
 def _valid_review_payload() -> dict:
     facts = _review_facts()
+    interpretations = {
+        "2024-11-05": "2024-11-05，SH603268 因 21 日窗口含停牌记录被移出；SZ300489 也被移出，SZ002094 和 SZ002583 补入。",
+        "2024-12-03": "2024-12-03，SH600889 因停牌窗口被移出，SH603955 补入；这只说明候选排序变化。",
+        "2024-12-31": "2024-12-31，SH600001 仍在 Top-5，名单未变。",
+    }
     return {
         "schema": "cehuan.h1_model_review.v1",
         "review_status": "NEEDS_DATA",
         "ranking_effects": [
-            {"signal_date": day, "top5_changed": changed, "interpretation": "观察到名单变化。",
-             "fact_ids": [f"H1_RANK_EFFECT_{day.replace('-', '')}"]}
-            for day, changed in ((row["signal_date"], row["top5_changed"]) for row in facts["signal_days"])
+            {"signal_date": row["signal_date"], "top5_changed": row["top5_changed"],
+             "removed_symbols": row["removed_from_top5"], "added_symbols": row["added_to_top5"],
+             "interpretation": interpretations[row["signal_date"]],
+             "fact_ids": [f"H1_RANK_EFFECT_{row['signal_date'].replace('-', '')}"]}
+            for row in facts["signal_days"]
         ],
         "focal_threshold_review": {
             "symbol": "SH603268", "candidate_momentum": 2.8, "proposed_min_momentum": 0.5,
@@ -104,6 +134,7 @@ def test_synthetic_model_review_response_passes_existing_strict_contract() -> No
 
     assert payload["review_status"] == "NEEDS_DATA"
     assert len(payload["ranking_effects"]) == 3
+    assert payload["ranking_effects"][0]["removed_symbols"] == ["SH603268", "SZ300489"]
 
 
 def test_synthetic_missing_field_has_safe_location() -> None:
@@ -145,6 +176,57 @@ def test_synthetic_fact_conflict_is_rejected_at_conflicting_field() -> None:
         raise AssertionError("模型输出不能覆盖程序计算的排名变化事实")
 
 
+def test_synthetic_removed_added_fact_conflict_is_rejected() -> None:
+    payload = _valid_review_payload()
+    payload["ranking_effects"][0]["removed_symbols"] = ["SH600001"]
+    try:
+        _parse_and_validate_review(json.dumps(payload), _review_facts())
+    except ReviewResponseFailure as exc:
+        assert exc.code == "PROGRAM_FACT_CONFLICT"
+        assert exc.field == "ranking_effects[0].removed_symbols"
+    else:
+        raise AssertionError("模型不能改写证券移入/移出事实")
+
+
+def test_synthetic_prompt_template_echo_is_rejected_without_relaxing_contract() -> None:
+    payload = _valid_review_payload()
+    payload["ranking_effects"][0]["interpretation"] = "根据所引程序事实解释变化或未变化，不声称收益改善。"
+    try:
+        _parse_and_validate_review(json.dumps(payload), _review_facts())
+    except ReviewResponseFailure as exc:
+        assert exc.code == "TEMPLATE_ECHO"
+        assert exc.field == "ranking_effects[0].interpretation"
+    else:
+        raise AssertionError("照抄模板的逐日解释必须被拒绝")
+
+
+def test_synthetic_unsupported_security_and_date_references_are_rejected() -> None:
+    payload = _valid_review_payload()
+    payload["ranking_effects"][0]["interpretation"] = (
+        "2024-11-05，SH999999 被移出，SH603268 因停牌移出；SZ300489 被移出，SZ002094 和 SZ002583 补入。"
+    )
+    try:
+        _parse_and_validate_review(json.dumps(payload), _review_facts())
+    except ReviewResponseFailure as exc:
+        assert exc.code == "UNSUPPORTED_SECURITY_REFERENCE"
+    else:
+        raise AssertionError("未出现在该日程序结果中的证券必须被拒绝")
+
+
+def test_synthetic_claim_that_h1_proves_returns_is_rejected() -> None:
+    payload = _valid_review_payload()
+    payload["ranking_effects"][0]["interpretation"] = (
+        "2024-11-05，SH603268 因 21 日窗口含停牌记录被移出；SZ300489 被移出，"
+        "SZ002094 和 SZ002583 补入，这证明了收益提升。"
+    )
+    try:
+        _parse_and_validate_review(json.dumps(payload), _review_facts())
+    except ReviewResponseFailure as exc:
+        assert exc.code == "UNSUPPORTED_PERFORMANCE_OR_EXECUTION_CLAIM"
+    else:
+        raise AssertionError("候选排名差异不能被描述为收益提升证据")
+
+
 def test_synthetic_invalid_json_is_separate_from_content_validation() -> None:
     try:
         _parse_and_validate_review('{"schema":', _review_facts())
@@ -169,6 +251,14 @@ def test_prompt_example_matches_all_dates_values_and_sorted_fact_ids() -> None:
     assert [item["top5_changed"] for item in example["ranking_effects"]] == [
         item["top5_changed"] for item in facts["signal_days"]
     ]
+    assert [item["removed_symbols"] for item in example["ranking_effects"]] == [
+        item["removed_from_top5"] for item in facts["signal_days"]
+    ]
+    assert [item["added_symbols"] for item in example["ranking_effects"]] == [
+        item["added_to_top5"] for item in facts["signal_days"]
+    ]
+    assert "禁止复制此说明文字" in prompt
+    assert "直接窗口原因" in prompt
     assert example["fact_ids"] == sorted(set(example["fact_ids"]))
     assert "顶层 fact_ids 必须排序且去重" in prompt
 
@@ -183,3 +273,18 @@ def test_request_failure_metadata_never_includes_exception_message() -> None:
         "failure_type": "RuntimeError",
     }
     assert "sensitive" not in json.dumps(safe)
+
+
+def test_saved_previous_review_is_classified_insufficient_when_it_echoes_template() -> None:
+    previous = _valid_review_payload()
+    for row in previous["ranking_effects"]:
+        row.pop("removed_symbols")
+        row.pop("added_symbols")
+        row["interpretation"] = "根据所引程序事实解释变化或未变化，不声称收益改善。"
+
+    quality = audit_saved_review_quality(previous, _review_facts())
+
+    assert quality["status"] == "INSUFFICIENT"
+    assert quality["model_called"] is False
+    assert all("TEMPLATE_ECHO" in row["quality_issues"] for row in quality["per_signal_findings"])
+    assert all("MISSING_CONCRETE_CHANGE_FIELDS" in row["quality_issues"] for row in quality["per_signal_findings"])
