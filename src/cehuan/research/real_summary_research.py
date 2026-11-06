@@ -346,7 +346,7 @@ def _load_frozen_summary(
         raise ValueError("摘要安全标记不满足脱敏研究输入边界，拒绝发送")
     if verify_reconstruction:
         rebuilder = summary_rebuilder or build_real_market_summary
-        rebuilt = rebuilder(summary.get("summary_id", ""))
+        rebuilt = rebuilder(summary_id=summary.get("summary_id", ""))
         if summary != rebuilt:
             raise ValueError("冻结摘要与当前来源文件经策环适配器重建的内容不一致；拒绝发送，需重新生成摘要")
     return summary

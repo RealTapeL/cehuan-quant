@@ -198,6 +198,9 @@ def test_frozen_summary_rechecks_all_source_hashes_before_reuse(tmp_path: Path):
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
     loaded = _load_frozen_summary(summary_path, repository_root=tmp_path, verify_reconstruction=False)
     assert loaded["classification"] == REAL_SUMMARY_CLASSIFICATION
+    assert _load_frozen_summary(
+        summary_path, repository_root=tmp_path, summary_rebuilder=lambda *, summary_id: summary
+    ) == summary
 
     rebuilt = dict(summary)
     altered = dict(summary)
@@ -207,7 +210,7 @@ def test_frozen_summary_rechecks_all_source_hashes_before_reuse(tmp_path: Path):
         _load_frozen_summary(
             summary_path,
             repository_root=tmp_path,
-            summary_rebuilder=lambda summary_id: rebuilt,
+            summary_rebuilder=lambda *, summary_id: rebuilt,
         )
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
