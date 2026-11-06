@@ -63,7 +63,9 @@ def validate_strategy_hypothesis(payload: Mapping[str, Any]) -> dict[str, Any]:
     for index, evidence in enumerate(payload["evidence"]):
         if not isinstance(evidence, Mapping):
             raise ValueError(f"evidence[{index}] 必须是对象")
-        if set(evidence) != {"description", "artifact_sha256", "evidence_status"}:
+        required_evidence_fields = {"description", "artifact_sha256", "evidence_status"}
+        optional_evidence_fields = {"source_fact_id"}
+        if not required_evidence_fields.issubset(evidence) or set(evidence) - required_evidence_fields - optional_evidence_fields:
             raise ValueError(f"evidence[{index}] 字段与假设 schema 不一致")
         if not isinstance(evidence["description"], str):
             raise ValueError(f"evidence[{index}].description 必须是字符串")
@@ -71,6 +73,10 @@ def validate_strategy_hypothesis(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"evidence[{index}].artifact_sha256 必须是 SHA-256")
         if evidence["evidence_status"] not in {"RECORDED", "RECONSTRUCTED", "UNVERIFIED", "SYNTHETIC"}:
             raise ValueError(f"evidence[{index}].evidence_status 不受支持")
+        if "source_fact_id" in evidence and (
+            not isinstance(evidence["source_fact_id"], str) or not evidence["source_fact_id"].strip()
+        ):
+            raise ValueError(f"evidence[{index}].source_fact_id 必须是非空字符串")
     if not isinstance(payload["required_data"], list) or not isinstance(payload["known_limitations"], list):
         raise ValueError("required_data 与 known_limitations 必须是列表")
     if not all(isinstance(value, str) for value in payload["required_data"] + payload["known_limitations"]):

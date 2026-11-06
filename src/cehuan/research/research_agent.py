@@ -27,7 +27,7 @@ INPUT_REQUIRED = {
     "frozen_strategy", "prior_experiments", "known_data_gaps", "allowed_actions",
     "forbidden_actions",
 }
-INPUT_OPTIONAL = {"review_summary", "experiment_capabilities"}
+INPUT_OPTIONAL = {"review_summary", "experiment_capabilities", "market_research_summary"}
 TRUST_FIELDS = {
     "input_file_integrity", "canonical_data_quality", "checkpoint_binding",
     "historical_availability_and_vendor_vintage", "market_rule_coverage", "fee_coverage",
@@ -114,6 +114,46 @@ def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, An
         raise ValueError("研究 Agent 输入必须完整禁止策略修改、无审批回测和券商操作")
     if "review_summary" in payload and payload["review_summary"] is not None and not isinstance(payload["review_summary"], Mapping):
         raise ValueError("review_summary 必须是对象或 null")
+    if "market_research_summary" in payload:
+        summary = payload["market_research_summary"]
+        if not isinstance(summary, Mapping) or set(summary) != {
+            "schema", "summary_id", "summary_sha256", "classification", "facts", "evidence_catalog",
+        }:
+            raise ValueError("market_research_summary 字段不符合真实摘要输入契约")
+        if summary.get("schema") != "cehuan.real_market_research_summary_input.v1":
+            raise ValueError("market_research_summary schema 不支持")
+        if summary.get("classification") != "REAL_MARKET_DATA_RESEARCH_SUMMARY_NOT_FORMAL_BACKTEST":
+            raise ValueError("真实摘要 classification 不正确")
+        if not isinstance(summary.get("summary_id"), str) or not summary["summary_id"].strip():
+            raise ValueError("market_research_summary.summary_id 必须为非空字符串")
+        summary_digest = summary.get("summary_sha256")
+        if not isinstance(summary_digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", summary_digest):
+            raise ValueError("market_research_summary.summary_sha256 必须是 SHA-256")
+        if not isinstance(summary.get("facts"), Mapping):
+            raise ValueError("market_research_summary.facts 必须是对象")
+        catalog = summary.get("evidence_catalog")
+        if not isinstance(catalog, list) or not catalog:
+            raise ValueError("真实摘要必须包含非空 evidence_catalog")
+        fact_ids: set[str] = set()
+        for index, fact in enumerate(catalog):
+            if not isinstance(fact, Mapping) or set(fact) != {
+                "fact_id", "statement", "artifact_sha256", "evidence_status",
+            }:
+                raise ValueError(f"market_research_summary.evidence_catalog[{index}] 字段无效")
+            fact_id = fact.get("fact_id")
+            digest = fact.get("artifact_sha256")
+            status = fact.get("evidence_status")
+            if not isinstance(fact_id, str) or not fact_id.strip() or fact_id in fact_ids:
+                raise ValueError(f"market_research_summary.evidence_catalog[{index}].fact_id 无效或重复")
+            if not isinstance(fact.get("statement"), str) or not fact["statement"].strip():
+                raise ValueError(f"market_research_summary.evidence_catalog[{index}].statement 无效")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError(f"market_research_summary.evidence_catalog[{index}].artifact_sha256 必须是 SHA-256")
+            if status not in {"RECORDED", "RECONSTRUCTED", "UNVERIFIED"}:
+                raise ValueError(f"market_research_summary.evidence_catalog[{index}].evidence_status 无效")
+            fact_ids.add(fact_id)
+        if trust.get("overall") != "REAL_MARKET_DATA_RESEARCH_SUMMARY_NOT_FORMAL_BACKTEST":
+            raise ValueError("真实行情摘要必须标记为 REAL_MARKET_DATA_RESEARCH_SUMMARY_NOT_FORMAL_BACKTEST")
     if "experiment_capabilities" in payload:
         capabilities = payload["experiment_capabilities"]
         if not isinstance(capabilities, Mapping) or set(capabilities) != {
@@ -163,6 +203,16 @@ def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, An
             if path.startswith("strategy.") and frozen["parameters"].get(path.split(".", 1)[1]) != parameter["current_value"]:
                 raise ValueError(f"experiment_capabilities 当前值与冻结策略参数不一致：{path}")
     return dict(payload)
+
+
+def _is_synthetic_research_input(payload: Mapping[str, Any]) -> bool:
+    trust = payload.get("data_trust", {})
+    if not isinstance(trust, Mapping):
+        return False
+    if str(trust.get("overall", "")).startswith("SYNTHETIC"):
+        return True
+    input_integrity = trust.get("input_file_integrity", {})
+    return isinstance(input_integrity, Mapping) and input_integrity.get("status") == "SYNTHETIC"
 
 
 @dataclass(frozen=True)
@@ -377,17 +427,16 @@ def build_hypothesis_prompt(
     experiment_id: str,
 ) -> str:
     output_schema = json.loads(HYPOTHESIS_SCHEMA_PATH.read_text(encoding="utf-8"))
+    real_summary = input_payload.get("market_research_summary")
+    synthetic_input = _is_synthetic_research_input(input_payload)
     phase_instruction = (
+        "基于真实市场数据的脱敏研究摘要提出一条可检验假设；只引用 market_research_summary.evidence_catalog 中的 fact_id。因为历史 vintage、时点、市场规则、费用和公司行动存在未核实项，本路径的假设状态必须为 NEEDS_DATA，不运行收益比较。参数变化只能来自 experiment_capabilities.supported_parameters。"
+        if real_summary else
         "根据研究目标提出假设；参数必须来自输入中的 experiment_capabilities.supported_parameters，且只提出能力清单允许数量的配置改动。"
         if phase == "initial" else
         "根据复盘摘要中的程序事实提出下一轮待验证研究假设；只使用 program_facts 明示的实验/成交事实，null 或缺失指标代表不可用，不得补写成事实；参数必须来自 experiment_capabilities.supported_parameters。证据不足时使用 NEEDS_DATA。"
     )
-    synthetic_evidence_template = {
-        "description": "仅用于验证流程的策环合成数据，不是市场证据",
-        "artifact_sha256": input_data_digest,
-        "evidence_status": "SYNTHETIC",
-    }
-    return "\n".join([
+    prompt_lines = [
         "输出一个 JSON 对象，匹配 strategy-research-hypothesis.schema.json，不要 Markdown 围栏。",
         "输出 JSON Schema：",
         json.dumps(output_schema, ensure_ascii=False, sort_keys=True),
@@ -395,14 +444,38 @@ def build_hypothesis_prompt(
         f"hypothesis_id 必须是 {input_payload['research_id']}-{phase}-hypothesis。",
         f"experiment_id 必须是 {experiment_id}。",
         f"input_data_digest 必须是 {input_data_digest}。",
-        "evidence 是必填字段。当前研究输入为合成数据，evidence 必须至少包含一项，且每项必须使用 evidence_status=SYNTHETIC、artifact_sha256 精确等于本条消息中的 input_data_digest。请逐字使用以下程序提供的证据对象，不要改写散列或标签：",
-        json.dumps(synthetic_evidence_template, ensure_ascii=False, sort_keys=True),
         "proposed_changes 只能引用 experiment_capabilities 中的参数；未列入的规则可以作为待实现建议说明，但不能写入拟执行改动。不要输出订单、交易股数、券商指令、代码或工具调用。",
-        "保留 data_trust 中的 UNVERIFIED、FALLBACK_USED、NOT_READY 和所有合成数据限制。",
         "Agent 不能修改当前有效策略；human_review_required=true、may_modify_active_strategy=false、may_generate_orders=false。",
+    ]
+    if real_summary:
+        prompt_lines.extend([
+            "本次是基于真实历史行情文件摘要的研究，不是合成行情，也不是完整真实收益验证。输入只包含脱敏聚合摘要和少量重建排名，不含原始行情行、华泰数据、账户资料或订单。",
+            "evidence 必须至少一项；每一项都必须带 source_fact_id，且该 ID 必须存在于 market_research_summary.evidence_catalog。artifact_sha256 和 evidence_status 必须与所引用目录条目逐字一致，不得另造来源。",
+            "模型对数据的解释属于建议；可量化事实只能引用摘要目录。不得把回退规则、名称字段、公告日期或适配器 available_at 假设说成已核实的历史事实。",
+            "保留所有 UNVERIFIED、FALLBACK_USED、NOT_READY 和事后重建限制；status 必须是 NEEDS_DATA。",
+        ])
+    elif synthetic_input:
+        synthetic_evidence_template = {
+            "description": "仅用于验证流程的策环合成数据，不是市场证据",
+            "artifact_sha256": input_data_digest,
+            "evidence_status": "SYNTHETIC",
+        }
+        prompt_lines.extend([
+            "上述行情、规则、基线、候选、计划、成交和持仓均为合成或项目默认假设。",
+            "evidence 是必填字段。当前研究输入为合成数据，evidence 必须至少包含一项，且每项必须使用 evidence_status=SYNTHETIC、artifact_sha256 精确等于本条消息中的 input_data_digest。请逐字使用以下程序提供的证据对象，不要改写散列或标签：",
+            json.dumps(synthetic_evidence_template, ensure_ascii=False, sort_keys=True),
+            "保留 data_trust 中的 UNVERIFIED、FALLBACK_USED、NOT_READY 和所有合成数据限制。",
+        ])
+    else:
+        prompt_lines.extend([
+            "程序计算事实来自保存的 CSV/JSON；Agent 文字是研究建议，不是数据事实。",
+            "保留 data_trust 中的 UNVERIFIED、FALLBACK_USED、NOT_READY 和所有数据限制。",
+        ])
+    prompt_lines.extend([
         "研究输入 JSON：",
         json.dumps(input_payload, ensure_ascii=False, sort_keys=True),
     ])
+    return "\n".join(prompt_lines)
 
 
 def generate_validated_hypothesis(
@@ -452,7 +525,7 @@ def generate_validated_hypothesis(
             hypothesis["known_limitations"] = list(dict.fromkeys([
                 *hypothesis["known_limitations"], *mandatory_limitations,
             ]))
-            synthetic_input = str(trust.get("overall", "")).startswith("SYNTHETIC")
+            synthetic_input = _is_synthetic_research_input(validated_input)
             if synthetic_input:
                 invalid_status = [
                     index for index, evidence in enumerate(hypothesis["evidence"])
@@ -471,6 +544,40 @@ def generate_validated_hypothesis(
                     if invalid_digest:
                         details.append(f"artifact_sha256 必须等于本轮输入摘要（错误项 {invalid_digest}）")
                     raise ValueError("合成研究 evidence 校验失败：" + "；".join(details))
+            elif "market_research_summary" in validated_input:
+                market_summary = validated_input["market_research_summary"]
+                catalog = {
+                    item["fact_id"]: item for item in market_summary["evidence_catalog"]
+                }
+                if not hypothesis["evidence"]:
+                    raise ValueError("真实行情摘要研究必须引用至少一项 evidence_catalog 事实")
+                invalid_refs = []
+                invalid_hashes = []
+                invalid_statuses = []
+                missing_refs = []
+                for index, evidence in enumerate(hypothesis["evidence"]):
+                    fact_id = evidence.get("source_fact_id")
+                    if not isinstance(fact_id, str) or fact_id not in catalog:
+                        missing_refs.append(index)
+                        continue
+                    source_fact = catalog[fact_id]
+                    if evidence["artifact_sha256"] != source_fact["artifact_sha256"]:
+                        invalid_hashes.append(index)
+                    if evidence["evidence_status"] != source_fact["evidence_status"]:
+                        invalid_statuses.append(index)
+                    if evidence["evidence_status"] == "SYNTHETIC":
+                        invalid_statuses.append(index)
+                if missing_refs or invalid_hashes or invalid_statuses:
+                    problems = []
+                    if missing_refs:
+                        problems.append(f"source_fact_id 不在摘要证据目录中（错误项 {missing_refs}）")
+                    if invalid_hashes:
+                        problems.append(f"artifact_sha256 与所引事实来源不一致（错误项 {invalid_hashes}）")
+                    if invalid_statuses:
+                        problems.append(f"evidence_status 与摘要事实不一致或误标为 SYNTHETIC（错误项 {sorted(set(invalid_statuses))}）")
+                    raise ValueError("真实行情摘要 evidence 校验失败：" + "；".join(problems))
+                if hypothesis["status"] != "NEEDS_DATA":
+                    raise ValueError("当前真实摘要仍有时点、规则、费率或公司行动缺口，研究假设 status 必须为 NEEDS_DATA")
             attempts.append({"attempt": attempt + 1, "status": "VALIDATED", "usage": reply.usage})
             audit = {
                 "provider": reply.provider,
@@ -491,7 +598,7 @@ def generate_validated_hypothesis(
         except Exception as exc:
             attempts.append({
                 "attempt": attempt + 1,
-                "status": "REJECTED",
+                "status": "REQUEST_FAILED" if isinstance(exc, ResearchModelRequestError) else "REJECTED",
                 "reason": str(exc)[:300],
                 "usage": reply.usage if reply else None,
             })
@@ -501,11 +608,18 @@ def generate_validated_hypothesis(
                 break
             if attempt >= max_retries:
                 break
+            correction = (
+                "真实摘要路径要求 source_fact_id 必须来自 market_research_summary.evidence_catalog，artifact_sha256 和 evidence_status 必须与目录一致，status 必须为 NEEDS_DATA。"
+                if "market_research_summary" in validated_input else
+                f"本轮 evidence 必须使用 evidence_status=SYNTHETIC 且 artifact_sha256={input_data_digest}。"
+                if _is_synthetic_research_input(validated_input) else
+                "证据必须引用输入中真实存在的来源，不得编造来源或把限制改写为通过。"
+            )
             prompt = "\n".join([
                 base_prompt,
                 "上一条模型输出未通过策环本地校验。请修正后重新输出完整 JSON，不要解释错误，不要改变其他安全约束。",
                 f"校验错误：{str(exc)[:300]}",
-                f"再次提醒：本轮 evidence 必须使用 evidence_status=SYNTHETIC 且 artifact_sha256={input_data_digest}。",
+                correction,
             ])
     audit = {
         "provider": getattr(model, "provider", "unknown"),
@@ -518,7 +632,11 @@ def generate_validated_hypothesis(
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "response_usage": attempts[-1].get("usage"),
         "attempts": attempts,
-        "response_classification": "REJECTED_STRUCTURED_HYPOTHESIS",
+        "response_classification": (
+            "MODEL_REQUEST_FAILED"
+            if attempts and attempts[-1].get("status") == "REQUEST_FAILED"
+            else "REJECTED_STRUCTURED_HYPOTHESIS"
+        ),
         "api_cost_estimate": None,
         "api_cost_estimate_reason": "提供商费率未在本地配置；调用次数和返回 token 用量单独记录。",
     }

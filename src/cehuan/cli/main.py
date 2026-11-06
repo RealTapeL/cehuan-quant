@@ -39,6 +39,7 @@ from cehuan.data.unknown_types import audit_unknown_security_types
 from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loader_check
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.research_cycle import run_research_cycle
+from cehuan.research.real_summary_research import run_real_summary_research
 from cehuan.research.baseline_readiness import (
     READINESS_CONTEXT_KEYS,
     build_baseline_readiness,
@@ -270,6 +271,21 @@ def _parser() -> argparse.ArgumentParser:
     ], default="partial_fill")
     research_cycle.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
     research_cycle.add_argument("--model-mode", choices=["auto", "stub", "llm"], help="覆盖模型模式；auto 仅在凭据齐全时调用配置模型")
+
+    real_summary_research = subs.add_parser(
+        "real-summary-research",
+        help="从已有 BaoStock 审计摘要生成一份真实行情研究假设；只允许显式 LLM 模式，不运行回测",
+    )
+    real_summary_research.add_argument(
+        "--model-mode", choices=["llm"], default="llm", help="真实摘要研究要求显式 LLM 模式，不会回退 stub",
+    )
+    real_summary_research.add_argument(
+        "--output", default="outputs/real-market-research", help="Git 忽略的私有研究产物根目录",
+    )
+    real_summary_research.add_argument(
+        "--summary", help="可选：复用已冻结的 outputs/market_summary.json，并复核其全部来源哈希",
+    )
+    real_summary_research.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
@@ -1204,6 +1220,33 @@ def main(argv: list[str] | None = None) -> int:
                 "orders_generated": manifest["orders_generated"],
             }, ensure_ascii=False, indent=2))
             return 0
+
+        if args.command == "real-summary-research":
+            run_dir = run_real_summary_research(
+                output_root=args.output,
+                agent_config_path=args.agent_config,
+                summary_path=args.summary,
+            )
+            manifest = json.loads((run_dir / "research_manifest.json").read_text(encoding="utf-8"))
+            print(json.dumps({
+                "research_id": manifest["research_id"],
+                "output_dir": str(run_dir),
+                "classification": manifest["classification"],
+                "status": manifest["status"],
+                "model_mode": manifest["model"]["selected_mode"],
+                "provider": manifest["model"].get("provider"),
+                "model": manifest["model"].get("model"),
+                "model_calls": manifest["model"].get("call_count", 0),
+                "token_usage": manifest["model"].get("usage"),
+                "token_usage_total": manifest["model"].get("usage_total"),
+                "token_usage_by_attempt": manifest["model"].get("usage_by_attempt"),
+                "cost_status": manifest["model"].get("cost_status"),
+                "formal_baseline": manifest["formal_baseline"],
+                "backtest_run": manifest["backtest_run"],
+                "broker_connected": manifest["broker_connected"],
+                "orders_generated": manifest["orders_generated"],
+            }, ensure_ascii=False, indent=2))
+            return 0 if str(manifest["status"]).startswith("COMPLETED_REAL_LLM") else 2
 
         if args.command == "review":
             def input_path(value: str) -> Path:
