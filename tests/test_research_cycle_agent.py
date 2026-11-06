@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from cehuan.research.controlled_experiments import (
 )
 from cehuan.research.research_agent import (
     ModelReply,
+    OpenAICompatibleResearchModel,
     StubResearchModel,
     build_hypothesis_prompt,
     generate_validated_hypothesis,
@@ -136,6 +139,52 @@ def test_configured_llm_metadata_never_contains_api_key(monkeypatch):
     assert audit["api_key_configured"] is True
     assert "synthetic-secret-for-test" not in json.dumps(audit)
     assert "synthetic-secret-for-test" not in repr(model)
+
+
+def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body():
+    captured = {}
+    response_body = json.dumps({
+        "choices": [{"message": {"content": '{"synthetic": true}'}}],
+        "usage": {"prompt_tokens": 21, "completion_tokens": 8, "total_tokens": 29},
+    }).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["path"] = self.path
+            captured["authorization"] = self.headers.get("Authorization")
+            captured["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    api_key = "local-test-key-must-not-be-in-payload"
+    base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    try:
+        model = OpenAICompatibleResearchModel(model="local-fixture-model", base_url=base_url, api_key=api_key)
+        reply = model.generate(phase="initial", prompt="synthetic-only prompt", context={})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["authorization"] == f"Bearer {api_key}"
+    assert api_key.encode() not in captured["body"]
+    request = json.loads(captured["body"])
+    assert request["model"] == "local-fixture-model"
+    assert request["response_format"] == {"type": "json_object"}
+    assert "synthetic-only prompt" in request["messages"][1]["content"]
+    assert reply.content == '{"synthetic": true}'
+    assert reply.endpoint == base_url
+    assert reply.usage == {"prompt_tokens": 21, "completion_tokens": 8, "total_tokens": 29}
 
 
 def test_unknown_experiment_rule_is_marked_pending_not_ignored():
