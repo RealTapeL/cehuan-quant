@@ -32,7 +32,7 @@ uv run cehuan research-cycle \
 
 下一轮输入从已保存的 `candidate_experiment.json`、基线/候选指标及成交和持仓对账文件重建 `program_facts`，并逐项列出来源文件名和 SHA-256。Agent 初始假设等文字位于独立的 `agent_authored_context`，不会混入程序事实。实验未完成、失败或候选指标缺失时，相应状态和空值会原样保留，不补造比较值；下一轮假设摘要通过输入摘要绑定这些事实和来源。
 
-模型设置位于 `configs/research_agent.toml`。`mode="auto"` 只有在模型名、服务地址和 API Key 都可用时才发起外部调用，否则使用明确标记的 stub。外部服务通过 `CEHUAN_LLM_MODEL`、`CEHUAN_LLM_BASE_URL` 和 `CEHUAN_LLM_API_KEY` 提供；Key 只放在环境变量中，不写入配置或产物。运行输入只有研究目标、合成数据摘要、参数和合成复盘事实，不包含账户资料或原始成交文件。切换真实模型前应避免把私密信息写入研究目标。
+模型设置位于 `configs/research_agent.toml`。`mode="auto"` 只有在模型名、服务地址和 API Key 都可用时才发起外部调用，否则使用明确标记的 stub。外部服务通过 `CEHUAN_LLM_MODEL`、`CEHUAN_LLM_BASE_URL` 和 `CEHUAN_LLM_API_KEY` 提供；Key 只放在环境变量中，不写入配置或产物。可选的 `CEHUAN_LLM_REASONING_EFFORT` 会原样作为兼容 API 的 `reasoning_effort` 请求参数发送；未设置时不发送该参数。对阿里云 `qwen3.8-27b`，可用 `none` 关闭默认思考，缩短结构化 JSON 请求时间。默认请求超时为 120 秒。网络/API 传输失败不会自动重试，因为服务端可能已处理超时请求；可在确认调用状态后手动重试。运行输入只有研究目标、合成数据摘要、参数和合成复盘事实，不包含账户资料或原始成交文件。切换真实模型前应避免把私密信息写入研究目标。
 
 真实 LLM 验收必须显式使用 `--model-mode llm`，例如在安全配置好环境变量后运行：
 
@@ -45,7 +45,7 @@ uv run cehuan research-cycle \
 
 任何模型配置缺失都会失败并说明缺少的变量名，不会自动退回 stub；stub 验收应显式使用 `--model-mode stub`。
 
-每个研究周期目录保存 Agent 输入/输出、提示词版本和摘要、候选配置/结果、合成成交复盘、研究报告及散列 manifest。若 provider 返回 usage，会记录 token 数；没有 provider 费率配置时不估算费用。`stub` 运行绝不标记成真实 LLM 调用。结果只验证软件流程，不代表策略表现；正式 baseline 仍为 `NOT_READY`，研究假设需要人工审核，不自动修改生效策略。
+每个研究周期目录保存 Agent 输入/输出、提示词版本和摘要、候选配置/结果、合成成交复盘、研究报告及散列 manifest。若 provider 返回 usage，会记录 token 数；没有 provider 费率配置时不估算费用。网络/API 传输失败记录为单次尝试，不能据此断定服务端未计费；结构校验失败仍遵循配置的有限重试数。`stub` 运行绝不标记成真实 LLM 调用。结果只验证软件流程，不代表策略表现；正式 baseline 仍为 `NOT_READY`，研究假设需要人工审核，不自动修改生效策略。
 
 该 MVP 的完整周期已用 stub 验证；仓库尚无一次成功的真实 LLM 周期验收记录。真实数据的受限摘要入口目前只有设计文档，尚未连接模型；Qlib/RD-Agent 自动搜索和多参数/新交易规则实验也需独立评估。
 

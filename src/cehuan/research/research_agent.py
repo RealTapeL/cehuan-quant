@@ -174,6 +174,10 @@ class ModelReply:
     usage: dict[str, int] | None = None
 
 
+class ResearchModelRequestError(RuntimeError):
+    """Transport/API failure where retrying may duplicate a billable request."""
+
+
 class ResearchHypothesisRejected(ValueError):
     def __init__(self, message: str, *, audit: dict[str, Any]):
         self.audit = audit
@@ -251,7 +255,15 @@ class StubResearchModel:
 class OpenAICompatibleResearchModel:
     provider = "openai-compatible-chat-completions"
 
-    def __init__(self, *, model: str, base_url: str, api_key: str, timeout_seconds: float = 45) -> None:
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: float = 120,
+        reasoning_effort: str | None = None,
+    ) -> None:
         parsed = urllib.parse.urlsplit(base_url)
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValueError("LLM base URL 必须是有效 HTTP(S) 地址")
@@ -263,6 +275,11 @@ class OpenAICompatibleResearchModel:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        if reasoning_effort is not None and reasoning_effort not in {
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError("LLM reasoning_effort 不受支持")
+        self.reasoning_effort = reasoning_effort
         self._api_key = api_key
 
     @property
@@ -272,7 +289,7 @@ class OpenAICompatibleResearchModel:
 
     def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
         url = f"{self.base_url}/chat/completions"
-        body = json.dumps({
+        request_payload = {
             "model": self.model,
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
@@ -280,7 +297,10 @@ class OpenAICompatibleResearchModel:
                 {"role": "system", "content": "你是策环的研究假设助手。只输出符合给定 JSON 契约的对象；不生成订单、不调用工具、不声称合成数据证明收益。"},
                 {"role": "user", "content": prompt},
             ],
-        }).encode("utf-8")
+        }
+        if self.reasoning_effort is not None:
+            request_payload["reasoning_effort"] = self.reasoning_effort
+        body = json.dumps(request_payload).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=body,
@@ -291,9 +311,9 @@ class OpenAICompatibleResearchModel:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"LLM 请求失败，HTTP {exc.code}") from None
+            raise ResearchModelRequestError(f"LLM 请求失败，HTTP {exc.code}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError(f"LLM 请求失败：{type(exc).__name__}") from None
+            raise ResearchModelRequestError(f"LLM 请求失败：{type(exc).__name__}") from None
         try:
             message = result["choices"][0]["message"]["content"]
             if not isinstance(message, str):
@@ -316,6 +336,7 @@ def resolve_research_model(settings: Mapping[str, Any], requested_mode: str | No
     model_env = str(settings.get("model_env", "CEHUAN_LLM_MODEL"))
     base_env = str(settings.get("base_url_env", "CEHUAN_LLM_BASE_URL"))
     key_env = str(settings.get("api_key_env", "CEHUAN_LLM_API_KEY"))
+    reasoning_effort_env = str(settings.get("reasoning_effort_env", "CEHUAN_LLM_REASONING_EFFORT"))
     model_name = os.environ.get(model_env, str(settings.get("model", ""))).strip()
     base_url = os.environ.get(base_env, str(settings.get("base_url", ""))).strip()
     api_key = os.environ.get(key_env, "")
@@ -328,6 +349,8 @@ def resolve_research_model(settings: Mapping[str, Any], requested_mode: str | No
         "api_key_env": key_env if api_key else None,
         "api_key_configured": bool(api_key),
         "endpoint": None,
+        "reasoning_effort": os.environ.get(reasoning_effort_env, "").strip() or None,
+        "timeout_seconds": float(settings.get("timeout_seconds", 120)),
     }
     if selected_mode == "stub":
         if mode == "llm":
@@ -339,7 +362,8 @@ def resolve_research_model(settings: Mapping[str, Any], requested_mode: str | No
         model=model_name,
         base_url=base_url,
         api_key=api_key,
-        timeout_seconds=float(settings.get("timeout_seconds", 45)),
+        timeout_seconds=float(settings.get("timeout_seconds", 120)),
+        reasoning_effort=audit["reasoning_effort"],
     )
     audit["endpoint"] = model.safe_endpoint
     return model, audit
@@ -358,6 +382,11 @@ def build_hypothesis_prompt(
         if phase == "initial" else
         "根据复盘摘要中的程序事实提出下一轮待验证研究假设；只使用 program_facts 明示的实验/成交事实，null 或缺失指标代表不可用，不得补写成事实；参数必须来自 experiment_capabilities.supported_parameters。证据不足时使用 NEEDS_DATA。"
     )
+    synthetic_evidence_template = {
+        "description": "仅用于验证流程的策环合成数据，不是市场证据",
+        "artifact_sha256": input_data_digest,
+        "evidence_status": "SYNTHETIC",
+    }
     return "\n".join([
         "输出一个 JSON 对象，匹配 strategy-research-hypothesis.schema.json，不要 Markdown 围栏。",
         "输出 JSON Schema：",
@@ -366,6 +395,8 @@ def build_hypothesis_prompt(
         f"hypothesis_id 必须是 {input_payload['research_id']}-{phase}-hypothesis。",
         f"experiment_id 必须是 {experiment_id}。",
         f"input_data_digest 必须是 {input_data_digest}。",
+        "evidence 是必填字段。当前研究输入为合成数据，evidence 必须至少包含一项，且每项必须使用 evidence_status=SYNTHETIC、artifact_sha256 精确等于本条消息中的 input_data_digest。请逐字使用以下程序提供的证据对象，不要改写散列或标签：",
+        json.dumps(synthetic_evidence_template, ensure_ascii=False, sort_keys=True),
         "proposed_changes 只能引用 experiment_capabilities 中的参数；未列入的规则可以作为待实现建议说明，但不能写入拟执行改动。不要输出订单、交易股数、券商指令、代码或工具调用。",
         "保留 data_trust 中的 UNVERIFIED、FALLBACK_USED、NOT_READY 和所有合成数据限制。",
         "Agent 不能修改当前有效策略；human_review_required=true、may_modify_active_strategy=false、may_generate_orders=false。",
@@ -386,13 +417,14 @@ def generate_validated_hypothesis(
     if max_retries < 0 or max_retries > 2:
         raise ValueError("模型重试次数必须在 0 到 2 之间")
     validated_input = validate_strategy_research_input(input_payload)
-    prompt = build_hypothesis_prompt(
+    base_prompt = build_hypothesis_prompt(
         input_payload=validated_input,
         phase=phase,
         input_data_digest=input_data_digest,
         experiment_id=experiment_id,
     )
     attempts: list[dict[str, Any]] = []
+    prompt = base_prompt
     for attempt in range(max_retries + 1):
         reply: ModelReply | None = None
         try:
@@ -422,12 +454,23 @@ def generate_validated_hypothesis(
             ]))
             synthetic_input = str(trust.get("overall", "")).startswith("SYNTHETIC")
             if synthetic_input:
-                if not hypothesis["evidence"] or any(
-                    evidence["evidence_status"] != "SYNTHETIC"
-                    or evidence["artifact_sha256"] != input_data_digest
-                    for evidence in hypothesis["evidence"]
-                ):
-                    raise ValueError("合成研究输入的 evidence 必须全部标为 SYNTHETIC 并绑定本轮摘要")
+                invalid_status = [
+                    index for index, evidence in enumerate(hypothesis["evidence"])
+                    if evidence["evidence_status"] != "SYNTHETIC"
+                ]
+                invalid_digest = [
+                    index for index, evidence in enumerate(hypothesis["evidence"])
+                    if evidence["artifact_sha256"] != input_data_digest
+                ]
+                if not hypothesis["evidence"] or invalid_status or invalid_digest:
+                    details = []
+                    if not hypothesis["evidence"]:
+                        details.append("evidence 不能为空")
+                    if invalid_status:
+                        details.append(f"evidence_status 必须为 SYNTHETIC（错误项 {invalid_status}）")
+                    if invalid_digest:
+                        details.append(f"artifact_sha256 必须等于本轮输入摘要（错误项 {invalid_digest}）")
+                    raise ValueError("合成研究 evidence 校验失败：" + "；".join(details))
             attempts.append({"attempt": attempt + 1, "status": "VALIDATED", "usage": reply.usage})
             audit = {
                 "provider": reply.provider,
@@ -452,8 +495,18 @@ def generate_validated_hypothesis(
                 "reason": str(exc)[:300],
                 "usage": reply.usage if reply else None,
             })
+            if isinstance(exc, ResearchModelRequestError):
+                # A timeout does not prove that the provider stopped processing the
+                # request. Do not automatically submit a potentially billable duplicate.
+                break
             if attempt >= max_retries:
                 break
+            prompt = "\n".join([
+                base_prompt,
+                "上一条模型输出未通过策环本地校验。请修正后重新输出完整 JSON，不要解释错误，不要改变其他安全约束。",
+                f"校验错误：{str(exc)[:300]}",
+                f"再次提醒：本轮 evidence 必须使用 evidence_status=SYNTHETIC 且 artifact_sha256={input_data_digest}。",
+            ])
     audit = {
         "provider": getattr(model, "provider", "unknown"),
         "model": getattr(model, "model", "unknown"),

@@ -18,6 +18,7 @@ from cehuan.research.controlled_experiments import (
 from cehuan.research.research_agent import (
     ModelReply,
     OpenAICompatibleResearchModel,
+    ResearchModelRequestError,
     StubResearchModel,
     build_hypothesis_prompt,
     generate_validated_hypothesis,
@@ -83,6 +84,8 @@ def test_model_prompt_capability_list_is_generated_from_executor_contract():
     for path in paths:
         assert path in prompt
     assert '"maximum_changes_per_experiment": 1' in prompt
+    assert '"artifact_sha256": "' + "a" * 64 + '"' in prompt
+    assert '"evidence_status": "SYNTHETIC"' in prompt
 
 
 def test_research_agent_rejects_order_or_unknown_action_fields():
@@ -132,11 +135,14 @@ def test_configured_llm_metadata_never_contains_api_key(monkeypatch):
     monkeypatch.setenv("CEHUAN_LLM_MODEL", "example-model")
     monkeypatch.setenv("CEHUAN_LLM_BASE_URL", "https://llm.example/v1")
     monkeypatch.setenv("CEHUAN_LLM_API_KEY", "synthetic-secret-for-test")
+    monkeypatch.setenv("CEHUAN_LLM_REASONING_EFFORT", "none")
     model, audit = resolve_research_model({"mode": "auto"})
     assert audit["selected_mode"] == "llm"
     assert audit["model"] == "example-model"
     assert audit["endpoint"] == "https://llm.example/v1"
     assert audit["api_key_configured"] is True
+    assert audit["reasoning_effort"] == "none"
+    assert audit["timeout_seconds"] == 120
     assert "synthetic-secret-for-test" not in json.dumps(audit)
     assert "synthetic-secret-for-test" not in repr(model)
 
@@ -150,9 +156,11 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
-            captured["path"] = self.path
-            captured["authorization"] = self.headers.get("Authorization")
-            captured["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+            captured.setdefault("requests", []).append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "body": self.rfile.read(int(self.headers["Content-Length"])),
+            })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response_body)))
@@ -170,21 +178,98 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
     try:
         model = OpenAICompatibleResearchModel(model="local-fixture-model", base_url=base_url, api_key=api_key)
         reply = model.generate(phase="initial", prompt="synthetic-only prompt", context={})
+        reduced_reasoning = OpenAICompatibleResearchModel(
+            model="local-fixture-model", base_url=base_url, api_key=api_key,
+            reasoning_effort="none",
+        )
+        reduced_reasoning.generate(phase="initial", prompt="synthetic-only prompt", context={})
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
-    assert captured["path"] == "/v1/chat/completions"
-    assert captured["authorization"] == f"Bearer {api_key}"
-    assert api_key.encode() not in captured["body"]
-    request = json.loads(captured["body"])
+    assert len(captured["requests"]) == 2
+    request_record = captured["requests"][0]
+    assert request_record["path"] == "/v1/chat/completions"
+    assert request_record["authorization"] == f"Bearer {api_key}"
+    assert api_key.encode() not in request_record["body"]
+    request = json.loads(request_record["body"])
     assert request["model"] == "local-fixture-model"
     assert request["response_format"] == {"type": "json_object"}
+    assert "reasoning_effort" not in request
     assert "synthetic-only prompt" in request["messages"][1]["content"]
     assert reply.content == '{"synthetic": true}'
     assert reply.endpoint == base_url
     assert reply.usage == {"prompt_tokens": 21, "completion_tokens": 8, "total_tokens": 29}
+    assert json.loads(captured["requests"][1]["body"])["reasoning_effort"] == "none"
+
+
+def test_llm_transport_timeout_is_not_retried_to_avoid_duplicate_requests():
+    payload = _agent_input()
+    digest = "c" * 64
+
+    class TimeoutModel:
+        provider = "test"
+        model = "timeout-fixture"
+        safe_endpoint = "https://llm.example/v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            raise ResearchModelRequestError("LLM 请求失败：TimeoutError")
+
+    model = TimeoutModel()
+    with pytest.raises(ValueError, match="TimeoutError") as exc:
+        generate_validated_hypothesis(
+            model,
+            input_payload=payload,
+            phase="initial",
+            input_data_digest=digest,
+            experiment_id="timeout-fixture-exp",
+            max_retries=1,
+        )
+    assert model.calls == 1
+    assert exc.value.audit["attempt_count"] == 1
+
+
+def test_invalid_synthetic_evidence_retry_includes_specific_binding_feedback():
+    payload = _agent_input()
+    payload["data_trust"]["overall"] = "SYNTHETIC_ONLY_NOT_MARKET_EVIDENCE"
+    digest = "d" * 64
+    good, _ = generate_validated_hypothesis(
+        StubResearchModel(), input_payload=payload, phase="initial",
+        input_data_digest=digest, experiment_id="evidence-retry-exp", max_retries=0,
+    )
+
+    class CorrectingModel:
+        provider = "test"
+        model = "evidence-retry-fixture"
+
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, *, phase, prompt, context):
+            self.prompts.append(prompt)
+            response = copy.deepcopy(good)
+            if len(self.prompts) == 1:
+                response["evidence"][0]["artifact_sha256"] = "e" * 64
+            return ModelReply(json.dumps(response), self.provider, self.model)
+
+    model = CorrectingModel()
+    hypothesis, audit = generate_validated_hypothesis(
+        model,
+        input_payload=payload,
+        phase="initial",
+        input_data_digest=digest,
+        experiment_id="evidence-retry-exp",
+        max_retries=1,
+    )
+    assert audit["attempt_count"] == 2
+    assert hypothesis["evidence"][0]["artifact_sha256"] == digest
+    assert "artifact_sha256 必须等于本轮输入摘要" in model.prompts[1]
+    assert digest in model.prompts[1]
 
 
 def test_unknown_experiment_rule_is_marked_pending_not_ignored():
