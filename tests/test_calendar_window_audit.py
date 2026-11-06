@@ -34,3 +34,5 @@ def test_security_window_audit_does_not_hide_one_symbol_gap_with_other_symbol_ro
     assert days[2] in report.loc["SH600001", "unknown_status_sessions"]
     assert report.loc["SZ000001", "window_status"] == "COMPLETE_WITH_SUSPENSION"
     assert report.loc["SH600002", "window_status"] == "UNKNOWN_STATUS"
+    assert "is_suspended" in report.loc["SH600002", "unknown_status_fields"]
+    assert "is_suspended" not in report.loc["SZ000001", "unknown_status_fields"]

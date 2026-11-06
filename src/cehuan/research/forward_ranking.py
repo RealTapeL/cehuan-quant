@@ -26,6 +26,10 @@ from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+class _ForwardWindowNeedsData(ValueError):
+    """A valid forward run was blocked by incomplete selected-pool windows."""
+
+
 def _build_h1_ranking_comparison(
     ranking: pd.DataFrame,
     window_audit: pd.DataFrame,
@@ -136,6 +140,7 @@ def create_paper_ranking_artifact(
         "orders_generated": False,
         "formal_baseline": "NOT_READY",
     }
+    audit: pd.DataFrame | None = None
     try:
         config_for_rules = load_config(config_file) if config_file.is_file() else None
     except Exception as exc:
@@ -227,8 +232,13 @@ def create_paper_ranking_artifact(
                 report["h1_filter_rule"] = report.get("research_rules", {}).get("h1_filter")
                 rank_symbols = set(audit.loc[audit["included_in_ranking_scope"], "symbol"].astype(str))
                 bars = bars.loc[bars["symbol"].astype(str).isin(rank_symbols)].copy()
+                blocked_windows = audit.loc[~audit["included_in_ranking_scope"]]
+                if not blocked_windows.empty:
+                    raise _ForwardWindowNeedsData(
+                        "所选研究池中存在未通过窗口完整性检查的证券；为避免静默缩小股票池，不生成排名"
+                    )
                 if not rank_symbols:
-                    raise ValueError("所有点时股票池证券都因逐证券窗口缺口被排除")
+                    raise _ForwardWindowNeedsData("所选研究池没有可用于排名的完整窗口")
                 _validate_signal_window_availability(
                     bars, signal_day=signal_day,
                     lookback_sessions=int(config["strategy"]["lookback_sessions"]),
@@ -326,8 +336,29 @@ def create_paper_ranking_artifact(
         os.rename(staging, target)
         return {"output_dir": str(target), "manifest": report}
     except Exception as exc:
-        report["status"] = "FAILED_INPUT"
-        report.setdefault("blocking_reasons", []).append(f"排名生成未完成: {type(exc).__name__}: {exc}")
+        if classification == "FORWARD_PAPER" and isinstance(exc, _ForwardWindowNeedsData) and audit is not None:
+            report["status"] = "NEEDS_DATA"
+            report["result_type"] = "NO_RANKING_WINDOW_DATA_INCOMPLETE"
+            report["blocking_reasons"] = [str(exc)]
+            status_columns = [
+                column for column in (
+                    "symbol", "window_status", "expected_session_count", "actual_row_count",
+                    "missing_sessions", "unknown_status_sessions", "unknown_status_fields",
+                    "suspended_sessions", "price_basis_status",
+                ) if column in audit.columns
+            ]
+            report["per_security_window_status"] = audit[status_columns].to_dict(orient="records")
+            for row in audit.loc[~audit["included_in_ranking_scope"]].itertuples(index=False):
+                report["blocking_reasons"].append(
+                    f"{row.symbol}: {row.window_status}; "
+                    f"missing_sessions={row.missing_sessions or 'none'}; "
+                    f"unknown_status_sessions={row.unknown_status_sessions or 'none'}; "
+                    f"unknown_status_fields={row.unknown_status_fields or 'none'}; "
+                    f"price_basis_status={row.price_basis_status}"
+                )
+        else:
+            report["status"] = "FAILED_INPUT"
+            report.setdefault("blocking_reasons", []).append(f"排名生成未完成: {type(exc).__name__}: {exc}")
         report["candidate_count"] = 0
         report.pop("ranking_file", None)
         report["ranking_file_sha256"] = None

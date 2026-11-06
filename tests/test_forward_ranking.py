@@ -216,7 +216,7 @@ def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: P
     assert not (Path(result["output_dir"]) / "ranking.csv").exists()
 
 
-def test_forward_ranking_excludes_security_with_missing_session_even_when_other_symbol_has_bar(tmp_path: Path) -> None:
+def test_forward_ranking_blocks_instead_of_silently_shrinking_pool_on_missing_session(tmp_path: Path) -> None:
     bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
     bars = pd.read_csv(bars_path)
     missing_date = sorted(bars["trade_date"].unique())[-2]
@@ -238,14 +238,45 @@ def test_forward_ranking_excludes_security_with_missing_session_even_when_other_
         now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
     )
     manifest = result["manifest"]
-    assert manifest["status"] == "CAPTURED_WITH_EXCLUSIONS"
+    assert manifest["status"] == "NEEDS_DATA"
     assert manifest["window_scope"]["point_in_time_universe_members"] == 2
     assert manifest["window_scope"]["excluded_symbols"] == 1
     audit = pd.read_csv(Path(result["output_dir"]) / "window-audit.csv")
     missing = audit.loc[audit["symbol"].eq("SH600001")].iloc[0]
     assert missing["window_status"] == "MISSING_BAR"
-    ranking = pd.read_csv(Path(result["output_dir"]) / "ranking.csv")
-    assert "SH600001" not in set(ranking["symbol"])
+    assert "SH600001" in " ".join(manifest["blocking_reasons"])
+    assert not (Path(result["output_dir"]) / "ranking.csv").exists()
+    assert not (Path(result["output_dir"]) / "h1-ranking.csv").exists()
+
+
+def test_forward_ranking_reports_unknown_status_as_needs_data_for_each_symbol(tmp_path: Path) -> None:
+    bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
+    bars = pd.read_csv(bars_path)
+    bars["is_suspended"] = pd.NA
+    bars.to_csv(bars_path, index=False)
+    repo = Path(__file__).resolve().parents[1]
+    capture = tmp_path / "capture.json"
+    capture.write_text(json.dumps({
+        "source_id": "synthetic-provider-fixture",
+        "captured_at_utc": "2026-11-05T07:05:00Z",
+        "data_file_sha256": _sha(bars_path),
+        "trusted_external_timestamp": "UNVERIFIED",
+        "provider_published_at_utc": None,
+    }), encoding="utf-8")
+    calendar, universe = _calendar_and_universe(tmp_path, bars_path, signal_date)
+    result = create_paper_ranking_artifact(
+        bars_path=bars_path, config_path=repo / "configs/default.toml", signal_date=signal_date,
+        output_dir=tmp_path / "forward-unknown-status", classification="FORWARD_PAPER",
+        source_capture_manifest_path=capture, trading_calendar_path=calendar, universe_path=universe,
+        now_utc=datetime(2026, 11, 5, 7, 10, tzinfo=timezone.utc),
+    )
+    manifest = result["manifest"]
+    assert manifest["status"] == "NEEDS_DATA"
+    assert manifest["candidate_count"] == 0
+    assert len(manifest["per_security_window_status"]) == 2
+    assert {row["window_status"] for row in manifest["per_security_window_status"]} == {"UNKNOWN_STATUS"}
+    assert all("is_suspended" in row["unknown_status_fields"] for row in manifest["per_security_window_status"])
+    assert not (Path(result["output_dir"]) / "ranking.csv").exists()
 
 
 def test_forward_ranking_rejects_bars_on_calendar_closed_date(tmp_path: Path) -> None:

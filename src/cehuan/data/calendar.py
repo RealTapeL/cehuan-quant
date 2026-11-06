@@ -124,12 +124,17 @@ def audit_security_windows(
         status_fields = [field for field in ("is_listed", "is_suspended", "is_st") if field not in rows.columns]
         if status_fields:
             unknown_status_dates = ["ALL_REQUIRED_SESSIONS"]
+            unknown_status_fields = list(status_fields)
         else:
             unknown_mask = rows[["is_listed", "is_suspended", "is_st"]].isna().any(axis=1)
             unknown_status_dates = sorted({
                 *pd.to_datetime(rows.loc[unknown_mask, "trade_date"]).dt.strftime("%Y-%m-%d").tolist(),
                 *missing,
             })
+            unknown_status_fields = [
+                field for field in ("is_listed", "is_suspended", "is_st")
+                if missing or rows[field].isna().any()
+            ]
         suspended_dates = sorted(pd.to_datetime(rows.loc[rows.get("is_suspended", pd.Series(pd.NA, index=rows.index)).fillna(False).astype(bool), "trade_date"]).dt.strftime("%Y-%m-%d").tolist()) if "is_suspended" in rows else []
         source_rows = source_by_index.loc[rows.index].astype(str)
         invalid_prices = (
@@ -158,6 +163,7 @@ def audit_security_windows(
             "actual_row_count": len(actual_dates),
             "missing_sessions": ";".join(missing),
             "unknown_status_sessions": ";".join(unknown_status_dates),
+            "unknown_status_fields": ";".join(unknown_status_fields),
             "suspended_sessions": ";".join(suspended_dates),
             "price_basis_status": "MIXED" if mixed_basis else "INVALID" if invalid_prices.any() else "CONSISTENT",
             "window_status": status,
