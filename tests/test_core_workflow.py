@@ -90,6 +90,184 @@ def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
     assert (candidate_pool["selected_target"] == candidate_pool["rank"].le(1)).all()
 
 
+def test_h1_filter_changes_only_candidate_selection_and_does_not_lock_held_position_sells() -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars(18)
+    suspension_day = sorted(data["trade_date"].unique())[5]
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == suspension_day), "is_suspended"] = True
+    calendar = pd.DataFrame({
+        "trade_date": sorted(data["trade_date"].unique()),
+        "is_open": True,
+        "source": "synthetic_h1_test_calendar",
+    })
+    baseline = run_backtest(data, 100_000, config)
+    unfiltered = run_backtest(data, 100_000, config, h1_calendar=calendar)
+    filtered = run_backtest(
+        data, 100_000, config,
+        h1_suspension_filter=True,
+        h1_calendar=calendar,
+    )
+
+    # Merely supplying a calendar or adding the opt-in API must not alter the
+    # original strategy's fills, candidate rows, or NAV.
+    assert baseline["trades"][["trade_date", "symbol", "side", "quantity"]].equals(
+        unfiltered["trades"][["trade_date", "symbol", "side", "quantity"]]
+    )
+    assert baseline["candidate_pool"][["signal_date", "symbol", "rank", "selected_target"]].equals(
+        unfiltered["candidate_pool"][["signal_date", "symbol", "rank", "selected_target"]]
+    )
+    assert baseline["equity_curve"]["equity_cny"].equals(unfiltered["equity_curve"]["equity_cny"])
+
+    audit = filtered["h1_candidate_audit"]
+    signal_after_suspension = sorted(audit["signal_date"].unique())[1]
+    rejected = audit.loc[
+        audit["signal_date"].eq(signal_after_suspension) & audit["symbol"].eq("SIM001")
+    ].iloc[0]
+    assert rejected["h1_status"] == "EXCLUDED"
+    assert "SUSPENDED_IN_WINDOW" in rejected["h1_reasons"]
+    baseline_target = baseline["candidate_pool"].loc[
+        baseline["candidate_pool"]["signal_date"].eq(signal_after_suspension)
+        & baseline["candidate_pool"]["symbol"].eq("SIM001")
+    ].iloc[0]
+    h1_target = filtered["candidate_pool"].loc[
+        filtered["candidate_pool"]["signal_date"].eq(signal_after_suspension)
+        & filtered["candidate_pool"]["symbol"].eq("SIM001")
+    ].iloc[0]
+    assert bool(baseline_target["selected_target"])
+    assert not bool(h1_target["selected_target"])
+    assert filtered["metrics"]["candidate_filter_mode"] == "H1_SUSPENSION_WINDOW"
+    assert filtered["metrics"]["candidate_filter_calendar_sha256"]
+    # SIM001 was bought before the later suspension entered the observation
+    # window; H1 removes it from new targets, while the normal sell path exits
+    # the existing holding once sell-side status permits.
+    sells = filtered["trades"].loc[
+        filtered["trades"]["symbol"].eq("SIM001") & filtered["trades"]["side"].eq("SELL")
+    ]
+    assert not sells.empty
+    assert filtered["metrics"]["research_trust"]["formal_baseline"]["status"] == "NOT_READY"
+    assert set(filtered["h1_candidate_audit"]["symbol"]).issubset(set(baseline["candidate_pool"]["symbol"]))
+
+    with pytest.raises(ValueError, match="H1 停牌窗口过滤尚未通过正式 readiness"):
+        run_backtest(
+            data, 100_000, config,
+            formal=True,
+            h1_suspension_filter=True,
+            h1_calendar=calendar,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sell_status", "expected_reason"),
+    [(True, "停牌"), (pd.NA, "停牌状态未知")],
+    ids=["currently-suspended", "current-suspension-unknown"],
+)
+def test_h1_excluded_existing_target_uses_independent_sell_status_gate(
+    sell_status: object,
+    expected_reason: str,
+) -> None:
+    config = load_config()
+    config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
+    data = bars(18)
+    dates = sorted(data["trade_date"].unique())
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == dates[5]), "is_suspended"] = True
+    if pd.isna(sell_status):
+        data["is_suspended"] = data["is_suspended"].astype("boolean")
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == dates[7]), "is_suspended"] = sell_status
+    calendar = pd.DataFrame({
+        "trade_date": dates,
+        "is_open": True,
+        "source": "synthetic_h1_sell_gate_calendar",
+    })
+
+    result = run_backtest(
+        data, 100_000, config,
+        h1_suspension_filter=True,
+        h1_calendar=calendar,
+    )
+    audit = result["h1_candidate_audit"]
+    second_signal = sorted(audit["signal_date"].unique())[1]
+    h1_row = result["candidate_pool"].loc[
+        result["candidate_pool"]["signal_date"].eq(second_signal)
+        & result["candidate_pool"]["symbol"].eq("SIM001")
+    ].iloc[0]
+    assert h1_row["h1_status"] == "EXCLUDED"
+    assert not bool(h1_row["selected_target"])
+
+    blocked = result["blocked_orders"]
+    blocked_sell = blocked.loc[
+        blocked["trade_date"].eq(dates[7])
+        & blocked["symbol"].eq("SIM001")
+        & blocked["side"].eq("SELL")
+    ]
+    assert not blocked_sell.empty
+    assert expected_reason in blocked_sell.iloc[0]["reason"]
+    assert not (
+        result["trades"]["trade_date"].eq(dates[7])
+        & result["trades"]["symbol"].eq("SIM001")
+        & result["trades"]["side"].eq("SELL")
+    ).any()
+
+
+def test_h1_filter_excludes_unknown_suspension_without_treating_it_as_normal() -> None:
+    from cehuan.research.hypothesis_prototypes import filter_h1_candidate_pool
+
+    data = bars(12)
+    data["is_suspended"] = data["is_suspended"].astype("boolean")
+    data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-10"), "is_suspended"] = pd.NA
+    signal_date = "2025-01-12"
+    calendar = pd.DataFrame({
+        "trade_date": sorted(data["trade_date"].unique()),
+        "is_open": True,
+        "source": "synthetic_h1_test_calendar",
+    })
+    baseline_candidates = pd.DataFrame([
+        {"symbol": "SIM001", "momentum": 0.5, "rank": 1},
+        {"symbol": "SIM002", "momentum": 0.4, "rank": 2},
+    ])
+    eligible, audit = filter_h1_candidate_pool(
+        baseline_candidates, data, calendar,
+        signal_date=signal_date, lookback_sessions=3,
+    )
+    sim001 = audit.loc[audit["symbol"].eq("SIM001")].iloc[0]
+    assert sim001["h1_status"] == "EXCLUDED"
+    assert "SUSPENSION_UNKNOWN" in sim001["h1_reasons"]
+    assert "SIM001" not in set(eligible["symbol"])
+
+
+def test_h1_filter_does_not_treat_missing_or_duplicate_bars_as_unsuspended() -> None:
+    from cehuan.research.hypothesis_prototypes import filter_h1_candidate_pool
+
+    data = bars(12)
+    calendar = pd.DataFrame({
+        "trade_date": sorted(data["trade_date"].unique()),
+        "is_open": True,
+        "source": "synthetic_h1_test_calendar",
+    })
+    baseline_candidates = pd.DataFrame([{"symbol": "SIM001", "momentum": 0.5, "rank": 1}])
+    missing_date = "2025-01-10"
+    missing_eligible, missing_audit = filter_h1_candidate_pool(
+        baseline_candidates,
+        data.loc[~((data["symbol"] == "SIM001") & (data["trade_date"] == missing_date))],
+        calendar,
+        signal_date="2025-01-12",
+        lookback_sessions=3,
+    )
+    assert missing_eligible.empty
+    assert "MISSING_SESSION" in missing_audit.iloc[0]["h1_reasons"]
+
+    duplicated_data = pd.concat([data, data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == missing_date)]])
+    duplicate_eligible, duplicate_audit = filter_h1_candidate_pool(
+        baseline_candidates,
+        duplicated_data,
+        calendar,
+        signal_date="2025-01-12",
+        lookback_sessions=3,
+    )
+    assert duplicate_eligible.empty
+    assert "DUPLICATE_SESSION" in duplicate_audit.iloc[0]["h1_reasons"]
+
+
 def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events():
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})

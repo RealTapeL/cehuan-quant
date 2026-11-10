@@ -187,6 +187,123 @@ def compare_h1_candidate_pool(
     return result
 
 
+def filter_h1_candidate_pool(
+    baseline_candidates: pd.DataFrame,
+    bars: pd.DataFrame,
+    calendar: pd.DataFrame,
+    *,
+    signal_date: str,
+    lookback_sessions: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply H1 to one already-ranked buy-candidate pool.
+
+    The baseline pool is the only source of candidates. A row is retained only
+    when its full ``lookback_sessions + 1`` open-session window has one valid
+    price row per session and an explicitly known, non-suspended status on
+    every row. Missing bars and unknown suspension status are exclusions, never
+    evidence of normal trading.
+
+    ``bars`` is expected to be the canonical, unique security-day frame already
+    used by the caller. The helper is vectorized across the input frame so it
+    can be used at each rebalance without rescanning all bars once per symbol.
+    """
+    required = {"symbol", "momentum", "rank"}
+    if not required.issubset(baseline_candidates.columns):
+        raise ValueError("baseline_candidates 缺少 symbol/momentum/rank")
+    if not {"symbol", "trade_date", "is_suspended", "close", "adjusted_close"}.issubset(bars.columns):
+        raise ValueError("bars 缺少 H1 所需的 symbol/trade_date/is_suspended/close/adjusted_close")
+    if lookback_sessions < 1:
+        raise ValueError("lookback_sessions 必须大于 0")
+
+    signal_day = _date_text(signal_date)
+    if not signal_day:
+        raise ValueError("signal_date 无效")
+    sessions = normalize_trading_calendar(calendar)
+    calendar_dates = sessions["trade_date"].astype(str)
+    is_open = parse_optional_bool(sessions["is_open"])
+    open_dates = sorted(calendar_dates.loc[is_open.eq(True).fillna(False)].tolist())
+    prior_open_dates = [day for day in open_dates if day <= signal_day]
+    required_count = lookback_sessions + 1
+    expected_dates = prior_open_dates[-required_count:]
+    signal_is_open = signal_day in set(open_dates)
+
+    candidate = baseline_candidates.copy().reset_index(drop=True)
+    candidate["symbol"] = candidate["symbol"].astype(str)
+    candidate["baseline_rank"] = pd.to_numeric(candidate["rank"], errors="coerce")
+    candidate["h1_status"] = "ELIGIBLE"
+    candidate["h1_reasons"] = ""
+    candidate["h1_expected_sessions"] = required_count
+    candidate["h1_observed_rows"] = 0
+    candidate["h1_missing_dates"] = ""
+    candidate["h1_duplicate_dates"] = ""
+    candidate["h1_suspended_rows"] = 0
+    candidate["h1_unknown_suspension_rows"] = 0
+    candidate["h1_invalid_price_rows"] = 0
+
+    if not signal_is_open:
+        candidate["h1_status"] = "EXCLUDED"
+        candidate["h1_reasons"] = "SIGNAL_DATE_NOT_OPEN_SESSION"
+    else:
+        common_reasons: list[str] = []
+        if len(expected_dates) < required_count:
+            common_reasons.append("INSUFFICIENT_HISTORY")
+        date_values = bars["trade_date"].astype(str)
+        symbol_values = bars["symbol"].astype(str)
+        mask = date_values.isin(expected_dates) & symbol_values.isin(candidate["symbol"])
+        window = bars.loc[mask, ["symbol", "trade_date", "is_suspended", "close", "adjusted_close"]].copy()
+        window["symbol"] = window["symbol"].astype(str)
+        window["trade_date"] = window["trade_date"].astype(str)
+        groups = {symbol: group for symbol, group in window.groupby("symbol", sort=False, observed=True)}
+        for index, row in candidate.iterrows():
+            symbol = str(row["symbol"])
+            symbol_window = groups.get(symbol)
+            reasons = list(common_reasons)
+            if symbol_window is None:
+                symbol_window = window.iloc[0:0]
+            counts = symbol_window["trade_date"].value_counts()
+            duplicate_dates = sorted(counts.index[counts.gt(1)].astype(str).tolist())
+            observed_dates = set(symbol_window["trade_date"].astype(str))
+            missing_dates = [day for day in expected_dates if day not in observed_dates]
+            suspension = parse_optional_bool(symbol_window["is_suspended"])
+            close = pd.to_numeric(symbol_window["close"], errors="coerce")
+            adjusted_close = pd.to_numeric(symbol_window["adjusted_close"], errors="coerce")
+            invalid_prices = (
+                close.isna() | ~close.map(lambda value: isfinite(float(value)) if not pd.isna(value) else False)
+                | close.le(0) | adjusted_close.isna()
+                | ~adjusted_close.map(lambda value: isfinite(float(value)) if not pd.isna(value) else False)
+                | adjusted_close.le(0)
+            )
+            if missing_dates:
+                reasons.append("MISSING_SESSION")
+            if duplicate_dates:
+                reasons.append("DUPLICATE_SESSION")
+            if suspension.isna().any():
+                reasons.append("SUSPENSION_UNKNOWN")
+            if suspension.eq(True).fillna(False).any():
+                reasons.append("SUSPENDED_IN_WINDOW")
+            if invalid_prices.any():
+                reasons.append("INVALID_PRICE_WINDOW")
+            reasons = list(dict.fromkeys(reasons))
+            candidate.at[index, "h1_status"] = "EXCLUDED" if reasons else "ELIGIBLE"
+            candidate.at[index, "h1_reasons"] = ";".join(reasons)
+            candidate.at[index, "h1_observed_rows"] = int(len(symbol_window))
+            candidate.at[index, "h1_missing_dates"] = ";".join(missing_dates)
+            candidate.at[index, "h1_duplicate_dates"] = ";".join(duplicate_dates)
+            candidate.at[index, "h1_suspended_rows"] = int(suspension.eq(True).fillna(False).sum())
+            candidate.at[index, "h1_unknown_suspension_rows"] = int(suspension.isna().sum())
+            candidate.at[index, "h1_invalid_price_rows"] = int(invalid_prices.sum())
+
+    eligible = candidate.loc[candidate["h1_status"].eq("ELIGIBLE")].copy()
+    eligible["momentum"] = pd.to_numeric(eligible["momentum"], errors="coerce")
+    eligible = eligible.sort_values(["momentum", "symbol"], ascending=[False, True], kind="stable")
+    eligible["h1_rank"] = range(1, len(eligible) + 1)
+    candidate["h1_rank"] = pd.NA
+    if not eligible.empty:
+        ranks = eligible.set_index("symbol")["h1_rank"]
+        candidate["h1_rank"] = candidate["symbol"].map(ranks).astype("Int64")
+    return eligible, candidate
+
+
 def _round_lot(shares: int, minimum: int, step: int) -> int:
     if minimum < 1 or step < 1:
         raise ValueError("minimum 和 step 必须为正整数")

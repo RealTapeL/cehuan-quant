@@ -58,6 +58,7 @@ from cehuan.research.baseline_readiness import (
     require_baseline_ready,
     require_report_matches_recomputed,
 )
+from cehuan.research.hypothesis_prototypes import filter_h1_candidate_pool
 from cehuan.research.trust_labels import build_research_trust_labels
 from cehuan.signals.strategy import (
     add_momentum,
@@ -348,6 +349,8 @@ def run_backtest(
     opening_accounting_snapshot: LedgerSnapshot | None = None,
     backtest_checkpoint: BacktestCheckpoint | None = None,
     trading_calendar: pd.DataFrame | None = None,
+    h1_suspension_filter: bool = False,
+    h1_calendar: pd.DataFrame | None = None,
     source_data_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run a small long-only daily baseline with next-session-open execution.
@@ -362,6 +365,14 @@ def run_backtest(
         raise ValueError("accounting_mode 只能是 legacy、ledger_shadow 或 ledger_v2")
     if formal and accounting_mode != "legacy":
         raise ValueError("ledger 诊断模式尚未通过正式门控，不能用于 formal=True 的正式基线")
+    if formal and h1_suspension_filter:
+        raise ValueError("H1 停牌窗口过滤尚未通过正式 readiness，不得用于 formal=True")
+    if h1_suspension_filter and h1_calendar is None:
+        raise ValueError("H1 停牌窗口过滤必须提供独立的 h1_calendar")
+    if h1_calendar is not None and formal:
+        raise ValueError("H1 诊断日历不能作为正式基线输入")
+    if h1_suspension_filter and (backtest_checkpoint is not None or opening_accounting_snapshot is not None):
+        raise ValueError("H1 诊断尚未绑定 checkpoint 状态，不能进行跨窗口续跑")
     if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(corporate_actions, pd.DataFrame):
         raise ValueError("ledger 诊断模式仅接受显式空 identity_events 与 corporate_actions 输入")
     if accounting_mode in {"ledger_shadow", "ledger_v2"} and not isinstance(security_identity_events, pd.DataFrame):
@@ -557,6 +568,11 @@ def run_backtest(
         rights_offering_decisions_by_event,
     )
     normalized_calendar = normalize_trading_calendar(trading_calendar) if trading_calendar is not None else None
+    normalized_h1_calendar = normalize_trading_calendar(h1_calendar) if h1_calendar is not None else None
+    normalized_h1_calendar_sha256 = (
+        _normalized_table_digest(normalized_h1_calendar)
+        if h1_suspension_filter and normalized_h1_calendar is not None else None
+    )
     normalized_calendar_sha256 = (
         _normalized_table_digest(normalized_calendar) if normalized_calendar is not None else None
     )
@@ -1033,6 +1049,7 @@ def run_backtest(
     )
     equity_rows: list[dict[str, Any]] = []
     candidate_pool_rows: list[dict[str, Any]] = []
+    h1_candidate_audit_rows: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     security_events: list[dict[str, Any]] = []
     blocked_orders: list[dict[str, Any]] = []
@@ -1640,20 +1657,51 @@ def run_backtest(
             execution_session = next_open_session_by_date.get(day_date)
             if execution_session is None and index + 1 < len(dates):
                 execution_session = pd.Timestamp(dates[index + 1]).date()
+            effective_ranked = ranked
+            h1_audit = pd.DataFrame()
+            if h1_suspension_filter:
+                assert normalized_h1_calendar is not None
+                effective_ranked, h1_audit = filter_h1_candidate_pool(
+                    ranked,
+                    data,
+                    normalized_h1_calendar,
+                    signal_date=day_date,
+                    lookback_sessions=lookback,
+                )
+                h1_audit["signal_date"] = day_date
+                h1_audit["execution_date"] = execution_session.isoformat() if execution_session else ""
+                h1_candidate_audit_rows.extend(h1_audit.to_dict(orient="records"))
+            baseline_rank_by_symbol = {
+                str(row.symbol): int(row.rank) for row in ranked.itertuples(index=False)
+            }
+            audit_by_symbol = (
+                h1_audit.set_index("symbol").to_dict(orient="index") if not h1_audit.empty else {}
+            )
+            effective_rank_by_symbol = {
+                str(row.symbol): int(row.h1_rank) for row in effective_ranked.itertuples(index=False)
+            } if h1_suspension_filter else baseline_rank_by_symbol
             for candidate_row in ranked.itertuples(index=False):
-                rank_value = int(getattr(candidate_row, "rank"))
+                symbol = str(getattr(candidate_row, "symbol"))
+                baseline_rank = int(getattr(candidate_row, "rank"))
+                effective_rank = effective_rank_by_symbol.get(symbol)
+                h1_row = audit_by_symbol.get(symbol, {})
                 candidate_pool_rows.append({
                     "signal_date": day_date,
                     "execution_date": execution_session.isoformat() if execution_session else "",
-                    "symbol": str(getattr(candidate_row, "symbol")),
+                    "symbol": symbol,
                     "momentum": float(getattr(candidate_row, "momentum")),
-                    "rank": rank_value,
-                    "selected_target": rank_value <= int(strategy["max_positions"]),
+                    "rank": baseline_rank,
+                    "baseline_rank": baseline_rank,
+                    "h1_rank": effective_rank if h1_suspension_filter else pd.NA,
+                    "effective_rank": effective_rank if effective_rank is not None else pd.NA,
+                    "selected_target": effective_rank is not None and effective_rank <= int(strategy["max_positions"]),
+                    "h1_status": str(h1_row.get("h1_status", "NOT_APPLIED")),
+                    "h1_reasons": str(h1_row.get("h1_reasons", "")),
                     "is_listed": getattr(candidate_row, "is_listed", pd.NA),
                     "is_suspended": getattr(candidate_row, "is_suspended", pd.NA),
                     "is_st": getattr(candidate_row, "is_st", pd.NA),
                 })
-            selected = ranked.head(int(strategy["max_positions"]))
+            selected = effective_ranked.head(int(strategy["max_positions"]))
             if not selected.empty:
                 target_weight = min(
                     float(strategy["max_position_weight"]),
@@ -1808,6 +1856,10 @@ def run_backtest(
         ).hexdigest()
         data_digest = hashlib.sha256(
             f"{data_digest}:{benchmark_data_digest}".encode("utf-8")
+        ).hexdigest()
+    if h1_suspension_filter and normalized_h1_calendar_sha256 is not None:
+        data_digest = hashlib.sha256(
+            f"{data_digest}:H1_SUSPENSION_WINDOW:{lookback}:{normalized_h1_calendar_sha256}".encode("utf-8")
         ).hexdigest()
     source_frames = [data] + ([benchmark_data] if benchmark_data is not None else [])
     data_sources = sorted({
@@ -2008,6 +2060,9 @@ def run_backtest(
     metrics.update({
         "experiment_id": f"chq-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}",
         "strategy_id": str(strategy["name"]),
+        "candidate_filter_mode": "H1_SUSPENSION_WINDOW" if h1_suspension_filter else "NONE",
+        "candidate_filter_lookback_sessions": lookback if h1_suspension_filter else None,
+        "candidate_filter_calendar_sha256": normalized_h1_calendar_sha256,
         "config_sha256": config_sha256,
         "data_version_sha256": data_digest,
         "current_window_input_file_sha256": current_window_data_sha256 if source_path is not None else None,
@@ -2123,9 +2178,10 @@ def run_backtest(
         "metrics": metrics,
         "equity_curve": curve,
         "candidate_pool": pd.DataFrame(candidate_pool_rows, columns=[
-            "signal_date", "execution_date", "symbol", "momentum", "rank", "selected_target",
-            "is_listed", "is_suspended", "is_st",
+            "signal_date", "execution_date", "symbol", "momentum", "rank", "baseline_rank", "h1_rank",
+            "effective_rank", "selected_target", "h1_status", "h1_reasons", "is_listed", "is_suspended", "is_st",
         ]),
+        "h1_candidate_audit": pd.DataFrame(h1_candidate_audit_rows),
         "trades": trade_frame.reindex(columns=[
             "trade_date", "symbol", "side", "quantity", "reference_price", "estimated_fill_price",
             "notional_cny", "fees_cny", "commission_cny", "stamp_duty_cny", "transfer_fee_cny",
