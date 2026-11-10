@@ -40,6 +40,7 @@ from cehuan.research.qlib_bridge import qlib_momentum_signals, qlib_static_loade
 from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.research_cycle import run_research_cycle
 from cehuan.research.real_summary_research import run_real_summary_research
+from cehuan.research.paper_ranking_review import run_paper_ranking_review
 from cehuan.research.baseline_readiness import (
     READINESS_CONTEXT_KEYS,
     build_baseline_readiness,
@@ -286,6 +287,16 @@ def _parser() -> argparse.ArgumentParser:
         "--summary", help="可选：复用已冻结的 outputs/market_summary.json，并复核其全部来源哈希",
     )
     real_summary_research.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
+
+    paper_review = subs.add_parser(
+        "paper-ranking-review",
+        help="复核已封存纸面排名并生成每日中文报告；仅显式 LLM，不抓行情或重跑排名",
+    )
+    paper_review.add_argument("--ranking-dir", required=True, help="已封存 FORWARD_PAPER 排名目录")
+    paper_review.add_argument("--capture-manifest", help="对应输入抓取清单；默认读取排名运行清单记录的路径")
+    paper_review.add_argument("--output", default="outputs/paper-ranking-reviews", help="Git 忽略的独立复盘产物根目录")
+    paper_review.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
+    paper_review.add_argument("--model-mode", choices=["llm"], required=True, help="必须显式指定 llm；不会回退 stub")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
@@ -1247,6 +1258,33 @@ def main(argv: list[str] | None = None) -> int:
                 "orders_generated": manifest["orders_generated"],
             }, ensure_ascii=False, indent=2))
             return 0 if str(manifest["status"]).startswith("COMPLETED_REAL_LLM") else 2
+
+        if args.command == "paper-ranking-review":
+            run_dir = run_paper_ranking_review(
+                ranking_dir=args.ranking_dir,
+                capture_manifest_path=args.capture_manifest,
+                output_root=args.output,
+                agent_config_path=args.agent_config,
+            )
+            manifest = json.loads((run_dir / "review-manifest.json").read_text(encoding="utf-8"))
+            model = manifest["model"]
+            print(json.dumps({
+                "review_id": manifest["review_id"],
+                "output_dir": str(run_dir),
+                "report": str(run_dir / "research-report.md"),
+                "status": manifest["status"],
+                "model_mode": model["requested_mode"],
+                "provider": model.get("provider"),
+                "model": model.get("model"),
+                "model_calls": model.get("call_count", 0),
+                "retry_count": model.get("retry_count", 0),
+                "token_usage": model.get("usage"),
+                "cost_status": model.get("cost_status"),
+                "formal_baseline": manifest["formal_baseline"],
+                "broker_connected": manifest["broker_connected"],
+                "orders_generated": manifest["orders_generated"],
+            }, ensure_ascii=False, indent=2))
+            return 0 if manifest["status"] == "COMPLETED_REAL_LLM_REVIEW" else 2
 
         if args.command == "review":
             def input_path(value: str) -> Path:
