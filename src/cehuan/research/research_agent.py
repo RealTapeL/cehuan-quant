@@ -361,7 +361,40 @@ class OpenAICompatibleResearchModel:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise ResearchModelRequestError(f"LLM 请求失败，HTTP {exc.code}") from None
+            # Keep only bounded provider diagnostics. Never persist raw response bodies,
+            # which may contain echoed request data or other sensitive content.
+            diagnostic_parts = []
+
+            def safe_diagnostic_value(value: Any, limit: int) -> str:
+                safe_value = str(value)
+                if self._api_key:
+                    safe_value = safe_value.replace(self._api_key, "[REDACTED]")
+                safe_value = "".join(ch if ch.isprintable() else " " for ch in safe_value)
+                return safe_value[:limit]
+
+            response_headers = exc.headers or {}
+            request_id = response_headers.get("x-request-id") or response_headers.get("x-dashscope-request-id")
+            if request_id:
+                diagnostic_parts.append(f"request_id={safe_diagnostic_value(request_id, 128)}")
+            try:
+                error_body = exc.read(8192)
+                error_payload = json.loads(error_body.decode("utf-8"))
+                provider_error = error_payload.get("error", error_payload) if isinstance(error_payload, dict) else {}
+                if isinstance(provider_error, dict):
+                    error_code = provider_error.get("code") or provider_error.get("type")
+                    error_message = provider_error.get("message")
+                    for label, value in (("code", error_code), ("message", error_message)):
+                        if value:
+                            diagnostic_parts.append(f"{label}={safe_diagnostic_value(value, 240)}")
+                if isinstance(error_payload, dict) and not request_id:
+                    payload_request_id = error_payload.get("request_id") or error_payload.get("requestId")
+                    if payload_request_id:
+                        diagnostic_parts.append(f"request_id={safe_diagnostic_value(payload_request_id, 128)}")
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                pass
+            diagnostic = "; ".join(diagnostic_parts)
+            suffix = f" ({diagnostic})" if diagnostic else ""
+            raise ResearchModelRequestError(f"LLM 请求失败，HTTP {exc.code}{suffix}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ResearchModelRequestError(f"LLM 请求失败：{type(exc).__name__}") from None
         try:

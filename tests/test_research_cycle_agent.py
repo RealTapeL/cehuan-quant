@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
+import cehuan.research.research_agent as research_agent_module
 from cehuan.research.controlled_experiments import (
     MAX_CHANGES_PER_EXPERIMENT,
     SUPPORTED_HYPOTHESIS_PATHS,
@@ -202,6 +205,85 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
     assert reply.endpoint == base_url
     assert reply.usage == {"prompt_tokens": 21, "completion_tokens": 8, "total_tokens": 29}
     assert json.loads(captured["requests"][1]["body"])["reasoning_effort"] == "none"
+
+
+def test_openai_compatible_403_extracts_provider_code_and_redacts_sensitive_values(monkeypatch):
+    api_key = "fixture-secret-token-403"
+    body = json.dumps({
+        "error": {
+            "code": "invalid_api_key",
+            "message": f"denied for token {api_key}; check provider settings",
+        },
+    }).encode("utf-8")
+    headers = {"x-request-id": f"request-{api_key}"}
+    http_error = urllib.error.HTTPError(
+        "https://llm.example/v1/chat/completions", 403, "Forbidden", headers, io.BytesIO(body),
+    )
+
+    def raise_http_error(request, timeout):
+        raise http_error
+
+    monkeypatch.setattr(research_agent_module.urllib.request, "urlopen", raise_http_error)
+    model = OpenAICompatibleResearchModel(
+        model="fixture-model", base_url="https://llm.example/v1", api_key=api_key,
+    )
+
+    with pytest.raises(ResearchModelRequestError) as exc:
+        model.generate(phase="initial", prompt="synthetic fixture", context={})
+
+    message = str(exc.value)
+    assert "HTTP 403" in message
+    assert "code=invalid_api_key" in message
+    assert "request_id=request-[REDACTED]" in message
+    assert "token [REDACTED]" in message
+    assert api_key not in message
+    assert "check provider settings" in message
+
+
+def test_openai_compatible_403_reads_top_level_error_and_never_echoes_malformed_body(monkeypatch):
+    api_key = "fixture-key-to-redact"
+    payload = {
+        "type": "access_denied",
+        "message": f"credential={api_key}",
+        "requestId": f"provider-{api_key}",
+    }
+    http_error = urllib.error.HTTPError(
+        "https://llm.example/v1/chat/completions", 403, "Forbidden", None,
+        io.BytesIO(json.dumps(payload).encode("utf-8")),
+    )
+
+    monkeypatch.setattr(
+        research_agent_module.urllib.request,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(http_error),
+    )
+    model = OpenAICompatibleResearchModel(
+        model="fixture-model", base_url="https://llm.example/v1", api_key=api_key,
+    )
+    with pytest.raises(ResearchModelRequestError) as exc:
+        model.generate(phase="initial", prompt="synthetic fixture", context={})
+
+    message = str(exc.value)
+    assert "HTTP 403" in message
+    assert "code=access_denied" in message
+    assert "request_id=provider-[REDACTED]" in message
+    assert "credential=[REDACTED]" in message
+    assert api_key not in message
+
+    malformed = urllib.error.HTTPError(
+        "https://llm.example/v1/chat/completions", 403, "Forbidden", {},
+        io.BytesIO(f"private provider body {api_key}".encode("utf-8")),
+    )
+    monkeypatch.setattr(
+        research_agent_module.urllib.request,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(malformed),
+    )
+    with pytest.raises(ResearchModelRequestError) as malformed_exc:
+        model.generate(phase="initial", prompt="synthetic fixture", context={})
+    assert str(malformed_exc.value) == "LLM 请求失败，HTTP 403"
+    assert api_key not in str(malformed_exc.value)
+    assert "private provider body" not in str(malformed_exc.value)
 
 
 def test_llm_transport_timeout_is_not_retried_to_avoid_duplicate_requests():
