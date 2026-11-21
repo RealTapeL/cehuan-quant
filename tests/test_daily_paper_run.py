@@ -194,3 +194,91 @@ def test_before_close_is_needs_data_without_provider_or_model_request(tmp_path: 
     assert manifest["rankings_generated"] is False
     assert manifest["model_calls"] == 0
     assert not called
+
+
+def test_calendar_not_confirming_signal_day_blocks_before_price_capture(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
+    pool, config, identity = _inputs(tmp_path / "inputs")
+    sessions = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
+    sessions = sessions[:-1]
+    calls: list[str] = []
+
+    class StaleCalendarBaoStock(_SyntheticBaoStock):
+        def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+            calls.append("calendar")
+            return super().trade_calendar(start_date, end_date)
+
+        def stock_basic(self, symbol: str) -> pd.DataFrame:
+            calls.append(f"basic:{symbol}")
+            return super().stock_basic(symbol)
+
+        def history(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
+            calls.append("history")
+            return super().history(*args, **kwargs)
+
+    def factory(**kwargs: Any) -> StaleCalendarBaoStock:
+        return StaleCalendarBaoStock(dates=sessions, **kwargs)
+
+    start = datetime(2026, 11, 20, 16, 0, tzinfo=SHANGHAI)
+    run_dir = daily_paper_run.run_daily_paper_workflow(
+        output_root=tmp_path / "data" / "private" / "daily-paper-runs",
+        pool_path=pool,
+        config_path=config,
+        identity_events_path=identity,
+        brief_output_root=tmp_path / "outputs" / "daily-briefs",
+        model_mode="llm",
+        now=start,
+        clock_fn=_clock(start),
+        session_factory=factory,
+    )
+    manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "NEEDS_DATA"
+    assert list(manifest["requests"]) == ["calendar"]
+    assert calls == ["calendar"]
+    assert manifest["rankings_generated"] is False
+    assert manifest["model_calls"] == 0
+    assert any("未确认本机日期为当日开市日" in reason for reason in manifest["blocking_reasons"])
+
+
+def test_modified_raw_response_hash_blocks_ranking_and_model(tmp_path: Path, monkeypatch) -> None:
+    pool, config, identity = _inputs(tmp_path / "inputs")
+    monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
+    original_request = daily_paper_run._request
+    mutated = False
+
+    def mutate_sealed_source(*args: Any, **kwargs: Any):
+        nonlocal mutated
+        result = original_request(*args, **kwargs)
+        request_id = args[4]
+        if request_id == f"basic:{FIXED_SYMBOLS[0]}" and not mutated:
+            raw_dir = args[2]
+            (raw_dir / f"{request_id.replace(':', '_')}.csv").write_text("tampered\n", encoding="utf-8")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(daily_paper_run, "_request", mutate_sealed_source)
+    dates = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
+    start = datetime(2026, 11, 20, 16, 0, tzinfo=SHANGHAI)
+    run_dir = daily_paper_run.run_daily_paper_workflow(
+        output_root=tmp_path / "data" / "private" / "daily-paper-runs",
+        pool_path=pool,
+        config_path=config,
+        identity_events_path=identity,
+        brief_output_root=tmp_path / "outputs" / "daily-briefs",
+        model_mode="llm",
+        now=start,
+        clock_fn=_clock(start),
+        session_factory=lambda **kwargs: _SyntheticBaoStock(dates=dates, **kwargs),
+    )
+    manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
+    capture = json.loads((run_dir / "capture-manifest.json").read_text(encoding="utf-8"))
+
+    assert mutated
+    assert manifest["status"] == "NEEDS_DATA"
+    assert manifest["rankings_generated"] is False
+    assert manifest["model_calls"] == 0
+    assert capture["status"] == "NEEDS_DATA"
+    assert any("原始响应缺失或哈希错误" in reason for reason in capture["blocking_reasons"])
+    assert not (run_dir / "ranking" / "paper-ranking-manifest.json").exists()
+    assert not list((tmp_path / "outputs" / "daily-briefs").glob("*/brief-manifest.json"))
