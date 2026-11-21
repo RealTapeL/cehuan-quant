@@ -17,7 +17,7 @@ import pandas as pd
 
 from cehuan.config import load_config
 from cehuan.data.adjustment import ADJUSTED_SOURCE, signal_price_sources
-from cehuan.data.canonical import canonical_symbol, read_bars
+from cehuan.data.canonical import canonical_symbol, parse_optional_bool, read_bars
 from cehuan.data.calendar import normalize_trading_calendar
 from cehuan.data.security_identity import normalize_security_identity_events
 from cehuan.signals.strategy import add_momentum, rank_precomputed_day
@@ -34,7 +34,7 @@ AUDIT_COLUMNS = [
     "symbol", "eligibility_status", "reasons", "expected_session_count",
     "actual_row_count", "missing_sessions", "duplicate_sessions",
     "unknown_status_sessions", "suspended_sessions", "price_basis_status",
-    "identity_events",
+    "status_sources", "identity_events",
 ]
 
 
@@ -393,9 +393,12 @@ def _validate_capture_manifest(
     if mode == "FORWARD_PAPER":
         if "baostock" not in provider.casefold():
             raise _BlockedInput("前瞻采集清单 provider 必须为 BaoStock")
+        if capture.get("status") != "CAPTURED_INPUTS_READY":
+            raise _BlockedInput("前瞻采集清单状态不是 CAPTURED_INPUTS_READY")
         expected_interfaces = {
             "bars": "query_history_k_data_plus",
             "calendar": "query_trade_dates",
+            "security_basic": "query_stock_basic(code=<fixed symbol>)",
             "universe": "query_all_stock",
         }
         if capture.get("interfaces") != expected_interfaces:
@@ -404,6 +407,24 @@ def _validate_capture_manifest(
             raise _BlockedInput("前瞻采集清单必须确认信号价格来自 adjustflag=1")
         if capture.get("raw_price_adjustment") != "adjustflag=3":
             raise _BlockedInput("前瞻采集清单必须确认原始价格来自 adjustflag=3")
+        seal_path = paths["capture_manifest"].with_name("capture-manifest.seal.json")
+        if not seal_path.is_file():
+            raise _BlockedInput("前瞻采集清单缺少不可覆盖封存记录")
+        seal = _read_json(seal_path)
+        if seal.get("capture_manifest_sha256") != _sha(paths["capture_manifest"]):
+            raise _BlockedInput("前瞻采集清单封存 SHA-256 不匹配")
+        raw_responses = capture.get("raw_responses")
+        if not isinstance(raw_responses, list) or not raw_responses:
+            raise _BlockedInput("前瞻采集清单缺少原始 BaoStock 响应及 SHA-256")
+        capture_root = paths["capture_manifest"].parent.resolve()
+        for item in raw_responses:
+            if not isinstance(item, dict) or not item.get("path") or not item.get("sha256"):
+                raise _BlockedInput("原始响应登记项缺少路径或 SHA-256")
+            response_path = (capture_root / str(item["path"])).resolve()
+            if not response_path.is_relative_to(capture_root) or not response_path.is_file():
+                raise _BlockedInput("原始响应路径缺失或越出采集目录")
+            if _sha(response_path) != item["sha256"]:
+                raise _BlockedInput(f"原始 BaoStock 响应 SHA-256 不匹配：{response_path.name}")
         captured = _parse_aware(capture.get("captured_at_utc"), "captured_at_utc")
         local_now = now.astimezone(SHANGHAI)
         if local_now.date() != signal_day or local_now.time() < time(15, 5):
@@ -454,6 +475,12 @@ def _normalize_universe(frame: pd.DataFrame, required_dates: list[str]) -> pd.Da
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
     data["symbol"] = data["symbol"].map(canonical_symbol).astype(str)
     data["pool_status"] = data["pool_status"].astype(str).str.strip().str.upper()
+    status_fields = {"is_listed", "is_suspended", "is_st"}
+    present_status_fields = status_fields.intersection(data.columns)
+    if present_status_fields and present_status_fields != status_fields:
+        raise _BlockedInput("点时成员文件的逐日状态字段不完整，需同时提供 is_listed/is_suspended/is_st")
+    for field in status_fields.intersection(data.columns):
+        data[field] = parse_optional_bool(data[field])
     future = data.loc[data["symbol"].isin(FIXED_SYMBOLS) & data["trade_date"].gt(required_dates[-1])]
     if not future.empty:
         raise _BlockedInput("点时成员文件包含信号日之后的固定池状态")
@@ -528,7 +555,6 @@ def _audit_common_candidates(
         rows["trade_date_text"] = rows["trade_date"].map(lambda value: value.isoformat())
         counts = rows["trade_date_text"].value_counts().to_dict()
         member_dates = [day for day in required_text if membership_values.get(day) == "STOCK_MEMBER"]
-        missing = [day for day in member_dates if counts.get(day, 0) == 0]
         duplicates = sorted(set(dup_keys.get(symbol, [])))
         if duplicates:
             message = "重复行情日:" + ";".join(duplicates)
@@ -541,45 +567,89 @@ def _audit_common_candidates(
         unknown_status_dates: list[str] = []
         suspended_dates: list[str] = []
         price_basis = "ADJUSTED_CLOSE"
-        member_rows = rows.loc[rows["trade_date_text"].isin(member_dates)].copy()
-        if missing:
-            message = "成员日缺少行情:" + ";".join(missing)
-            reasons.append(message)
-            fatal_reasons.append(message)
-            unknown_status_dates.extend(missing)
-        for field in ("is_listed", "is_suspended", "is_st"):
-            if field not in member_rows:
-                unknown_status_dates.extend(member_dates)
-                continue
-            unknown_status_dates.extend(member_rows.loc[member_rows[field].isna(), "trade_date_text"].tolist())
+        status_by_day: dict[str, dict[str, Any]] = {}
+        status_sources: set[str] = set()
+        status_from_universe = {"is_listed", "is_suspended", "is_st"}.issubset(universe.columns)
+        for day in member_dates:
+            member_row = universe_idx.loc[(symbol, day)] if universe_idx is not None else None
+            bar_rows = rows.loc[rows["trade_date_text"].eq(day)]
+            state: dict[str, Any] = {}
+            for field in ("is_listed", "is_suspended", "is_st"):
+                value: Any = pd.NA
+                if status_from_universe and member_row is not None:
+                    value = member_row[field]
+                elif len(bar_rows) == 1 and field in bar_rows:
+                    value = bar_rows.iloc[0][field]
+                state[field] = value
+                if pd.isna(value):
+                    unknown_status_dates.append(day)
+            if status_from_universe and member_row is not None and "status_source" in universe.columns:
+                source_value = str(member_row.get("status_source", "")).strip()
+                if source_value:
+                    status_sources.add(source_value)
+            if len(bar_rows) == 1:
+                for field in ("is_listed", "is_suspended", "is_st"):
+                    bar_value = bar_rows.iloc[0].get(field, pd.NA)
+                    if not pd.isna(state[field]) and not pd.isna(bar_value) and bool(state[field]) != bool(bar_value):
+                        message = f"成员/行情状态冲突:{day}:{field}"
+                        reasons.append(message)
+                        fatal_reasons.append(message)
+            status_by_day[day] = state
+            if not pd.isna(state["is_suspended"]) and bool(state["is_suspended"]):
+                suspended_dates.append(day)
+            if not pd.isna(state["is_listed"]) and not bool(state["is_listed"]):
+                message = f"点时成员状态与上市状态冲突:{day}"
+                reasons.append(message)
+                fatal_reasons.append(message)
         if unknown_status_dates:
             message = "必需成员/上市/ST/停牌状态未知:" + ";".join(sorted(set(unknown_status_dates)))
             reasons.append(message)
             fatal_reasons.append(message)
-        if "is_suspended" in member_rows:
-            suspended_dates = sorted(member_rows.loc[
-                member_rows["is_suspended"].fillna(False).astype(bool), "trade_date_text",
-            ].unique().tolist())
-        if "is_listed" in member_rows:
-            not_listed_dates = sorted(member_rows.loc[
-                member_rows["is_listed"].fillna(False).eq(False), "trade_date_text",
-            ].unique().tolist())
-        else:
-            not_listed_dates = []
-        if not_listed_dates:
-            message = "点时成员状态与上市状态冲突:" + ";".join(not_listed_dates)
+        missing: list[str] = []
+        for day in member_dates:
+            state = status_by_day[day]
+            bar_rows = rows.loc[rows["trade_date_text"].eq(day)]
+            if not pd.isna(state["is_suspended"]) and bool(state["is_suspended"]):
+                continue
+            if counts.get(day, 0) == 0:
+                missing.append(day)
+                continue
+            if len(bar_rows) != 1:
+                continue
+            price_columns = ["open", "high", "low", "close", "adjusted_close"]
+            numeric = bar_rows[price_columns].apply(pd.to_numeric, errors="coerce")
+            finite_positive = numeric.map(
+                lambda value: math.isfinite(float(value)) and float(value) > 0 if pd.notna(value) else False,
+            )
+            bad_ohlc = (
+                numeric["low"].gt(numeric["high"])
+                | numeric["low"].gt(numeric[["open", "close"]].min(axis=1))
+                | numeric["high"].lt(numeric[["open", "close"]].max(axis=1))
+            )
+            if not finite_positive.all(axis=None) or bad_ohlc.any():
+                message = f"窗口含无效或不一致价格:{day}"
+                reasons.append(message)
+                fatal_reasons.append(message)
+            sources = signal_price_sources(bar_rows)
+            if not sources.eq(ADJUSTED_SOURCE).all():
+                price_basis = "INVALID_OR_MIXED"
+                message = f"信号价格不是完整一致的 adjusted_close:{day}"
+                reasons.append(message)
+                fatal_reasons.append(message)
+        if missing:
+            message = "成员且非停牌日缺少行情:" + ";".join(missing)
             reasons.append(message)
             fatal_reasons.append(message)
-        signal_rows = member_rows.loc[member_rows["trade_date_text"].eq(signal_day.isoformat())]
+        signal_day_text = signal_day.isoformat()
+        signal_rows = rows.loc[rows["trade_date_text"].eq(signal_day_text)]
         signal_not_member = membership_values.get(signal_day.isoformat()) == "NOT_STOCK_MEMBER"
-        signal_not_listed = False
-        signal_is_st = False
-        signal_suspended = False
-        if not signal_rows.empty:
+        signal_state = status_by_day.get(signal_day_text, {})
+        if signal_day_text not in status_by_day and not signal_rows.empty:
             signal = signal_rows.iloc[0]
-            signal_not_listed = not pd.isna(signal.get("is_listed")) and not bool(signal.get("is_listed"))
-            signal_is_st = not pd.isna(signal.get("is_st")) and bool(signal.get("is_st"))
-            signal_suspended = not pd.isna(signal.get("is_suspended")) and bool(signal.get("is_suspended"))
+            signal_state = {field: signal.get(field, pd.NA) for field in ("is_listed", "is_suspended", "is_st")}
+        signal_not_listed = not pd.isna(signal_state.get("is_listed", pd.NA)) and not bool(signal_state["is_listed"])
+        signal_is_st = not pd.isna(signal_state.get("is_st", pd.NA)) and bool(signal_state["is_st"])
+        signal_suspended = not pd.isna(signal_state.get("is_suspended", pd.NA)) and bool(signal_state["is_suspended"])
         if signal_not_member:
             reasons.append("信号日已确认非 STOCK_MEMBER")
         if signal_not_listed:
@@ -592,28 +662,6 @@ def _audit_common_candidates(
             reasons.append("信号日停牌")
         if suspended_dates:
             reasons.append("共同窗口内已确认停牌:" + ";".join(suspended_dates))
-        if not member_rows.empty:
-            price_columns = ["open", "high", "low", "close", "adjusted_close"]
-            numeric = member_rows[price_columns].apply(pd.to_numeric, errors="coerce")
-            finite_positive = numeric.map(
-                lambda value: math.isfinite(float(value)) and float(value) > 0 if pd.notna(value) else False,
-            )
-            bad_price_rows = ~finite_positive.all(axis=1)
-            bad_ohlc = (
-                numeric["low"].gt(numeric["high"])
-                | numeric["low"].gt(numeric[["open", "close"]].min(axis=1))
-                | numeric["high"].lt(numeric[["open", "close"]].max(axis=1))
-            )
-            if bad_price_rows.any() or bad_ohlc.any():
-                message = "窗口含无效或不一致价格"
-                reasons.append(message)
-                fatal_reasons.append(message)
-            sources = signal_price_sources(member_rows)
-            if not sources.eq(ADJUSTED_SOURCE).all():
-                price_basis = "INVALID_OR_MIXED"
-                message = "信号价格不是完整一致的 adjusted_close"
-                reasons.append(message)
-                fatal_reasons.append(message)
         if identity_events:
             relevant_events = [
                 item for item in identity_events
@@ -645,6 +693,7 @@ def _audit_common_candidates(
             "unknown_status_sessions": ";".join(sorted(set(unknown_status_dates))),
             "suspended_sessions": ";".join(suspended_dates),
             "price_basis_status": price_basis,
+            "status_sources": ";".join(sorted(status_sources)),
             "identity_events": json.dumps(
                 [item for item in identity_events if symbol in {item["old_symbol"], item["new_symbol"]}],
                 ensure_ascii=False,

@@ -543,8 +543,11 @@ class BaoStockSession:
             lambda: self.bs.query_trade_dates(start_date=start_date, end_date=end_date),
         )
 
-    def stock_basic(self) -> pd.DataFrame:
-        return self._query("query_stock_basic", self.bs.query_stock_basic)
+    def stock_basic(self, symbol: object | None = None) -> pd.DataFrame:
+        """Return security basics, optionally restricted to one BaoStock equity code."""
+        code = _vendor_code(symbol) if symbol is not None else ""
+        endpoint = f"query_stock_basic({code})" if code else "query_stock_basic"
+        return self._query(endpoint, lambda: self.bs.query_stock_basic(code=code))
 
     def all_stocks(self, day: str) -> pd.DataFrame:
         """Return BaoStock's date-specific securities list for one market day."""

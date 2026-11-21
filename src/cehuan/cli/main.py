@@ -42,6 +42,7 @@ from cehuan.research.research_cycle import run_research_cycle
 from cehuan.research.real_summary_research import run_real_summary_research
 from cehuan.research.paper_ranking_review import run_paper_ranking_review
 from cehuan.research.lookback_pair import create_lookback_pair_ranking
+from cehuan.research.lookback_pair_capture import capture_lookback_pair_inputs
 from cehuan.research.baseline_readiness import (
     READINESS_CONTEXT_KEYS,
     build_baseline_readiness,
@@ -316,6 +317,24 @@ def _parser() -> argparse.ArgumentParser:
     lookback_pair.add_argument("--config", default="configs/default.toml", help="必须与登记冻结配置哈希一致")
     lookback_pair.add_argument("--signal-date", required=True, help="登记的固定信号日 YYYY-MM-DD")
     lookback_pair.add_argument("--output-dir", required=True, help="必须为 data/private/ 下的新目录；已存在时拒绝覆盖")
+
+    lookback_capture = subs.add_parser(
+        "lookback-pair-capture",
+        help="按冻结登记采集 10 只固定证券的配对排名输入；严格限时、限次，不生成排名",
+    )
+    lookback_capture.add_argument("--signal-date", default="2026-12-17", help="只能是登记的固定信号日 2026-12-17")
+    lookback_capture.add_argument("--output-dir", required=True, help="data/private/ 下尚不存在的本次采集目录")
+    lookback_capture.add_argument(
+        "--registration-freeze",
+        default="data/private/experiments/lookback-10-vs-20-forward-20261217-v1/registration-freeze.json",
+    )
+    lookback_capture.add_argument("--config", default="configs/default.toml", help="必须与登记冻结配置哈希一致")
+    lookback_capture.add_argument(
+        "--pool", default="data/private/experiments/forward-small-20261106-akshare-v1/selected_pool.csv",
+        help="登记冻结的 10 只证券名单，不可替换或扩展",
+    )
+    lookback_capture.add_argument("--identity-events", help="身份事件 CSV；默认读取冻结配置中的路径")
+    lookback_capture.add_argument("--resume", action="store_true", help="在 15:20 或 15:35 对同一目录续跑失败请求")
 
     review = subs.add_parser("review", help="将成交 CSV 与计划对账")
     review.add_argument("--plan", required=True)
@@ -1348,6 +1367,50 @@ def main(argv: list[str] | None = None) -> int:
                 "formal_baseline": manifest["formal_baseline"],
             }, ensure_ascii=False, indent=2))
             return 0 if manifest["status"] == "CAPTURED_FORWARD_RANKING_ONLY" else 2
+
+        if args.command == "lookback-pair-capture":
+            def capture_repo_path(value: str) -> Path:
+                path = Path(value).expanduser()
+                return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+            capture_config = capture_repo_path(args.config)
+            capture_settings = load_config(capture_config)
+            identity_path = _configured_path(
+                capture_settings, "security_identity_events_file", args.identity_events,
+            )
+            if identity_path is None:
+                raise ValueError("缺少证券身份事件输入路径")
+            output_path = capture_repo_path(args.output_dir)
+            private_root = (REPO_ROOT / "data" / "private").resolve()
+            if private_root not in output_path.parents:
+                raise ValueError("lookback-pair-capture 的 output-dir 必须位于 data/private/ 下")
+            result = capture_lookback_pair_inputs(
+                output_dir=output_path,
+                registration_freeze_path=capture_repo_path(args.registration_freeze),
+                config_path=capture_config,
+                pool_path=capture_repo_path(args.pool),
+                identity_events_path=identity_path,
+                signal_date=args.signal_date,
+                resume=args.resume,
+            )
+            manifest = result["manifest"]
+            print(json.dumps({
+                "experiment_id": manifest["experiment_id"],
+                "output_dir": result["output_dir"],
+                "signal_date": manifest["signal_date"],
+                "status": manifest["status"],
+                "last_stage": manifest.get("last_stage"),
+                "request_states": {
+                    key: {"status": value.get("status"), "attempts": len(value.get("attempts", []))}
+                    for key, value in manifest.get("requests", {}).items()
+                },
+                "calendar_outcome_horizon_status": manifest.get("calendar_outcome_horizon_status"),
+                "blocking_reasons": manifest.get("blocking_reasons", []),
+                "rankings_generated": manifest.get("rankings_generated", False),
+                "orders_generated": manifest.get("orders_generated", False),
+                "formal_baseline": manifest.get("formal_baseline", "NOT_READY"),
+            }, ensure_ascii=False, indent=2))
+            return 0 if manifest["status"] == "CAPTURED_INPUTS_READY" else 2
 
         if args.command == "review":
             def input_path(value: str) -> Path:

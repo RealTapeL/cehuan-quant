@@ -469,6 +469,43 @@ def test_baostock_vendor_code_maps_to_canonical_symbol():
     assert _canonical_vendor_symbol("sz.159579") == "SZ159579"
 
 
+def test_stock_basic_can_be_restricted_to_one_requested_symbol():
+    class Response:
+        error_code = "0"
+        error_msg = "success"
+        fields = ["code", "code_name", "ipoDate", "outDate", "type"]
+        data = [["sh.600000", "浦发银行", "1999-11-10", "", "1"]]
+        cur_row_num = 0
+        per_page_count = 100
+        cur_page_num = "1"
+
+        def next(self):
+            return self.cur_row_num < len(self.data)
+
+        def get_row_data(self):
+            row = self.data[self.cur_row_num]
+            self.cur_row_num += 1
+            return row
+
+    class FakeClient:
+        def __init__(self):
+            self.requested_code = None
+
+        def query_stock_basic(self, *, code):
+            self.requested_code = code
+            return Response()
+
+    client = FakeClient()
+    session = BaoStockSession(minimum_interval_seconds=0, max_retries=0)
+    session.bs = client
+
+    result = session.stock_basic("SH600000")
+
+    assert client.requested_code == "sh.600000"
+    assert result["code"].tolist() == ["sh.600000"]
+    assert session.request_log[0]["endpoint"] == "query_stock_basic(sh.600000)"
+
+
 def test_normalize_baostock_calendar_records_open_dates_and_predecessor():
     raw = pd.DataFrame([
         {"calendar_date": "2025-01-02", "is_trading_day": "1"},

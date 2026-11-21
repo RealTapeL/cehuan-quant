@@ -269,7 +269,7 @@ def test_missing_and_duplicate_session_block_the_paired_day(tmp_path: Path) -> N
         assert result["manifest"]["status"] == "NEEDS_DATA"
         assert not (Path(result["output_dir"]) / "ranking-20d.csv").exists()
         reason = " ".join(result["manifest"]["blocking_reasons"])
-        assert ("成员日缺少行情" in reason) if case == "missing" else ("重复行情日" in reason)
+        assert ("成员且非停牌日缺少行情" in reason) if case == "missing" else ("重复行情日" in reason)
 
 
 def test_invalid_adjusted_price_blocks_instead_of_falling_back_to_raw(tmp_path: Path) -> None:
