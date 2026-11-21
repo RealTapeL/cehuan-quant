@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import json
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from cehuan.data.security_identity import IDENTITY_EVENT_COLUMNS
+from cehuan.research import daily_paper_run
+from cehuan.research.lookback_pair import FIXED_SYMBOLS
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+SIGNAL_DATE = "2026-11-20"
+
+
+def _inputs(root: Path) -> tuple[Path, Path, Path]:
+    pool = root / "selected_pool.csv"
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"symbol": FIXED_SYMBOLS}).to_csv(pool, index=False)
+    config = Path(__file__).resolve().parents[1] / "configs" / "default.toml"
+    identity = root / "security-identity-events.csv"
+    pd.DataFrame(columns=IDENTITY_EVENT_COLUMNS).to_csv(identity, index=False)
+    return pool, config, identity
+
+
+class _SyntheticBaoStock:
+    package_version = "synthetic-test-only"
+
+    def __init__(self, *, dates: list[str], omit_signal_member: bool = False, **kwargs: Any) -> None:
+        self.dates = dates
+        self.omit_signal_member = omit_signal_member
+        self.request_log: list[dict[str, Any]] = []
+
+    def __enter__(self) -> "_SyntheticBaoStock":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+        return pd.DataFrame({"calendar_date": self.dates, "is_trading_day": ["1"] * len(self.dates)})
+
+    def stock_basic(self, symbol: str) -> pd.DataFrame:
+        code = f"{symbol[:2].lower()}.{symbol[2:]}"
+        return pd.DataFrame([{
+            "code": code, "code_name": symbol, "ipoDate": "2010-01-01", "outDate": "", "type": "1",
+        }])
+
+    def all_stocks(self, day: str) -> pd.DataFrame:
+        symbols = list(FIXED_SYMBOLS)
+        if self.omit_signal_member and day == SIGNAL_DATE:
+            symbols = symbols[:-1]
+        rows = []
+        for symbol in symbols:
+            status = "0" if symbol == FIXED_SYMBOLS[0] and day == self.dates[5] else "1"
+            rows.append({"code": f"{symbol[:2].lower()}.{symbol[2:]}", "tradeStatus": status})
+        return pd.DataFrame(rows)
+
+    def history(
+        self, symbol: str, start_date: str, end_date: str, adjustflag: str, fields: str,
+    ) -> pd.DataFrame:
+        code = f"{symbol[:2].lower()}.{symbol[2:]}"
+        slope = 0.08 + 0.005 * FIXED_SYMBOLS.index(symbol)
+        rows = []
+        prior_close = 10.0
+        for index, day in enumerate(self.dates):
+            close = 10.0 + slope * index
+            suspended = symbol == FIXED_SYMBOLS[0] and day == self.dates[5]
+            if suspended:
+                close = prior_close
+            status = "0" if suspended else "1"
+            rows.append({
+                "date": day, "code": code, "open": str(close), "high": str(close + 0.1),
+                "low": str(close - 0.1), "close": str(close), "preclose": str(prior_close),
+                "volume": "0" if suspended else "1000", "amount": "0" if suspended else "10000",
+                "adjustflag": adjustflag, "turn": "0.1", "tradestatus": status,
+                "pctChg": "0" if suspended else "1", "isST": "0",
+            })
+            prior_close = close
+        return pd.DataFrame(rows)
+
+
+def _clock(start: datetime):
+    tick = [0]
+
+    def now() -> datetime:
+        value = start + timedelta(seconds=tick[0])
+        tick[0] += 1
+        return value
+
+    return now
+
+
+def _run(
+    root: Path, monkeypatch, *, omit_signal_member: bool = False,
+) -> tuple[Path, list[dict[str, Any]]]:
+    monkeypatch.setattr(daily_paper_run, "REPO_ROOT", root)
+    pool, config, identity = _inputs(root / "inputs")
+    dates = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
+    factory_arguments: list[dict[str, Any]] = []
+
+    def factory(**kwargs: Any) -> _SyntheticBaoStock:
+        factory_arguments.append(kwargs)
+        return _SyntheticBaoStock(dates=dates, omit_signal_member=omit_signal_member, **kwargs)
+
+    start = datetime(2026, 11, 20, 16, 0, tzinfo=SHANGHAI)
+    run_dir = daily_paper_run.run_daily_paper_workflow(
+        output_root=root / "data" / "private" / "daily-paper-runs",
+        pool_path=pool,
+        config_path=config,
+        identity_events_path=identity,
+        brief_output_root=root / "outputs" / "daily-briefs",
+        model_mode="llm" if omit_signal_member else "stub",
+        now=start,
+        clock_fn=_clock(start),
+        session_factory=factory,
+    )
+    return run_dir, factory_arguments
+
+
+def test_daily_paper_workflow_synthetic_capture_rank_and_brief(tmp_path: Path, monkeypatch) -> None:
+    run_dir, factory_arguments = _run(tmp_path, monkeypatch)
+
+    manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
+    capture = json.loads((run_dir / "capture-manifest.json").read_text(encoding="utf-8"))
+    ranking_manifest = json.loads((run_dir / "ranking" / "paper-ranking-manifest.json").read_text(encoding="utf-8"))
+    brief_manifest = json.loads((Path(manifest["brief_path"]).parent / "brief-manifest.json").read_text(encoding="utf-8"))
+
+    assert factory_arguments[0]["max_retries"] == 0
+    assert manifest["status"] == "COMPLETED_DAILY_PAPER_BRIEF"
+    assert manifest["rankings_generated"] is True
+    assert manifest["model_calls"] == 1
+    assert manifest["llm_request_count"] == 0
+    assert manifest["returns_computed"] is False
+    assert manifest["orders_generated"] is False
+    assert manifest["broker_connected"] is False
+    assert manifest["formal_baseline"] == "NOT_READY"
+    assert capture["state_window_row_count"] == len(FIXED_SYMBOLS) * 21
+    assert len(capture["status_requests"]) == len(FIXED_SYMBOLS)
+    assert len(capture["price_requests"]) == len(FIXED_SYMBOLS)
+    assert ranking_manifest["status"] in {"CAPTURED", "CAPTURED_WITH_EXCLUSIONS"}
+    assert ranking_manifest["window_scope"]["suspended_window_symbols"] == 1
+    assert brief_manifest["model"]["selected_mode"] == "stub"
+    assert brief_manifest["model"]["call_count"] == 1
+    assert (run_dir / "capture-manifest.seal.json").is_file()
+    assert (run_dir / "vendor-status.csv").is_file()
+
+
+def test_incomplete_member_response_blocks_ranking_and_model(tmp_path: Path, monkeypatch) -> None:
+    run_dir, _ = _run(tmp_path, monkeypatch, omit_signal_member=True)
+
+    manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
+    capture = json.loads((run_dir / "capture-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "NEEDS_DATA"
+    assert manifest["rankings_generated"] is False
+    assert manifest["model_calls"] == 0
+    assert manifest["orders_generated"] is False
+    assert capture["status"] == "NEEDS_DATA"
+    assert capture["requests"][f"membership:{SIGNAL_DATE}"]["status"] == "FAILED_VALIDATION"
+    assert "INCOMPLETE_MEMBER_RESPONSE_UNKNOWN" in capture["requests"][f"membership:{SIGNAL_DATE}"]["error_category"]
+    assert not (run_dir / "ranking" / "paper-ranking-manifest.json").exists()
+    assert not list((tmp_path / "outputs" / "daily-briefs").glob("*/brief-manifest.json"))
+
+
+def test_before_close_is_needs_data_without_provider_or_model_request(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
+    pool, config, identity = _inputs(tmp_path / "inputs")
+    called = []
+
+    def forbidden_session(**kwargs: Any):
+        called.append(kwargs)
+        raise AssertionError("pre-close gate must not open BaoStock")
+
+    now = datetime(2026, 11, 20, 14, 59, tzinfo=SHANGHAI)
+    run_dir = daily_paper_run.run_daily_paper_workflow(
+        output_root=tmp_path / "data" / "private" / "daily-paper-runs",
+        pool_path=pool,
+        config_path=config,
+        identity_events_path=identity,
+        brief_output_root=tmp_path / "outputs" / "daily-briefs",
+        model_mode="llm",
+        now=now,
+        session_factory=forbidden_session,
+    )
+    manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "NEEDS_DATA"
+    assert manifest["capture_gate"] == "BLOCKED_BEFORE_CLOSE"
+    assert manifest["requests"] == {}
+    assert manifest["rankings_generated"] is False
+    assert manifest["model_calls"] == 0
+    assert not called

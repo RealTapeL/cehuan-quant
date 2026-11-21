@@ -39,7 +39,7 @@ def _sealed_fixture(root: Path, *, h1_changed: bool = False) -> tuple[Path, Path
     pool_dir = inputs / "pool"
     symbols = ["SH600000", "SZ000001", "SH600001"] if h1_changed else ["SH600000", "SZ000001"]
     original_rows = [
-        {"signal_date": "2026-11-06", "symbol": symbol, "momentum": momentum, "rank": index, "selected_target": True}
+        {"signal_date": "2026-11-06", "symbol": symbol, "momentum": momentum, "rank": index, "selected_target": index <= 2}
         for index, (symbol, momentum) in enumerate(zip(symbols, [0.05, 0.02, 0.01]), start=1)
     ]
     ranking = pd.DataFrame(original_rows)
@@ -61,6 +61,7 @@ def _sealed_fixture(root: Path, *, h1_changed: bool = False) -> tuple[Path, Path
     h1_ranking = ranking.loc[~ranking["symbol"].eq("SH600000")].copy() if h1_changed else ranking.copy()
     if h1_changed:
         h1_ranking["rank"] = range(1, len(h1_ranking) + 1)
+        h1_ranking["selected_target"] = h1_ranking["rank"].le(2)
     bars = pd.DataFrame([
         {"symbol": symbol, "trade_date": day, "adjusted_close": close}
         for index, symbol in enumerate(symbols)

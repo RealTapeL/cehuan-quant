@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from cehuan.data.canonical import canonical_symbol
 from cehuan.research.real_market_summary import REPO_ROOT, sha256_file
 from cehuan.research.research_agent import ModelReply, resolve_research_model
 from cehuan.research.research_cycle import _read_settings
@@ -44,6 +45,14 @@ ACTION_PATTERN = re.compile(
     r"|(?:买入|卖出|建仓|加仓|减仓|下单|委托)(?:指令|建议)"
     r"|(?:目标股数|目标仓位|可执行订单|保证收益|稳赚)"
 )
+
+
+def _canonical_source_symbol(value: object) -> str:
+    raw = str(value).strip().upper()
+    prefixed = re.fullmatch(r"(SH|SZ|BJ)\.(\d{6})", raw)
+    if prefixed:
+        return f"{prefixed.group(1)}{prefixed.group(2)}"
+    return canonical_symbol(raw)
 POSITIVE_PERFORMANCE_PATTERN = re.compile(
     r"(?:收益|回报).{0,8}(?:提升|改善|增加|更高|优于|超额)"
     r"|(?:证明|证实|验证).{0,8}(?:策略有效|收益改善|收益提升|可以成交|可交易)"
@@ -132,8 +141,8 @@ def _check_rank_frame(frame: pd.DataFrame, label: str, *, allow_empty: bool = Fa
     expected = list(range(1, len(result) + 1))
     if result["rank"].astype(int).tolist() != expected:
         raise ValueError(f"{label} 排名必须从 1 连续递增")
-    if not result["selected_target"].astype(str).str.lower().isin({"true", "1"}).all():
-        raise ValueError(f"{label} 含未选入目标集合的行")
+    if not result["selected_target"].astype(str).str.lower().isin({"true", "false", "1", "0"}).all():
+        raise ValueError(f"{label} 的 selected_target 含无效布尔值")
     return result
 
 
@@ -241,6 +250,11 @@ def build_paper_ranking_facts(
     max_positions = int(manifest.get("strategy_config", {}).get("max_positions", 0))
     if max_positions < 1:
         raise ValueError("排名清单缺少有效 max_positions")
+    for label, frame in (("原排名", original), ("H1 排名", h1)):
+        expected_targets = frame["rank"].astype(int).le(max_positions)
+        actual_targets = frame["selected_target"].astype(str).str.lower().isin({"true", "1"})
+        if not actual_targets.reset_index(drop=True).equals(expected_targets.reset_index(drop=True)):
+            raise ValueError(f"{label} selected_target 与 max_positions / rank 不一致")
     eligible_symbols = set(diff.loc[diff["h1_eligible"], "symbol"])
     expected_h1 = original.loc[original["symbol"].isin(eligible_symbols)].sort_values(
         ["momentum", "symbol"], ascending=[False, True], kind="stable",
@@ -252,6 +266,10 @@ def build_paper_ranking_facts(
         or list(range(1, len(expected_h1) + 1)) != actual_h1["rank"].astype(int).tolist()
     ):
         raise ValueError("H1 排名与原候选筛选后按动量降序、代码升序重排的结果不一致")
+    expected_h1_targets = actual_h1["rank"].astype(int).le(max_positions)
+    actual_h1_targets = actual_h1["selected_target"].astype(str).str.lower().isin({"true", "1"})
+    if not actual_h1_targets.reset_index(drop=True).equals(expected_h1_targets.reset_index(drop=True)):
+        raise ValueError("H1 排名 selected_target 与重排位置不一致")
 
     original_top = original.loc[original["rank"].le(max_positions), "symbol"].tolist()
     h1_top = h1.loc[h1["rank"].le(max_positions), "symbol"].tolist()
@@ -390,12 +408,27 @@ def build_paper_ranking_facts(
     if set(price_request_files) != set(price_file_hashes):
         raise ValueError("后复权来源请求与其文件哈希清单不一致")
     for filename, request in price_request_files.items():
-        if request.get("source") != "akshare.stock_zh_a_hist_tx" or request.get("adjust") != "hfq":
-            raise ValueError("后复权补抓来源或复权口径不符合封存清单")
+        source_name = request.get("source")
+        is_akshare_hfq = source_name == "akshare.stock_zh_a_hist_tx" and request.get("adjust") == "hfq"
+        is_baostock_hfq = (
+            source_name == "BaoStock.query_history_k_data_plus"
+            and request.get("adjust") == "hfq"
+            and str(request.get("adjustflag")) == "1"
+        )
+        if not (is_akshare_hfq or is_baostock_hfq):
+            raise ValueError("后复权来源或复权口径不符合可验证的抓取清单")
         source_price = _csv(capture_path.parent / filename, f"后复权来源文件 {filename}")
         if not {"date", "close"}.issubset(source_price.columns):
             raise ValueError(f"后复权来源文件缺少日期或价格：{filename}")
         symbol = str(request.get("symbol"))
+        if is_baostock_hfq:
+            if "adjustflag" not in source_price or not source_price["adjustflag"].astype(str).str.strip().eq("1").all():
+                raise ValueError(f"BaoStock 后复权原始文件 adjustflag 与抓取清单不一致：{symbol}")
+            if "code" not in source_price:
+                raise ValueError(f"BaoStock 后复权原始文件缺少证券代码：{symbol}")
+            source_symbols = source_price["code"].map(_canonical_source_symbol).astype(str).unique().tolist()
+            if source_symbols != [symbol]:
+                raise ValueError(f"BaoStock 后复权原始文件证券代码不匹配：{symbol}")
         input_symbol = bar_frame.loc[bar_frame["symbol"].astype(str).eq(symbol), ["trade_date", "adjusted_close"]].copy()
         source_price = source_price[["date", "close"]].copy()
         input_symbol["trade_date"] = input_symbol["trade_date"].astype(str)

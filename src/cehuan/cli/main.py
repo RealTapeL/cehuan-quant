@@ -42,6 +42,7 @@ from cehuan.research.research_cycle import run_research_cycle
 from cehuan.research.real_summary_research import run_real_summary_research
 from cehuan.research.paper_ranking_review import run_paper_ranking_review
 from cehuan.research.daily_research_brief import run_daily_research_brief
+from cehuan.research.daily_paper_run import run_daily_paper_workflow
 from cehuan.research.lookback_pair import create_lookback_pair_ranking
 from cehuan.research.lookback_pair_capture import capture_lookback_pair_inputs
 from cehuan.research.baseline_readiness import (
@@ -311,6 +312,18 @@ def _parser() -> argparse.ArgumentParser:
     daily_brief.add_argument("--config", default="configs/default.toml", help="只读的基线配置")
     daily_brief.add_argument("--agent-config", help="研究 Agent 模型配置 TOML")
     daily_brief.add_argument("--model-mode", choices=["stub", "llm"], required=True, help="显式选择流程 Stub 或真实 LLM；数据不新鲜时不会请求模型")
+
+    daily_paper = subs.add_parser(
+        "daily-paper-run",
+        help="收盘后为固定 10 只研究池采集 21 日输入、生成纸面排名并交给每日简报门控",
+    )
+    daily_paper.add_argument("--pool", default="data/private/experiments/forward-small-20261106-akshare-v1/selected_pool.csv", help="固定 10 只流程试运行池；代码和顺序必须匹配已登记名单")
+    daily_paper.add_argument("--config", default="configs/default.toml", help="只读当前基线配置；本命令不修改")
+    daily_paper.add_argument("--identity-events", help="默认读取配置中的证券身份事件文件")
+    daily_paper.add_argument("--output-root", default="data/private/experiments/daily-paper-runs", help="每次写入新的 Git 忽略私有目录")
+    daily_paper.add_argument("--brief-output", default="outputs/daily-research-briefs", help="每日简报写入 Git 忽略的 outputs/ 目录")
+    daily_paper.add_argument("--agent-config", help="研究 Agent 模型配置 TOML")
+    daily_paper.add_argument("--model-mode", choices=["stub", "llm"], required=True, help="显式选择；只在采集、窗口、状态、来源哈希和排名全部通过后才可能调用")
 
     lookback_pair = subs.add_parser(
         "lookback-pair-rank",
@@ -1368,6 +1381,51 @@ def main(argv: list[str] | None = None) -> int:
                 "orders_generated": manifest["orders_generated"],
             }, ensure_ascii=False, indent=2))
             return 0 if manifest["status"].startswith("COMPLETED") else 2
+
+        if args.command == "daily-paper-run":
+            def daily_repo_path(value: str) -> Path:
+                path = Path(value).expanduser()
+                return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+            output_root = daily_repo_path(args.output_root)
+            private_root = (REPO_ROOT / "data" / "private").resolve()
+            if private_root not in output_root.parents:
+                raise ValueError("daily-paper-run 的 output-root 必须位于 Git 忽略的 data/private/ 下")
+            brief_root = daily_repo_path(args.brief_output)
+            ignored_output_root = (REPO_ROOT / "outputs").resolve()
+            if ignored_output_root not in brief_root.parents:
+                raise ValueError("daily-paper-run 的 brief-output 必须位于 Git 忽略的 outputs/ 下")
+            run_dir = run_daily_paper_workflow(
+                output_root=output_root,
+                pool_path=daily_repo_path(args.pool),
+                config_path=daily_repo_path(args.config),
+                identity_events_path=daily_repo_path(args.identity_events) if args.identity_events else None,
+                brief_output_root=brief_root,
+                agent_config_path=daily_repo_path(args.agent_config) if args.agent_config else None,
+                model_mode=args.model_mode,
+            )
+            manifest_path = run_dir / "daily-run-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            print(json.dumps({
+                "run_id": manifest["run_id"],
+                "output_dir": str(run_dir),
+                "report": str(run_dir / "daily-run-report.md"),
+                "status": manifest["status"],
+                "signal_date": manifest["signal_date"],
+                "capture_status": manifest.get("capture_manifest_status", manifest.get("status")),
+                "ranking_generated": manifest.get("rankings_generated", False),
+                "ranking_path": manifest.get("ranking_manifest_path"),
+                "brief_path": manifest.get("brief_path"),
+                "model_mode": manifest.get("model_mode"),
+                "model_calls": manifest.get("model_calls", 0),
+                "llm_request_count": manifest.get("llm_request_count", 0),
+                "token_usage": manifest.get("model_usage"),
+                "formal_baseline": manifest.get("formal_baseline", "NOT_READY"),
+                "broker_connected": manifest.get("broker_connected", False),
+                "orders_generated": manifest.get("orders_generated", False),
+                "blocking_reasons": manifest.get("blocking_reasons", []),
+            }, ensure_ascii=False, indent=2))
+            return 0 if str(manifest["status"]).startswith("COMPLETED") else 2
 
         if args.command == "lookback-pair-rank":
             def repo_path(value: str) -> Path:
