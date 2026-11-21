@@ -41,6 +41,7 @@ from cehuan.research.baseline_diagnostics import run_baseline_sensitivity
 from cehuan.research.research_cycle import run_research_cycle
 from cehuan.research.real_summary_research import run_real_summary_research
 from cehuan.research.paper_ranking_review import run_paper_ranking_review
+from cehuan.research.daily_research_brief import run_daily_research_brief
 from cehuan.research.lookback_pair import create_lookback_pair_ranking
 from cehuan.research.lookback_pair_capture import capture_lookback_pair_inputs
 from cehuan.research.baseline_readiness import (
@@ -299,6 +300,17 @@ def _parser() -> argparse.ArgumentParser:
     paper_review.add_argument("--output", default="outputs/paper-ranking-reviews", help="Git 忽略的独立复盘产物根目录")
     paper_review.add_argument("--agent-config", help="研究 Agent 模型与预算配置 TOML")
     paper_review.add_argument("--model-mode", choices=["llm"], required=True, help="必须显式指定 llm；不会回退 stub")
+
+    daily_brief = subs.add_parser(
+        "daily-research-brief",
+        help="从最近已完成交易日的封存纸面排名生成研究简报；不采集行情、不回测、不下单",
+    )
+    daily_brief.add_argument("--calendar", required=True, help="当前交易日历 CSV；优先使用带同目录 capture-manifest 的冻结文件")
+    daily_brief.add_argument("--ranking-root", default="data/private/experiments", help="搜索封存 FORWARD_PAPER 排名的私有目录")
+    daily_brief.add_argument("--output", default="outputs/daily-research-briefs", help="Git 忽略的每日简报产物目录")
+    daily_brief.add_argument("--config", default="configs/default.toml", help="只读的基线配置")
+    daily_brief.add_argument("--agent-config", help="研究 Agent 模型配置 TOML")
+    daily_brief.add_argument("--model-mode", choices=["stub", "llm"], required=True, help="显式选择流程 Stub 或真实 LLM；数据不新鲜时不会请求模型")
 
     lookback_pair = subs.add_parser(
         "lookback-pair-rank",
@@ -1323,6 +1335,39 @@ def main(argv: list[str] | None = None) -> int:
                 "orders_generated": manifest["orders_generated"],
             }, ensure_ascii=False, indent=2))
             return 0 if manifest["status"] == "COMPLETED_REAL_LLM_REVIEW" else 2
+
+        if args.command == "daily-research-brief":
+            brief_output = Path(args.output).expanduser()
+            brief_output = (brief_output if brief_output.is_absolute() else REPO_ROOT / brief_output).resolve()
+            ignored_output_root = (REPO_ROOT / "outputs").resolve()
+            try:
+                brief_output.relative_to(ignored_output_root)
+            except ValueError:
+                raise ValueError("每日研究简报必须写入 Git 忽略的 outputs/ 目录") from None
+            run_dir = run_daily_research_brief(
+                calendar_path=args.calendar,
+                ranking_root=args.ranking_root,
+                output_root=brief_output,
+                model_mode=args.model_mode,
+                agent_config_path=args.agent_config,
+                config_path=args.config,
+            )
+            manifest = json.loads((run_dir / "brief-manifest.json").read_text(encoding="utf-8"))
+            print(json.dumps({
+                "run_id": manifest["run_id"],
+                "output_dir": str(run_dir),
+                "report": str(run_dir / "daily-brief.md"),
+                "status": manifest["status"],
+                "signal_date": manifest["signal_date"],
+                "model_mode": manifest["model"].get("selected_mode"),
+                "model": manifest["model"].get("model"),
+                "model_calls": manifest["model"].get("call_count", 0),
+                "token_usage": manifest["model"].get("usage"),
+                "formal_baseline": manifest["formal_baseline"],
+                "broker_connected": manifest["broker_connected"],
+                "orders_generated": manifest["orders_generated"],
+            }, ensure_ascii=False, indent=2))
+            return 0 if manifest["status"].startswith("COMPLETED") else 2
 
         if args.command == "lookback-pair-rank":
             def repo_path(value: str) -> Path:
