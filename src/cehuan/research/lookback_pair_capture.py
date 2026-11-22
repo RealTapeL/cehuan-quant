@@ -107,11 +107,14 @@ def _capture_locked(
         raise ValueError("采集目录缺少 capture-progress.json，不能续跑")
 
     freeze = _load_freeze(freeze_path)
+    adapter_path = _repo_root() / "src" / "cehuan" / "data" / "baostock_adapter.py"
     inputs = {
         "registration_freeze": _sha(freeze_path),
         "config": _sha_required(config_path, "strategy config"),
         "pool": _sha_required(pool_path, "fixed pool"),
         "identity_events": _sha_required(identity_path, "identity events"),
+        "baostock_adapter": _sha_required(adapter_path, "registered BaoStock adapter"),
+        "lookback_pair_capture": _sha_required(Path(__file__).resolve(), "lookback capture implementation"),
     }
     _validate_freeze_inputs(freeze, config_path, pool_path, inputs)
     if resume:
@@ -346,6 +349,19 @@ def _build_dependent_requests(progress: dict[str, Any], target: Path) -> None:
     _write_progress(target / "capture-progress.json", progress)
 
 
+def _stock_basic_for_symbol(session: Any, symbol: str) -> pd.DataFrame:
+    """Filter one basic record through the registered session's existing request wrapper."""
+    normalized = canonical_symbol(symbol)
+    if len(normalized) != 8 or normalized[:2] not in {"SH", "SZ"}:
+        raise ValueError(f"BaoStock 固定研究池仅支持沪深代码：{symbol}")
+    code = f"{normalized[:2].lower()}.{normalized[2:]}"
+    endpoint = f"query_stock_basic({code})"
+    return session._query(
+        endpoint,
+        lambda: session.bs.query_stock_basic(code=code),
+    )
+
+
 def _new_request() -> dict[str, Any]:
     return {"status": "PENDING", "attempts": []}
 
@@ -357,7 +373,7 @@ def _attempt_pending(
     if not progress.get("dependent_requests_built"):
         return
     tasks: list[tuple[str, Callable[[Any], pd.DataFrame]]] = [
-        (f"stock_basic:{symbol}", lambda s, symbol=symbol: s.stock_basic(symbol))
+        (f"stock_basic:{symbol}", lambda s, symbol=symbol: _stock_basic_for_symbol(s, symbol))
         for symbol in FIXED_SYMBOLS
     ]
     for day in progress["signal_sessions"]:
@@ -555,6 +571,8 @@ def _response_validation_error(
         codes = frame["code"].astype(str).str.strip()
         if codes.eq("").any() or codes.duplicated().any():
             return "证券基础资料含空代码或重复代码"
+        if not frame["type"].astype(str).str.strip().eq("1").all():
+            return "证券基础资料含非股票或未知 type；固定池证券类型无法确认"
         if ":" in key:
             expected_symbol = key.split(":", 1)[1]
             canonical_codes = set(frame["code"].map(_canonical_baostock_symbol).astype(str))
@@ -607,11 +625,14 @@ def _seal_capture(
     target: Path, progress: dict[str, Any], config_path: Path, pool_path: Path,
     identity_path: Path, freeze_path: Path, now: datetime,
 ) -> None:
+    adapter_path = _repo_root() / "src" / "cehuan" / "data" / "baostock_adapter.py"
     current_source_hashes = {
         "registration_freeze": _sha(freeze_path),
         "config": _sha_required(config_path, "strategy config"),
         "pool": _sha_required(pool_path, "fixed pool"),
         "identity_events": _sha_required(identity_path, "identity events"),
+        "baostock_adapter": _sha_required(adapter_path, "registered BaoStock adapter"),
+        "lookback_pair_capture": _sha_required(Path(__file__).resolve(), "lookback capture implementation"),
     }
     if current_source_hashes != progress.get("source_sha256"):
         raise ValueError("采集期间冻结配置、研究池、身份事件或登记清单发生变化；禁止封存")
@@ -822,6 +843,18 @@ def _seal_capture(
         "provider": "BaoStock",
         "provider_package_version": progress.get("provider_package_version"),
         "interfaces": CAPTURE_INTERFACES,
+        "adapter_provenance": {
+            "adapter_path": "src/cehuan/data/baostock_adapter.py",
+            "adapter_sha256": progress["source_sha256"]["baostock_adapter"],
+            "registered_adapter_sha256": progress["source_sha256"]["baostock_adapter"],
+            "compatibility_layer_path": "src/cehuan/research/lookback_pair_capture.py",
+            "compatibility_layer_sha256": progress["source_sha256"]["lookback_pair_capture"],
+            "compatibility_call": (
+                "_stock_basic_for_symbol uses the registered BaoStockSession._query wrapper "
+                "to call session.bs.query_stock_basic(code=<fixed symbol>)"
+            ),
+            "actual_query_interface": "query_stock_basic(code=<fixed symbol>)",
+        },
         "membership_response_scope": (
             "BaoStock documents query_all_stock(day) as the date's full securities list. The SDK adapter exhausts "
             "pages and detects a failed next() after a full page, but the response has no total-row count or checksum. "
@@ -1096,6 +1129,16 @@ def _validate_freeze_inputs(freeze: dict[str, Any], config: Path, pool: Path, in
     pool_frame = pd.read_csv(pool, dtype=str, keep_default_na=False)
     if "symbol" not in pool_frame or tuple(pool_frame["symbol"].map(canonical_symbol)) != FIXED_SYMBOLS:
         raise ValueError("研究池 CSV 的代码、顺序或数量不符合冻结的 10 只证券")
+    adapter_item = files.get("baostock_adapter", {})
+    adapter_path = _repo_root() / "src" / "cehuan" / "data" / "baostock_adapter.py"
+    expected_adapter_path = Path(adapter_item.get("path", ""))
+    if not expected_adapter_path.is_absolute():
+        expected_adapter_path = _repo_root() / expected_adapter_path
+    if (
+        expected_adapter_path.resolve() != adapter_path.resolve()
+        or adapter_item.get("sha256") != input_hashes.get("baostock_adapter")
+    ):
+        raise ValueError("BaoStock 适配器路径或 SHA-256 与冻结登记不匹配；禁止采集")
     calendar_item = files.get("calendar", {})
     calendar_path = _registration_calendar_path(freeze)
     if not calendar_path.is_file() or _sha(calendar_path) != calendar_item.get("sha256"):

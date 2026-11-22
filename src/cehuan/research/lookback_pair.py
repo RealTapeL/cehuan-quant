@@ -74,6 +74,8 @@ def create_lookback_pair_ranking(
         "identity_events": Path(identity_events_path).expanduser().resolve(),
         "registration_freeze": Path(registration_freeze_path).expanduser().resolve(),
         "capture_manifest": Path(capture_manifest_path).expanduser().resolve(),
+        "baostock_adapter": Path(__file__).resolve().parents[3] / "src" / "cehuan" / "data" / "baostock_adapter.py",
+        "lookback_pair_capture": Path(__file__).resolve().with_name("lookback_pair_capture.py"),
     }
     target = Path(output_dir).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -342,6 +344,19 @@ def _validate_frozen_sources(freeze: dict[str, Any], paths: dict[str, Path], has
             pool = pd.read_csv(frozen_path, dtype=str, keep_default_na=False)
             if "symbol" not in pool or tuple(pool["symbol"].map(canonical_symbol)) != FIXED_SYMBOLS:
                 raise _BlockedInput("固定研究池源文件证券或顺序与登记名单不一致")
+    adapter_item = frozen.get("baostock_adapter")
+    if not isinstance(adapter_item, dict) or not adapter_item.get("path") or not adapter_item.get("sha256"):
+        raise _BlockedInput("登记冻结文件缺少 baostock_adapter 路径或 SHA-256")
+    adapter_path = Path(adapter_item["path"])
+    if not adapter_path.is_absolute():
+        adapter_path = Path(__file__).resolve().parents[3] / adapter_path
+    if (
+        adapter_path.resolve() != paths["baostock_adapter"].resolve()
+        or not adapter_path.is_file()
+        or _sha(adapter_path) != adapter_item["sha256"]
+        or hashes.get("baostock_adapter") != adapter_item["sha256"]
+    ):
+        raise _BlockedInput("当前 BaoStock 适配器 SHA-256 与 2026-12-17 冻结登记不匹配")
     doc_item = frozen.get("registration_document")
     if isinstance(doc_item, dict) and doc_item.get("path") and doc_item.get("sha256"):
         document = Path(doc_item["path"])
@@ -389,6 +404,22 @@ def _validate_capture_manifest(
         if bound.get(key) != hashes.get(key):
             raise _BlockedInput(f"采集清单 {key} SHA-256 与实际输入不一致")
         checks[key] = "VERIFIED"
+    source_bound = capture.get("source_sha256")
+    if not isinstance(source_bound, dict):
+        raise _BlockedInput("采集清单缺少源码 SHA-256 绑定")
+    for key in ("baostock_adapter", "lookback_pair_capture"):
+        if source_bound.get(key) != hashes.get(key):
+            raise _BlockedInput(f"采集清单 {key} 源码 SHA-256 与当前实验源码不一致")
+        checks[f"source_{key}"] = "VERIFIED"
+    provenance = capture.get("adapter_provenance")
+    if not isinstance(provenance, dict):
+        raise _BlockedInput("采集清单缺少适配器兼容层来源记录")
+    if provenance.get("adapter_sha256") != hashes.get("baostock_adapter"):
+        raise _BlockedInput("采集清单记录的适配器哈希与当前源码不一致")
+    if provenance.get("compatibility_layer_sha256") != hashes.get("lookback_pair_capture"):
+        raise _BlockedInput("采集清单记录的兼容层哈希与当前源码不一致")
+    if provenance.get("actual_query_interface") != "query_stock_basic(code=<fixed symbol>)":
+        raise _BlockedInput("采集清单基础资料接口记录与实际查询不一致")
     provider = str(capture.get("provider", "")).strip()
     if mode == "FORWARD_PAPER":
         if "baostock" not in provider.casefold():
@@ -844,7 +875,9 @@ def _code_sha256() -> dict[str, str]:
     repo = Path(__file__).resolve().parents[3]
     sources = (
         "src/cehuan/research/lookback_pair.py",
+        "src/cehuan/research/lookback_pair_capture.py",
         "src/cehuan/cli/main.py",
+        "src/cehuan/data/baostock_adapter.py",
         "src/cehuan/signals/strategy.py",
         "src/cehuan/data/canonical.py",
         "src/cehuan/data/calendar.py",

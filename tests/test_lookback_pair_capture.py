@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from cehuan.research.lookback_pair import EXPERIMENT_ID, FIXED_SYMBOLS
+from cehuan.research.lookback_pair import (
+    EXPERIMENT_ID,
+    FIXED_SYMBOLS,
+    create_lookback_pair_ranking,
+)
 from cehuan.research.lookback_pair_capture import capture_lookback_pair_inputs
 
 
@@ -56,6 +60,10 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, Path], pd.DataFrame]:
             "strategy_config": {"path": str(config), "sha256": _sha(config)},
             "pool": {"path": str(pool), "sha256": _sha(pool)},
             "calendar": {"path": str(calendar), "sha256": _sha(calendar)},
+            "baostock_adapter": {
+                "path": "src/cehuan/data/baostock_adapter.py",
+                "sha256": _sha(REPO / "src/cehuan/data/baostock_adapter.py"),
+            },
             "registration_document": {
                 "path": "docs/lookback-10-vs-20-forward-registration.md",
                 "sha256": _sha(registration_doc),
@@ -79,6 +87,7 @@ class FakeBaoStockState:
         missing_bar: tuple[str, str] | None = None,
         invalid_member_day: str | None = None,
         omitted_member: tuple[str, str] | None = None,
+        basic_issue: tuple[str, str] | None = None,
     ) -> None:
         self.reference = reference
         self.fail_member_once = fail_member_once
@@ -86,6 +95,7 @@ class FakeBaoStockState:
         self.missing_bar = missing_bar
         self.invalid_member_day = invalid_member_day
         self.omitted_member = omitted_member
+        self.basic_issue = basic_issue
         self.calls: dict[str, int] = {}
         self.session_count = 0
 
@@ -102,6 +112,7 @@ class FakeBaoStockSession:
     def __init__(self, state: FakeBaoStockState) -> None:
         self.state = state
         self.request_log: list[dict[str, Any]] = []
+        self.bs = self
 
     def __enter__(self) -> "FakeBaoStockSession":
         self._record("login")
@@ -121,13 +132,22 @@ class FakeBaoStockSession:
             "is_trading_day": self.state.reference["is_open"].map({True: "1", False: "0"}),
         })
 
-    def stock_basic(self, symbol: str) -> pd.DataFrame:
-        endpoint = f"query_stock_basic({_vendor_code(symbol)})"
+    def _query(self, endpoint: str, operation):
         self._record(endpoint)
-        return pd.DataFrame([{
-            "code": _vendor_code(symbol), "code_name": f"synthetic-{symbol}",
-            "ipoDate": "2000-01-01", "outDate": "", "type": "1",
-        }])
+        return operation()
+
+    def query_stock_basic(self, *, code: str) -> pd.DataFrame:
+        symbol = f"{code[:2].upper()}{code[3:]}"
+        issue = self.state.basic_issue
+        if issue == (symbol, "missing"):
+            return pd.DataFrame(columns=["code", "code_name", "ipoDate", "outDate", "type"])
+        security_type = "2" if issue == (symbol, "type") else "1"
+        row = {
+            "code": code, "code_name": f"synthetic-{symbol}",
+            "ipoDate": "2000-01-01", "outDate": "", "type": security_type,
+        }
+        rows = [row, row.copy()] if issue == (symbol, "duplicate") else [row]
+        return pd.DataFrame(rows)
 
     def all_stocks(self, day: str) -> pd.DataFrame:
         endpoint = f"query_all_stock({day})"
@@ -209,6 +229,14 @@ def test_capture_writes_bao_stock_raw_and_normalized_inputs_with_hashes(tmp_path
     assert capture_manifest["signal_price_adjustment"] == "adjustflag=1"
     assert capture_manifest["raw_price_adjustment"] == "adjustflag=3"
     assert len(capture_manifest["raw_responses"]) == 52
+    adapter_hash = _sha(REPO / "src/cehuan/data/baostock_adapter.py")
+    capture_layer_hash = _sha(REPO / "src/cehuan/research/lookback_pair_capture.py")
+    assert capture_manifest["source_sha256"]["baostock_adapter"] == adapter_hash
+    assert capture_manifest["source_sha256"]["lookback_pair_capture"] == capture_layer_hash
+    assert capture_manifest["adapter_provenance"]["adapter_sha256"] == adapter_hash
+    assert capture_manifest["adapter_provenance"]["compatibility_layer_sha256"] == capture_layer_hash
+    assert capture_manifest["adapter_provenance"]["actual_query_interface"] == "query_stock_basic(code=<fixed symbol>)"
+    assert all(state.calls[f"query_stock_basic({_vendor_code(symbol)})"] == 1 for symbol in FIXED_SYMBOLS)
     for response in capture_manifest["raw_responses"]:
         path = output / response["path"]
         assert path.is_file()
@@ -222,6 +250,120 @@ def test_capture_writes_bao_stock_raw_and_normalized_inputs_with_hashes(tmp_path
     assert capture_manifest["calendar_overlap"]["status"] == "MATCH"
     assert capture_manifest["session_events"]
     assert all(item["events_before_data_request"][0]["endpoint"] == "login" for item in capture_manifest["session_events"])
+
+
+def test_sealed_synthetic_capture_is_consumed_by_forward_pair_ranker(tmp_path: Path) -> None:
+    paths, reference = _fixture(tmp_path)
+    state = FakeBaoStockState(reference)
+    capture_at = datetime(2026, 12, 17, 15, 10, tzinfo=SHANGHAI)
+    capture_dir = tmp_path / "capture-then-rank"
+
+    captured = _capture(tmp_path, paths, state, capture_dir, capture_at)
+    assert captured["manifest"]["status"] == "CAPTURED_INPUTS_READY"
+
+    ranking = create_lookback_pair_ranking(
+        bars_path=capture_dir / "bars.csv",
+        config_path=paths["config"],
+        calendar_path=capture_dir / "trading-calendar.csv",
+        universe_path=capture_dir / "point-in-time-universe.csv",
+        pool_path=paths["pool"],
+        identity_events_path=paths["identity"],
+        registration_freeze_path=paths["freeze"],
+        capture_manifest_path=capture_dir / "capture-manifest.json",
+        signal_date="2026-12-17",
+        output_dir=tmp_path / "paired-ranking",
+        mode="FORWARD_PAPER",
+        now_utc=datetime(2026, 12, 17, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert ranking["manifest"]["status"] == "CAPTURED_FORWARD_RANKING_ONLY"
+    assert ranking["manifest"]["classification"] == "FORWARD_PAPER_CANDIDATE_ONLY"
+    assert ranking["manifest"]["common_candidate_count"] == len(FIXED_SYMBOLS)
+    assert ranking["manifest"]["input_sha256"]["capture_manifest"] == _sha(
+        capture_dir / "capture-manifest.json",
+    )
+    assert ranking["manifest"]["capture_checks"]["source_baostock_adapter"] == "VERIFIED"
+    assert ranking["manifest"]["capture_checks"]["source_lookback_pair_capture"] == "VERIFIED"
+    assert (Path(ranking["output_dir"]) / "ranking-20d.csv").is_file()
+    assert (Path(ranking["output_dir"]) / "ranking-10d.csv").is_file()
+
+    capture_manifest_path = capture_dir / "capture-manifest.json"
+    capture_manifest_path.write_text(
+        capture_manifest_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    tampered = create_lookback_pair_ranking(
+        bars_path=capture_dir / "bars.csv",
+        config_path=paths["config"],
+        calendar_path=capture_dir / "trading-calendar.csv",
+        universe_path=capture_dir / "point-in-time-universe.csv",
+        pool_path=paths["pool"],
+        identity_events_path=paths["identity"],
+        registration_freeze_path=paths["freeze"],
+        capture_manifest_path=capture_manifest_path,
+        signal_date="2026-12-17",
+        output_dir=tmp_path / "tampered-paired-ranking",
+        mode="FORWARD_PAPER",
+        now_utc=datetime(2026, 12, 17, 8, 0, tzinfo=timezone.utc),
+    )
+    assert tampered["manifest"]["status"] == "NEEDS_DATA"
+    assert any("封存 SHA-256 不匹配" in reason for reason in tampered["manifest"]["blocking_reasons"])
+    assert not (Path(tampered["output_dir"]) / "ranking-20d.csv").exists()
+
+
+@pytest.mark.parametrize(
+    ("issue", "expected_error"),
+    [
+        ("missing", "必需响应返回 0 行"),
+        ("duplicate", "证券基础资料含空代码或重复代码"),
+        ("type", "含非股票或未知 type"),
+    ],
+)
+def test_basic_response_missing_duplicate_or_wrong_type_blocks_capture(
+    tmp_path: Path, issue: str, expected_error: str,
+) -> None:
+    paths, reference = _fixture(tmp_path)
+    state = FakeBaoStockState(reference, basic_issue=(FIXED_SYMBOLS[0], issue))
+    output = tmp_path / f"bad-basic-{issue}"
+    at = datetime(2026, 12, 17, 15, 10, tzinfo=SHANGHAI)
+
+    result = _capture(tmp_path, paths, state, output, at)
+
+    request = result["manifest"]["requests"][f"stock_basic:{FIXED_SYMBOLS[0]}"]
+    assert result["manifest"]["status"] == "PARTIAL_CAPTURE_RETRY_2_PENDING"
+    assert request["status"] == "FAILED"
+    assert expected_error in request["attempts"][0]["error"]["message"]
+    assert result["manifest"]["rankings_generated"] is False
+
+
+def test_adapter_hash_mismatch_blocks_before_provider_session(tmp_path: Path) -> None:
+    paths, reference = _fixture(tmp_path)
+    freeze = json.loads(paths["freeze"].read_text(encoding="utf-8"))
+    freeze["frozen_input_files"]["baostock_adapter"]["sha256"] = "0" * 64
+    paths["freeze"].write_text(json.dumps(freeze, indent=2) + "\n", encoding="utf-8")
+    paths["freeze"].with_suffix(".sha256").write_text(
+        f"{_sha(paths['freeze'])}  {paths['freeze'].name}\n", encoding="ascii",
+    )
+    sessions: list[object] = []
+
+    def forbidden_session(**kwargs: Any):
+        sessions.append(kwargs)
+        raise AssertionError("adapter hash mismatch must block before provider connection")
+
+    at = datetime(2026, 12, 17, 15, 10, tzinfo=SHANGHAI)
+    with pytest.raises(ValueError, match="BaoStock 适配器路径或 SHA-256 与冻结登记不匹配"):
+        capture_lookback_pair_inputs(
+            output_dir=tmp_path / "adapter-mismatch",
+            registration_freeze_path=paths["freeze"],
+            config_path=paths["config"],
+            pool_path=paths["pool"],
+            identity_events_path=paths["identity"],
+            signal_date="2026-12-17",
+            now=at,
+            clock_fn=_clock(at),
+            session_factory=forbidden_session,
+        )
+    assert not sessions
 
 
 def test_capture_retries_only_failed_request_and_never_overwrites_attempts(tmp_path: Path) -> None:

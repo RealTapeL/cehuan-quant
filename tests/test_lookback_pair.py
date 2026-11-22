@@ -66,6 +66,8 @@ def _inputs(tmp_path: Path) -> dict[str, Path]:
 
     config_path = tmp_path / "default.toml"
     config_path.write_bytes((repo / "configs/default.toml").read_bytes())
+    adapter_path = repo / "src/cehuan/data/baostock_adapter.py"
+    capture_impl_path = repo / "src/cehuan/research/lookback_pair_capture.py"
 
     freeze_path = tmp_path / "registration-freeze.json"
     freeze = {
@@ -77,6 +79,9 @@ def _inputs(tmp_path: Path) -> dict[str, Path]:
             "strategy_config": {"path": str(config_path), "sha256": _sha(config_path)},
             "pool": {"path": str(pool_path), "sha256": _sha(pool_path)},
             "calendar": {"path": str(calendar_path), "sha256": _sha(calendar_path)},
+            "baostock_adapter": {
+                "path": "src/cehuan/data/baostock_adapter.py", "sha256": _sha(adapter_path),
+            },
         },
     }
     freeze_path.write_text(json.dumps(freeze, indent=2) + "\n", encoding="utf-8")
@@ -101,6 +106,19 @@ def _inputs(tmp_path: Path) -> dict[str, Path]:
         "provider_publication_evidence": "UNVERIFIED",
         "trusted_external_timestamp": "UNVERIFIED",
         "input_sha256": {key: _sha(path) for key, path in paths.items()},
+        "source_sha256": {
+            "baostock_adapter": _sha(adapter_path),
+            "lookback_pair_capture": _sha(capture_impl_path),
+        },
+        "adapter_provenance": {
+            "adapter_path": "src/cehuan/data/baostock_adapter.py",
+            "adapter_sha256": _sha(adapter_path),
+            "registered_adapter_sha256": _sha(adapter_path),
+            "compatibility_layer_path": "src/cehuan/research/lookback_pair_capture.py",
+            "compatibility_layer_sha256": _sha(capture_impl_path),
+            "compatibility_call": "synthetic fixture for registered adapter compatibility",
+            "actual_query_interface": "query_stock_basic(code=<fixed symbol>)",
+        },
     }, indent=2) + "\n", encoding="utf-8")
     return {
         "bars": bars_path, "calendar": calendar_path, "universe": universe_path,
@@ -325,6 +343,25 @@ def test_capture_hash_mismatch_is_blocked_and_inputs_are_bound(tmp_path: Path) -
     assert result["manifest"]["status"] == "NEEDS_DATA"
     assert "bars SHA-256" in " ".join(result["manifest"]["blocking_reasons"])
     assert not (out / "ranking-20d.csv").exists()
+
+
+def test_registered_adapter_hash_mismatch_blocks_pair_ranking(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    freeze = json.loads(inputs["freeze"].read_text(encoding="utf-8"))
+    freeze["frozen_input_files"]["baostock_adapter"]["sha256"] = "0" * 64
+    inputs["freeze"].write_text(json.dumps(freeze, indent=2) + "\n", encoding="utf-8")
+    inputs["freeze"].with_suffix(".sha256").write_text(
+        f"{_sha(inputs['freeze'])}  registration-freeze.json\n", encoding="ascii",
+    )
+
+    result = _run(inputs, tmp_path / "adapter-mismatch-rank")
+
+    assert result["manifest"]["status"] == "NEEDS_DATA"
+    assert any(
+        "当前 BaoStock 适配器 SHA-256 与 2026-12-17 冻结登记不匹配" in reason
+        for reason in result["manifest"]["blocking_reasons"]
+    )
+    assert not (Path(result["output_dir"]) / "ranking-20d.csv").exists()
     assert result["manifest"]["input_sha256"]["bars"] == _sha(inputs["bars"])
 
 

@@ -469,7 +469,7 @@ def test_baostock_vendor_code_maps_to_canonical_symbol():
     assert _canonical_vendor_symbol("sz.159579") == "SZ159579"
 
 
-def test_stock_basic_can_be_restricted_to_one_requested_symbol():
+def test_registered_stock_basic_uses_unfiltered_no_argument_interface():
     class Response:
         error_code = "0"
         error_msg = "success"
@@ -489,21 +489,21 @@ def test_stock_basic_can_be_restricted_to_one_requested_symbol():
 
     class FakeClient:
         def __init__(self):
-            self.requested_code = None
+            self.requested_without_code = False
 
-        def query_stock_basic(self, *, code):
-            self.requested_code = code
+        def query_stock_basic(self):
+            self.requested_without_code = True
             return Response()
 
     client = FakeClient()
     session = BaoStockSession(minimum_interval_seconds=0, max_retries=0)
     session.bs = client
 
-    result = session.stock_basic("SH600000")
+    result = session.stock_basic()
 
-    assert client.requested_code == "sh.600000"
+    assert client.requested_without_code
     assert result["code"].tolist() == ["sh.600000"]
-    assert session.request_log[0]["endpoint"] == "query_stock_basic(sh.600000)"
+    assert session.request_log[0]["endpoint"] == "query_stock_basic"
 
 
 def test_normalize_baostock_calendar_records_open_dates_and_predecessor():
