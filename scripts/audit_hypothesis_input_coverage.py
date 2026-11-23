@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only H1/H2 coverage preflight for a private historical snapshot."""
+"""汇总历史假设诊断所需输入的覆盖、哈希和限制，并生成审计报告；读取私有输入但只写新审计产物。"""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ DEFAULT_ORIGINAL_RUN_MANIFEST = ROOT / "data/private/experiments/ckpt-v2-real-sh
 
 
 def sha256_file(path: Path) -> str:
+    """计算指定文件的 SHA-256，用于把报告输入绑定到文件字节。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -45,6 +46,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _json(path: Path) -> dict[str, Any]:
+    """读取 UTF-8 JSON 文件并返回解析对象；格式错误向上抛出。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"JSON 顶层必须为对象: {path}")
@@ -52,12 +54,14 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def _git_context() -> dict[str, Any]:
+    """读取当前仓库提交与工作区信息，为审计产物记录代码上下文。"""
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
     status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
     return {"head": head, "working_tree_dirty": bool(status.strip())}
 
 
 def _input_record(path: Path, role: str, expected_sha256: str | None = None) -> dict[str, Any]:
+    """构造单个审计输入的路径、角色和哈希记录；实际哈希与预期值不一致时保留差异。"""
     observed = sha256_file(path) if path.is_file() else None
     status = "MISSING" if observed is None else "AVAILABLE_BUT_UNVERIFIED"
     if expected_sha256:
@@ -69,6 +73,7 @@ def _input_record(path: Path, role: str, expected_sha256: str | None = None) -> 
 
 
 def _markdown(report: dict[str, Any], input_records: list[dict[str, Any]]) -> str:
+    """将覆盖审计结果与输入清单渲染为 Markdown，供人工阅读。"""
     lines = [
         "# H1/H2 真实快照输入覆盖预检", "",
         f"- 类型：`{report['report_type']}`", f"- 生成时间：`{report['created_at_utc']}`",
@@ -116,6 +121,7 @@ def _markdown(report: dict[str, Any], input_records: list[dict[str, Any]]) -> st
 
 
 def _h1_candidate_changes_markdown(frame: pd.DataFrame, report: dict[str, Any]) -> str:
+    """把 H1 候选变化表中的程序差异整理为报告段落；不推断收益变化。"""
     detail = frame.loc[frame.scope.eq("ORIGINAL_CANDIDATE_POOL")].copy()
     impacted = detail.loc[
         ~detail.h1_status.eq("ELIGIBLE_FOR_H1_DIAGNOSTIC")
@@ -158,6 +164,7 @@ def build_report(
     market_rules_path: Path | None = None, fee_schedule_path: Path | None = None,
     output_dir: Path,
 ) -> dict[str, Any]:
+    """读取已登记实验资料，计算输入覆盖和限制并组装结构化报告；缺少资料时显式保留未知状态。"""
     bars_path = bars_path.resolve()
     bars_manifest_path = bars_manifest_path.resolve()
     universe_dir = universe_dir.resolve()
@@ -360,6 +367,7 @@ def build_report(
 
 
 def main() -> int:
+    """解析审计目录和输出位置，生成覆盖报告与相关文件；不会修改原实验输入。"""
     parser = argparse.ArgumentParser(description="Read-only H1/H2 input coverage preflight; computes no returns or orders.")
     parser.add_argument("--bars", type=Path, default=DEFAULT_BARS)
     parser.add_argument("--bars-manifest", type=Path, default=DEFAULT_BARS_MANIFEST)

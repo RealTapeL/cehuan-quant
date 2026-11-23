@@ -1,3 +1,5 @@
+"""策环测试模块：验证固定研究池采集、有限重试、原始响应留存和封存校验。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -19,10 +21,12 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, Path], pd.DataFrame]:
+    """私有测试辅助函数，用于夹具。 参数：`tmp_path`：pytest 提供的临时目录。 返回：tuple[dict[str, Path], pd.DataFrame]，供调用处构造夹具或断言复用。"""
     config = tmp_path / "default.toml"
     config.write_bytes((REPO / "configs/default.toml").read_bytes())
     pool = tmp_path / "pool.csv"
@@ -70,6 +74,7 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, Path], pd.DataFrame]:
 
 
 class FakeBaoStockState:
+    """测试辅助类“FakeBaoStockState”，用于承载模拟BaoStock股票状态相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     def __init__(
         self,
         reference: pd.DataFrame,
@@ -80,6 +85,7 @@ class FakeBaoStockState:
         invalid_member_day: str | None = None,
         omitted_member: tuple[str, str] | None = None,
     ) -> None:
+        """初始化测试辅助对象`FakeBaoStockState`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.reference = reference
         self.fail_member_once = fail_member_once
         self.unknown_st = unknown_st
@@ -90,6 +96,7 @@ class FakeBaoStockState:
         self.session_count = 0
 
     def session(self, **kwargs: Any) -> "FakeBaoStockSession":
+        """实现测试替身FakeBaoStockState的交易日行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回：'FakeBaoStockSession'，供调用处构造夹具或断言复用。"""
         assert kwargs["max_retries"] == 0
         assert kwargs["minimum_interval_seconds"] == 1.0
         self.session_count += 1
@@ -97,24 +104,30 @@ class FakeBaoStockState:
 
 
 class FakeBaoStockSession:
+    """测试辅助类“FakeBaoStockSession”，用于承载模拟BaoStock股票交易日相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     package_version = "0.9.4-synthetic"
 
     def __init__(self, state: FakeBaoStockState) -> None:
+        """初始化测试辅助对象`FakeBaoStockSession`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.state = state
         self.request_log: list[dict[str, Any]] = []
 
     def __enter__(self) -> "FakeBaoStockSession":
+        """实现测试替身FakeBaoStockSession的进入行为；用于控制被测代码与断言，不访问真实服务。 返回：'FakeBaoStockSession'，供调用处构造夹具或断言复用。"""
         self._record("login")
         return self
 
     def __exit__(self, *_: object) -> None:
+        """实现测试替身FakeBaoStockSession的退出行为；用于控制被测代码与断言，不访问真实服务。 参数：`*_`：场景输入。 返回：None，供调用处构造夹具或断言复用。"""
         return None
 
     def _record(self, endpoint: str) -> None:
+        """实现测试替身FakeBaoStockSession的登记行为；用于控制被测代码与断言，不访问真实服务。 参数：`endpoint`：接口场景输入。 返回：None，供调用处构造夹具或断言复用。"""
         self.request_log.append({"endpoint": endpoint, "status": "success", "request_count": 1})
         self.state.calls[endpoint] = self.state.calls.get(endpoint, 0) + 1
 
     def trade_calendar(self, start: str, end: str) -> pd.DataFrame:
+        """实现测试替身FakeBaoStockSession的交易日历行为；用于控制被测代码与断言，不访问真实服务。 参数：`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         self._record("query_trade_dates")
         return pd.DataFrame({
             "calendar_date": self.state.reference["trade_date"],
@@ -122,6 +135,7 @@ class FakeBaoStockSession:
         })
 
     def stock_basic(self, symbol: str) -> pd.DataFrame:
+        """实现测试替身FakeBaoStockSession的股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         endpoint = f"query_stock_basic({_vendor_code(symbol)})"
         self._record(endpoint)
         return pd.DataFrame([{
@@ -130,6 +144,7 @@ class FakeBaoStockSession:
         }])
 
     def all_stocks(self, day: str) -> pd.DataFrame:
+        """实现测试替身FakeBaoStockSession的全部股票行为；用于控制被测代码与断言，不访问真实服务。 参数：`day`：日场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         endpoint = f"query_all_stock({day})"
         self._record(endpoint)
         if day == self.state.fail_member_once and self.state.calls[endpoint] == 1:
@@ -142,6 +157,7 @@ class FakeBaoStockSession:
         return pd.DataFrame({"code": [_vendor_code(item) for item in symbols], "tradeStatus": [trade_status] * len(symbols)})
 
     def history(self, symbol: str, start: str, end: str, *, adjustflag: str, fields: str) -> pd.DataFrame:
+        """实现测试替身FakeBaoStockSession的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入；`adjustflag`：代码标识“adjustflag”（含义待核实）场景输入；`fields`：字段场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         endpoint = f"query_history_k_data_plus({_vendor_code(symbol)},adjustflag={adjustflag})"
         self._record(endpoint)
         open_dates = self.state.reference.loc[self.state.reference["is_open"], "trade_date"]
@@ -165,14 +181,17 @@ class FakeBaoStockSession:
 
 
 def _vendor_code(symbol: str) -> str:
+    """私有测试辅助函数，用于供应商代码。 参数：`symbol`：证券代码场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return f"{symbol[:2].lower()}.{symbol[2:]}"
 
 
 def _clock(value: datetime):
+    """私有测试辅助函数，用于时钟。 参数：`value`：值场景输入。 返回值供调用处构造夹具或断言复用。"""
     return lambda: value
 
 
 def _capture(tmp_path: Path, paths: dict[str, Path], state: FakeBaoStockState, output: Path, at: datetime):
+    """私有测试辅助函数，用于采集。 参数：`tmp_path`：pytest 提供的临时目录；`paths`：代码标识“paths”（含义待核实）场景输入；`state`：状态场景输入；`output`：输出场景输入；`at`：于场景输入。 返回值供调用处构造夹具或断言复用。"""
     return capture_lookback_pair_inputs(
         output_dir=output,
         registration_freeze_path=paths["freeze"],
@@ -187,6 +206,7 @@ def _capture(tmp_path: Path, paths: dict[str, Path], state: FakeBaoStockState, o
 
 
 def test_capture_writes_bao_stock_raw_and_normalized_inputs_with_hashes(tmp_path: Path) -> None:
+    """验证采集写入BaoStock股票原始与规范化输入带有哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     state = FakeBaoStockState(reference)
     at = datetime(2026, 12, 17, 15, 10, tzinfo=SHANGHAI)
@@ -225,6 +245,7 @@ def test_capture_writes_bao_stock_raw_and_normalized_inputs_with_hashes(tmp_path
 
 
 def test_capture_retries_only_failed_request_and_never_overwrites_attempts(tmp_path: Path) -> None:
+    """验证采集重试仅失败请求与不会覆盖尝试。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     failed_day = "2026-12-16"
     state = FakeBaoStockState(reference, fail_member_once=failed_day)
@@ -255,6 +276,7 @@ def test_capture_retries_only_failed_request_and_never_overwrites_attempts(tmp_p
 
 
 def test_unknown_st_state_is_preserved_as_unknown_and_blocks_capture_readiness(tmp_path: Path) -> None:
+    """验证未知ST状态状态保留为未知与阻断采集就绪门控。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     unknown_day = "2026-12-16"
     state = FakeBaoStockState(reference, unknown_st=(FIXED_SYMBOLS[0], unknown_day))
@@ -278,6 +300,7 @@ def test_unknown_st_state_is_preserved_as_unknown_and_blocks_capture_readiness(t
 
 
 def test_nonempty_membership_response_missing_frozen_symbol_is_unknown_and_blocks(tmp_path: Path) -> None:
+    """验证非空成员资格响应缺失冻结证券代码未知与阻断。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     missing_day = "2026-12-16"
     missing_symbol = FIXED_SYMBOLS[0]
@@ -327,6 +350,7 @@ def test_nonempty_membership_response_missing_frozen_symbol_is_unknown_and_block
 
 
 def test_missing_member_bar_blocks_capture_without_inferring_suspension(tmp_path: Path) -> None:
+    """验证缺失成员行情行阻断采集缺少推断停牌。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     missing_day = "2026-12-16"
     state = FakeBaoStockState(reference, missing_bar=(FIXED_SYMBOLS[0], missing_day))
@@ -348,6 +372,7 @@ def test_missing_member_bar_blocks_capture_without_inferring_suspension(tmp_path
 
 
 def test_retries_stop_after_registered_three_attempts_and_preserve_each_response(tmp_path: Path) -> None:
+    """验证重试停止之后已登记三尝试与保留每项响应。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     invalid_day = "2026-12-16"
     state = FakeBaoStockState(reference, invalid_member_day=invalid_day)
@@ -380,6 +405,7 @@ def test_retries_stop_after_registered_three_attempts_and_preserve_each_response
 
 
 def test_capture_does_not_create_output_or_request_outside_first_window(tmp_path: Path) -> None:
+    """验证采集不创建输出或请求范围外首次窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths, reference = _fixture(tmp_path)
     state = FakeBaoStockState(reference)
     output = tmp_path / "too-early"
@@ -393,6 +419,7 @@ def test_capture_does_not_create_output_or_request_outside_first_window(tmp_path
 
 
 def test_capture_response_validator_rejects_unknown_status_duplicate_and_empty_frames() -> None:
+    """验证采集响应校验器拒绝未知状态重复与空数据表。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.research.lookback_pair_capture import _response_validation_error
 
     empty = pd.DataFrame(columns=["code", "tradeStatus"])

@@ -1,3 +1,5 @@
+"""策略研究假设的结构与安全边界校验。它只验证 Agent 提案的数据结构、证据引用字段和禁止动作，不执行参数变更、不连接券商。"""
+
 from __future__ import annotations
 
 import re
@@ -13,6 +15,10 @@ _FORBIDDEN_KEYS = {
 
 
 def _reject_order_fields(value: Any, path: str = "$") -> None:
+    """递归检查对象中是否出现真实委托或执行字段。
+    参数：value 为待检查结构，path 用于定位嵌套字段。
+    返回：没有禁止字段时返回 None。
+    异常：发现禁止键时抛出 ValueError，并给出字段路径。"""
     if isinstance(value, Mapping):
         for key, child in value.items():
             normalized = str(key).strip().lower()
@@ -25,7 +31,10 @@ def _reject_order_fields(value: Any, path: str = "$") -> None:
 
 
 def validate_strategy_hypothesis(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate a proposed research hypothesis without applying it to a strategy."""
+    """校验结构化研究假设，保留人工审核和不下单约束。
+    参数：payload 为模型或文件提供的映射对象。
+    返回：验证通过后的普通字典副本。
+    异常：缺字段、额外动作、摘要格式或状态不合规时抛出 ValueError；不会应用假设。"""
     required = {
         "schema_version", "hypothesis_id", "experiment_id", "input_data_digest",
         "problem_observed", "proposed_changes", "rationale", "evidence",

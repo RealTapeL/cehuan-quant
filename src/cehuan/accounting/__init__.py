@@ -1,4 +1,4 @@
-"""Pure accounting models and ledger transitions for research simulations."""
+"""研究模拟中的账务模型、公司行动事件和账本状态变更公开入口。"""
 
 from cehuan.accounting.ledger import PortfolioLedger
 from cehuan.accounting.snapshot_io import ledger_snapshot_from_dict, read_ledger_snapshot

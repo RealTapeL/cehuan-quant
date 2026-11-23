@@ -1,3 +1,5 @@
+"""策环测试模块：验证信任标签和研究假设不会把未知来源升级为已验证事实。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +12,7 @@ from cehuan.research.trust_labels import build_research_trust_labels
 
 
 def test_trust_labels_do_not_treat_empty_event_list_as_complete_coverage():
+    """验证可信度标签不视为空事件列表为完整覆盖。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     labels = build_research_trust_labels(
         quality_healthy=True,
         input_file_sha256="a" * 64,
@@ -32,6 +35,7 @@ def test_trust_labels_do_not_treat_empty_event_list_as_complete_coverage():
 
 
 def test_trust_labels_keep_source_review_unknown_even_when_schedules_are_consumed():
+    """验证可信度标签保持来源复核未知即使当调度已消费。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     labels = build_research_trust_labels(
         quality_healthy=True,
         input_file_sha256=None,
@@ -51,6 +55,7 @@ def test_trust_labels_keep_source_review_unknown_even_when_schedules_are_consume
 
 
 def test_synthetic_hypothesis_is_validated_without_applying_it():
+    """验证合成假设已缺少应用其。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     path = Path(__file__).parents[1] / "examples/strategy-research-hypothesis.synthetic.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     result = validate_strategy_hypothesis(payload)
@@ -61,6 +66,7 @@ def test_synthetic_hypothesis_is_validated_without_applying_it():
 
 
 def test_synthetic_agent_input_matches_trust_and_action_contract():
+    """验证合成Agent输入匹配可信度与行动契约。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     root = Path(__file__).parents[1]
     payload = json.loads((root / "examples/strategy-research-agent-input.synthetic.json").read_text(encoding="utf-8"))
     schema = json.loads((root / "examples/strategy-research-agent-input.schema.json").read_text(encoding="utf-8"))
@@ -78,6 +84,7 @@ def test_synthetic_agent_input_matches_trust_and_action_contract():
 
 
 def test_hypothesis_rejects_strategy_override_and_broker_order_fields():
+    """验证假设拒绝策略覆盖与券商订单字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     path = Path(__file__).parents[1] / "examples/strategy-research-hypothesis.synthetic.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["may_modify_active_strategy"] = True

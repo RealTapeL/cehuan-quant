@@ -1,3 +1,5 @@
+"""策环测试模块：验证公告样本审计、原件哈希和人工签认状态的区分。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import csv
@@ -11,6 +13,7 @@ from cehuan.data.accounting_sample_audit import build_accounting_sample_review_p
 
 
 def _manifest(tmp_path: Path, archive_bytes: bytes) -> Path:
+    """私有测试辅助函数，用于清单。 参数：`tmp_path`：pytest 提供的临时目录；`archive_bytes`：归档字节场景输入。 返回：Path，供调用处构造夹具或断言复用。"""
     root = tmp_path / "repo"
     evidence = root / "docs" / "evidence"
     evidence.mkdir(parents=True)
@@ -48,6 +51,7 @@ def _manifest(tmp_path: Path, archive_bytes: bytes) -> Path:
 
 
 def test_sample_audit_separates_hash_token_matches_from_human_signoff(tmp_path: Path):
+    """验证样本审计区分哈希令牌匹配从人工签认。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     manifest = _manifest(tmp_path, b"synthetic official-notice fixture")
     result = verify_accounting_sample_manifest(manifest)
     assert result["automated_pass_count"] == 1
@@ -59,6 +63,7 @@ def test_sample_audit_separates_hash_token_matches_from_human_signoff(tmp_path: 
 
 
 def test_sample_audit_detects_changed_archive_hash(tmp_path: Path):
+    """验证样本审计检测变更归档哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     manifest = _manifest(tmp_path, b"synthetic official-notice fixture")
     archive = manifest.parents[2] / "data" / "private" / "source.pdf"
     archive.write_bytes(b"modified fixture")
@@ -68,6 +73,7 @@ def test_sample_audit_detects_changed_archive_hash(tmp_path: Path):
 
 
 def test_review_pack_copies_sources_adds_candidate_excerpt_and_keeps_signoff_pending(tmp_path: Path):
+    """验证复核审阅包复制来源增加候选摘录与保持签认待处理。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     manifest = _manifest(tmp_path, b"synthetic official-notice fixture")
     repo = manifest.parents[2]
     fields = manifest.parent / "field-review.csv"
@@ -111,6 +117,7 @@ def test_review_pack_copies_sources_adds_candidate_excerpt_and_keeps_signoff_pen
 
 
 def test_review_pack_rejects_unsigned_human_conclusion(tmp_path: Path):
+    """验证复核审阅包拒绝未签认人工结论。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     manifest = _manifest(tmp_path, b"synthetic official-notice fixture")
     repo = manifest.parents[2]
     fields = manifest.parent / "field-review.csv"

@@ -1,3 +1,4 @@
+"""纸面观察证据记录校验器。它验证观察请求、响应原件、规范化载荷、时间顺序和研究资格推导；资格只表示给定研究输入下的状态，不是订单成交证明。"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ OBSERVATION_TYPES = {"QUOTE", "STATUS"}
 
 
 def validate_paper_observation_file(path: str | Path) -> dict[str, Any]:
+    """读取并校验纸面观察 JSON 文件。参数：path 为记录文件。返回：结构、原件绑定及逐观察键结果摘要。副作用：只读文件并解析原件。异常：JSON、schema、哈希或时点约束不满足时抛 ValueError。"""
     record_path = Path(path).resolve()
     document = json.loads(record_path.read_text(encoding="utf-8"))
     return validate_paper_observation_document(document, base_dir=record_path.parent)
@@ -34,6 +36,7 @@ def validate_paper_observation_file(path: str | Path) -> dict[str, Any]:
 def validate_paper_observation_document(
     document: dict[str, Any], *, base_dir: str | Path,
 ) -> dict[str, Any]:
+    """按 schema 版本分发纸面观察文档校验。参数：document 为 JSON 对象，base_dir 为允许引用文件的目录。返回：校验状态与逐项观察结果。异常：版本不支持、引用越界或时间/载荷不一致时阻断。v1 旧记录的 payload 原件绑定保持未验证。"""
     version = document.get("schema_version")
     if version not in SUPPORTED_PAPER_OBSERVATION_SCHEMA_VERSIONS:
         raise ValueError("paper observation schema_version 不支持")
@@ -43,7 +46,7 @@ def validate_paper_observation_document(
 
 
 def _validate_legacy_v1(document: dict[str, Any], base_dir: Path) -> dict[str, Any]:
-    """Read old synthetic records without pretending their payload was rebuilt."""
+    """兼容读取 schema v1 纸面观察记录。参数：document 为旧版对象，base_dir 为原件根目录。返回：标出旧版载荷无法从原件重建的审计摘要。异常：字段、尝试序号、来源时间或文件摘要不合法时抛 ValueError。"""
     if document.get("record_type") != "PAPER_OBSERVATION" or not str(document.get("observation_id", "")).strip():
         raise ValueError("记录必须包含 PAPER_OBSERVATION 类型和 observation_id")
     classification = document.get("classification")
@@ -145,6 +148,7 @@ def _validate_legacy_v1(document: dict[str, Any], base_dir: Path) -> dict[str, A
 
 
 def _validate_v2(document: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    """完整验证 schema v2 纸面观察记录及其原件重建。参数：document 为 v2 对象，base_dir 限定相对路径。返回：观察键、重试、时间线、来源及研究资格摘要。异常：请求时间顺序、事件时间、哈希、解析重建或结构化证据不匹配时阻断；本地采集不建立历史时点证明。"""
     if document.get("record_type") != "PAPER_OBSERVATION" or not str(document.get("observation_id", "")).strip():
         raise ValueError("记录必须包含 PAPER_OBSERVATION 类型和 observation_id")
     classification = document.get("classification")
@@ -355,10 +359,11 @@ def derive_research_eligibility(
     price_within_limits: Any, account_cash_sufficient: Any,
     decision_observations_timely: bool | None = True,
 ) -> dict[str, Any]:
-    """Derive a research-only eligibility state; never interpret it as a fill guarantee."""
+    """根据报价、状态、规则、限价与现金证据推导研究资格。参数：quote/listed/suspended/ST 描述观察状态，exclude_st 为研究筛选配置，其余字段是规则和账户输入或带来源证据对象，decision_observations_timely 表示决策时点可用性。返回：ELIGIBLE/BLOCKED/UNKNOWN、阻断原因和证据质量。异常：输入类型不合法时抛 ValueError；不是成交保证。"""
     supplied_inputs: dict[str, dict[str, Any]] = {}
 
     def unpack(label: str, raw: Any) -> bool | None:
+        """解析并记录一个结构化资格输入的值与证据字段。参数：label 为输入名称，raw 为布尔值、证据映射或 None。返回：bool 或 None；证据不完整时标注不完整而不把缺值视作 False。异常：value 类型错误时抛 ValueError。"""
         if isinstance(raw, dict):
             value = raw.get("value")
             if value is not None and not isinstance(value, bool):
@@ -455,6 +460,7 @@ def _eligibility_summary(
     result_rows: list[dict[str, Any]], payloads: dict[tuple[str, str, str], dict[str, Any] | None],
     inputs: Any, decision_at: datetime,
 ) -> list[dict[str, Any]]:
+    """按决策时点为每只证券汇总报价和状态观察并调用资格推导。参数：result_rows 为终态观察摘要，payloads 为原件重建载荷，inputs 为可选规则/资金证据，decision_at 为决策截止时点。返回：逐证券研究资格列表；未知状态保持 UNKNOWN。"""
     config = inputs if isinstance(inputs, dict) else {}
     output = []
     keys = sorted({(row["symbol"], row["phase"]) for row in result_rows if row["phase"] == "DECISION"})
@@ -492,6 +498,7 @@ def _eligibility_summary(
 
 
 def build_synthetic_paper_observation(output_dir: str | Path) -> dict[str, Any]:
+    """构造可重复的合成观察记录并立即通过同一校验器验证。参数：output_dir 为必须不存在的目标目录。返回：目录和校验摘要。副作用：仅生成合成原件及 JSON；不访问行情服务、不代表真实可得性。"""
     target = Path(output_dir).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -569,6 +576,7 @@ def _synthetic_attempt(
     requested: str, received: str, planned: str, raw_path: str,
     payload: dict[str, Any] | None, base_dir: Path,
 ) -> dict[str, Any]:
+    """构造一条合成观察尝试记录并绑定对应合成原件哈希。参数描述阶段、类型、结果、来源、事件/请求/响应时间、文件和载荷。返回：符合 schema 的记录字典；不访问外部数据。"""
     entry = {
         "symbol": "SH600001",
         "phase": phase,
@@ -600,6 +608,7 @@ def _synthetic_attempt(
 
 
 def _validate_payload(kind: str, payload: dict[str, Any], index: int) -> None:
+    """校验 schema v2 的规范报价或状态载荷。参数：kind 为观察类型，payload 为规范对象，index 用于错误定位。返回：通过时 None。异常：价格、时间、状态类型或派生 can_buy 字段不符合契约时拒绝。"""
     if kind == "QUOTE":
         try:
             price = float(payload["open_price_cny"])
@@ -624,6 +633,7 @@ def _validate_payload(kind: str, payload: dict[str, Any], index: int) -> None:
 
 
 def _validate_payload_v1(kind: str, payload: dict[str, Any], index: int) -> None:
+    """校验 schema v1 的旧格式报价/状态载荷。参数：kind、payload 和记录 index。返回：通过时 None。异常：价格或旧版状态字段缺失/无效时阻断。"""
     if kind == "QUOTE":
         try:
             price = float(payload["open_price_cny"])
@@ -638,6 +648,7 @@ def _validate_payload_v1(kind: str, payload: dict[str, Any], index: int) -> None
 
 
 def _validate_file_binding(value: Any, base_dir: Path, label: str) -> Path:
+    """限制相对路径在记录目录内并验证文件摘要。参数：value 为路径/哈希绑定，base_dir 为授权根目录，label 用于报错。返回：已核验 Path。异常：绝对/越界路径、格式错误、文件缺失或哈希不符时阻断。"""
     if not isinstance(value, dict) or not str(value.get("path", "")).strip():
         raise ValueError(f"{label} 必须包含相对路径和 SHA-256")
     relative = Path(value["path"])
@@ -655,6 +666,7 @@ def _validate_file_binding(value: Any, base_dir: Path, label: str) -> Path:
 
 
 def _aware_timestamp(value: Any, label: str) -> datetime:
+    """解析带时区时间。参数：value 为时间文本，label 为错误定位。返回：带时区 datetime。异常：缺失、格式错误或无时区时抛 ValueError。"""
     if value is None or str(value).strip() == "":
         raise ValueError(f"{label} 缺失")
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -664,6 +676,7 @@ def _aware_timestamp(value: Any, label: str) -> datetime:
 
 
 def _sha256(path: Path) -> str:
+    """流式计算文件 SHA-256。参数：path 为文件路径。返回：小写十六进制摘要。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):

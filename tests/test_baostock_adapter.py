@@ -1,3 +1,5 @@
+"""策环测试模块：验证 BaoStock 适配器的请求、协议响应、重试、快照续跑和规范化映射。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 import json
 import pandas as pd
 import pytest
@@ -19,7 +21,9 @@ from cehuan.data.baostock_adapter import (
 
 
 def test_baostock_pagination_silent_stop_is_classified_as_transport_failure():
+    """验证BaoStock分页无提示停止归类为传输失败。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class InterruptedResponse:
+        """测试辅助类“InterruptedResponse”，用于承载中断响应相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         error_code = "0"
         error_msg = "success"
         fields = ["code"]
@@ -29,6 +33,7 @@ def test_baostock_pagination_silent_stop_is_classified_as_transport_failure():
         cur_page_num = "1"
 
         def next(self):
+            """实现测试替身InterruptedResponse的下一条行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return False
 
     try:
@@ -41,15 +46,20 @@ def test_baostock_pagination_silent_stop_is_classified_as_transport_failure():
 
 
 def test_baostock_socket_guard_rejects_eof_and_reads_fragmented_responses():
+    """验证BaoStock套接字保护拒绝EOF与读取分片响应。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class FakeSocket:
+        """测试辅助类“FakeSocket”，用于承载模拟套接字相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def __init__(self, chunks):
+            """初始化测试辅助对象`FakeSocket`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.chunks = list(chunks)
             self.sent = None
 
         def sendall(self, payload):
+            """实现测试替身FakeSocket的发送全部行为；用于控制被测代码与断言，不访问真实服务。 参数：`payload`：载荷场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.sent = payload
 
         def recv(self, size):
+            """实现测试替身FakeSocket的接收行为；用于控制被测代码与断言，不访问真实服务。 参数：`size`：代码标识“size”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
             return self.chunks.pop(0) if self.chunks else b""
 
     header = b"version\x01plain\x011".ljust(21, b" ")
@@ -69,16 +79,21 @@ def test_baostock_socket_guard_rejects_eof_and_reads_fragmented_responses():
 
 
 def test_baostock_socket_guard_decompresses_compressed_protocol_responses():
+    """验证BaoStock套接字保护解压压缩协议响应。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import zlib
 
     class FakeSocket:
+        """测试辅助类“FakeSocket”，用于承载模拟套接字相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def __init__(self, response):
+            """初始化测试辅助对象`FakeSocket`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.response = response
 
         def sendall(self, payload):
+            """实现测试替身FakeSocket的发送全部行为；用于控制被测代码与断言，不访问真实服务。 参数：`payload`：载荷场景输入。 返回值供调用处构造夹具或断言复用。"""
             pass
 
         def recv(self, size):
+            """实现测试替身FakeSocket的接收行为；用于控制被测代码与断言，不访问真实服务。 参数：`size`：代码标识“size”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
             response, self.response = self.response, b""
             return response
 
@@ -93,7 +108,9 @@ def test_baostock_socket_guard_decompresses_compressed_protocol_responses():
 
 
 def test_baostock_single_response_larger_than_page_threshold_is_valid():
+    """验证BaoStock单个响应更大而非页阈值有效。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class SingleLargeResponse:
+        """测试辅助类“SingleLargeResponse”，用于承载单个较大响应相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         error_code = "0"
         error_msg = "success"
         fields = ["code"]
@@ -103,9 +120,11 @@ def test_baostock_single_response_larger_than_page_threshold_is_valid():
         cur_page_num = "1"
 
         def next(self):
+            """实现测试替身SingleLargeResponse的下一条行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return self.cur_row_num < len(self.data)
 
         def get_row_data(self):
+            """实现测试替身SingleLargeResponse的获取行数据行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             row = self.data[self.cur_row_num]
             self.cur_row_num += 1
             return row
@@ -117,6 +136,7 @@ def test_baostock_single_response_larger_than_page_threshold_is_valid():
 
 
 def test_operator_interrupt_during_request_is_logged_and_not_retried():
+    """验证操作员中断期间请求记录与不重试。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     session = BaoStockSession(minimum_interval_seconds=0, max_retries=2)
     session.bs = object()
     with pytest.raises(KeyboardInterrupt):
@@ -126,8 +146,11 @@ def test_operator_interrupt_during_request_is_logged_and_not_retried():
 
 
 def test_expired_baostock_session_relogs_in_once_and_retries_endpoint():
+    """验证过期BaoStock交易日重新登录在一次与重试接口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class Response:
+        """测试辅助类“Response”，用于承载响应相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def __init__(self, error_code="0", error_msg="success"):
+            """初始化测试辅助对象`Response`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.error_code = error_code
             self.error_msg = error_msg
             self.fields = ["code"]
@@ -137,18 +160,23 @@ def test_expired_baostock_session_relogs_in_once_and_retries_endpoint():
             self.cur_page_num = "1"
 
         def next(self):
+            """实现测试替身Response的下一条行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return bool(self.data) and self.cur_row_num < len(self.data)
 
         def get_row_data(self):
+            """实现测试替身Response的获取行数据行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             row = self.data[self.cur_row_num]
             self.cur_row_num += 1
             return row
 
     class FakeClient:
+        """测试辅助类“FakeClient”，用于承载模拟客户端相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def __init__(self):
+            """初始化测试辅助对象`FakeClient`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.login_count = 0
 
         def login(self):
+            """实现测试替身FakeClient的登录行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             self.login_count += 1
             return SimpleNamespace(error_code="0", error_msg="success")
 
@@ -164,7 +192,9 @@ def test_expired_baostock_session_relogs_in_once_and_retries_endpoint():
 
 
 def test_transport_exception_is_retried_once_and_logged_as_transport():
+    """验证传输异常重试一次与记录为传输。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class Response:
+        """测试辅助类“Response”，用于承载响应相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         error_code = "0"
         error_msg = "success"
         fields = ["code"]
@@ -174,21 +204,26 @@ def test_transport_exception_is_retried_once_and_logged_as_transport():
         cur_page_num = "1"
 
         def next(self):
+            """实现测试替身Response的下一条行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             if self.cur_row_num == 0:
                 self.cur_row_num = 1
                 return True
             return False
 
         def get_row_data(self):
+            """实现测试替身Response的获取行数据行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return self.data[self.cur_row_num - 1]
 
     class FakeClient:
+        """测试辅助类“FakeClient”，用于承载模拟客户端相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def login(self):
+            """实现测试替身FakeClient的登录行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return SimpleNamespace(error_code="0", error_msg="success")
 
     calls = 0
 
     def call():
+        """实现测试替身test_transport_exception_is_retried_once_and_logged_as_transport的调用行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -206,6 +241,7 @@ def test_transport_exception_is_retried_once_and_logged_as_transport():
 
 
 def test_baostock_file_lock_prevents_a_second_process_session(tmp_path):
+    """验证BaoStock文件锁防止第二进程交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     lock_path = tmp_path / "baostock.lock"
     first = BaoStockSession(lock_path=lock_path)
     first._acquire_process_lock()
@@ -226,12 +262,15 @@ def test_baostock_file_lock_prevents_a_second_process_session(tmp_path):
 
 
 class _FakeBaoStockSession:
+    """测试辅助类“_FakeBaoStockSession”，用于承载模拟BaoStock股票交易日相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     package_version = "test"
 
     def __init__(self):
+        """初始化测试辅助对象`_FakeBaoStockSession`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.request_log = []
 
     def _record(self, endpoint, frame):
+        """实现测试替身_FakeBaoStockSession的登记行为；用于控制被测代码与断言，不访问真实服务。 参数：`endpoint`：接口场景输入；`frame`：数据表场景输入。 返回值供调用处构造夹具或断言复用。"""
         self.request_log.append({
             "endpoint": endpoint,
             "started_at_utc": "2025-01-03T00:00:00+00:00",
@@ -243,17 +282,20 @@ class _FakeBaoStockSession:
         return frame
 
     def trade_calendar(self, start, end):
+        """实现测试替身_FakeBaoStockSession的交易日历行为；用于控制被测代码与断言，不访问真实服务。 参数：`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入。 返回值供调用处构造夹具或断言复用。"""
         return self._record("query_trade_dates", pd.DataFrame([
             {"calendar_date": "2025-01-02", "is_trading_day": "1"},
         ]))
 
     def stock_basic(self):
+        """实现测试替身_FakeBaoStockSession的股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
         return self._record("query_stock_basic", pd.DataFrame([
             {"code": "sh.600000", "code_name": "浦发银行", "ipoDate": "1999-11-10", "outDate": "", "type": "1", "status": "1"},
             {"code": "sz.000001", "code_name": "平安银行", "ipoDate": "1991-04-03", "outDate": "", "type": "1", "status": "1"},
         ]))
 
     def history(self, symbol, start_date, end_date, adjustflag, fields=""):
+        """实现测试替身_FakeBaoStockSession的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入；`adjustflag`：代码标识“adjustflag”（含义待核实）场景输入；`fields`：字段场景输入。 返回值供调用处构造夹具或断言复用。"""
         base = {
             "date": "2025-01-02", "code": "sh.600000" if "600000" in symbol else "sz.000001",
             "open": "10", "high": "11", "low": "9", "close": "10.5", "preclose": "10",
@@ -267,10 +309,12 @@ class _FakeBaoStockSession:
         return frame
 
     def adjust_factors(self, symbol, start_date, end_date):
+        """实现测试替身_FakeBaoStockSession的复权因子行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入。 返回值供调用处构造夹具或断言复用。"""
         return self._record(f"query_adjust_factor({symbol})", pd.DataFrame(columns=["code", "date", "foreAdjustFactor", "backAdjustFactor"]))
 
 
 def test_baostock_snapshot_is_chunked_and_resumable(tmp_path):
+    """验证BaoStock快照分块与可续跑。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     session = _FakeBaoStockSession()
     initial = create_baostock_snapshot(
         session,
@@ -311,6 +355,7 @@ def test_baostock_snapshot_is_chunked_and_resumable(tmp_path):
 
 
 def test_baostock_final_manifest_keeps_each_new_chunk_request_log(tmp_path):
+    """验证BaoStock最终清单保持每项新分块请求日志。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = create_baostock_snapshot(
         _FakeBaoStockSession(),
         symbols=["SH600000", "SZ000001"],
@@ -335,10 +380,13 @@ def test_baostock_final_manifest_keeps_each_new_chunk_request_log(tmp_path):
 
 
 def test_baostock_failed_chunk_attempt_is_checkpointed_and_included_in_final_manifest(tmp_path):
+    """验证BaoStock失败分块尝试已写入检查点与纳入在最终清单。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class OneFailedRequestSession(_FakeBaoStockSession):
+        """测试辅助类“OneFailedRequestSession”，用于承载一项失败请求交易日相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         failed = False
 
         def history(self, symbol, start_date, end_date, adjustflag, fields=""):
+            """实现测试替身OneFailedRequestSession的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入；`adjustflag`：代码标识“adjustflag”（含义待核实）场景输入；`fields`：字段场景输入。 返回值供调用处构造夹具或断言复用。"""
             if not self.failed:
                 self.failed = True
                 endpoint = f"query_history_k_data_plus({symbol},adjustflag={adjustflag})"
@@ -397,8 +445,11 @@ def test_baostock_failed_chunk_attempt_is_checkpointed_and_included_in_final_man
 
 
 def test_baostock_operator_interrupt_keeps_checkpoint_and_removes_uncommitted_temp_chunk(tmp_path):
+    """验证BaoStock操作员中断保持检查点与移除未提交临时分块。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class InterruptedSession(_FakeBaoStockSession):
+        """测试辅助类“InterruptedSession”，用于承载中断交易日相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def history(self, symbol, start_date, end_date, adjustflag, fields=""):
+            """实现测试替身InterruptedSession的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入；`adjustflag`：代码标识“adjustflag”（含义待核实）场景输入；`fields`：字段场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.request_log.append({
                 "endpoint": f"query_history_k_data_plus({symbol},adjustflag={adjustflag})",
                 "status": "interrupted",
@@ -429,6 +480,7 @@ def test_baostock_operator_interrupt_keeps_checkpoint_and_removes_uncommitted_te
 
 
 def test_baostock_resume_rejects_tampered_committed_chunk_before_fetching(tmp_path):
+    """验证BaoStock续跑拒绝被篡改已提交分块之前抓取。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     initial = create_baostock_snapshot(
         _FakeBaoStockSession(),
         symbols=["SH600000", "SZ000001"],
@@ -462,6 +514,7 @@ def test_baostock_resume_rejects_tampered_committed_chunk_before_fetching(tmp_pa
 
 
 def test_baostock_vendor_code_maps_to_canonical_symbol():
+    """验证BaoStock供应商代码映射到规范化证券代码。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     assert _canonical_vendor_symbol("sh.600519") == "SH600519"
     assert _canonical_vendor_symbol("sz.000001") == "SZ000001"
     assert _canonical_vendor_symbol("sh.000300") == "SH000300"
@@ -470,7 +523,9 @@ def test_baostock_vendor_code_maps_to_canonical_symbol():
 
 
 def test_stock_basic_can_be_restricted_to_one_requested_symbol():
+    """验证股票基础资料可以限定到一项请求证券代码。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class Response:
+        """测试辅助类“Response”，用于承载响应相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         error_code = "0"
         error_msg = "success"
         fields = ["code", "code_name", "ipoDate", "outDate", "type"]
@@ -480,18 +535,23 @@ def test_stock_basic_can_be_restricted_to_one_requested_symbol():
         cur_page_num = "1"
 
         def next(self):
+            """实现测试替身Response的下一条行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             return self.cur_row_num < len(self.data)
 
         def get_row_data(self):
+            """实现测试替身Response的获取行数据行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             row = self.data[self.cur_row_num]
             self.cur_row_num += 1
             return row
 
     class FakeClient:
+        """测试辅助类“FakeClient”，用于承载模拟客户端相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def __init__(self):
+            """初始化测试辅助对象`FakeClient`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.requested_code = None
 
         def query_stock_basic(self, *, code):
+            """实现测试替身FakeClient的查询股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 参数：`code`：代码场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.requested_code = code
             return Response()
 
@@ -507,6 +567,7 @@ def test_stock_basic_can_be_restricted_to_one_requested_symbol():
 
 
 def test_normalize_baostock_calendar_records_open_dates_and_predecessor():
+    """验证规范化BaoStock日历记录开盘日期与前一交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([
         {"calendar_date": "2025-01-02", "is_trading_day": "1"},
         {"calendar_date": "2025-01-03", "is_trading_day": "1"},
@@ -522,6 +583,7 @@ def test_normalize_baostock_calendar_records_open_dates_and_predecessor():
 
 
 def test_normalize_baostock_index_marks_reference_series_nontradable():
+    """验证规范化BaoStock索引标记参考序列不可交易。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([{
         "date": "2025-01-02", "code": "sh.000300", "open": "3900",
         "high": "3920", "low": "3880", "close": "3910",
@@ -537,6 +599,7 @@ def test_normalize_baostock_index_marks_reference_series_nontradable():
 
 
 def test_normalize_baostock_maps_units_prices_and_point_in_time_flags():
+    """验证规范化BaoStock映射单位价格与时点在时间标记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([{
         "date": "2025-01-02",
         "code": "sh.600519",
@@ -575,6 +638,7 @@ def test_normalize_baostock_maps_units_prices_and_point_in_time_flags():
 
 
 def test_normalize_baostock_marks_suspension_and_uses_zero_turnover():
+    """验证规范化BaoStock标记停牌与使用零成交额。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([{
         "date": "2025-01-02",
         "code": "sz.000001",

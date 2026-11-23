@@ -1,3 +1,5 @@
+"""策环测试模块：验证输入证明重建器使用实际适配器绑定规范摘要、文件和 checkpoint。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -32,6 +34,7 @@ from cehuan.data.security_identity import IDENTITY_EVENT_COLUMNS, normalize_secu
 
 
 def _source_bars(days: int = 25) -> pd.DataFrame:
+    """私有测试辅助函数，用于来源行情。 参数：`days`：日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     rows = []
     start = date(2025, 1, 2)
     for index in range(days):
@@ -65,6 +68,7 @@ def _source_bars(days: int = 25) -> pd.DataFrame:
 
 
 def _fixture(tmp_path: Path):
+    """私有测试辅助函数，用于夹具。 参数：`tmp_path`：pytest 提供的临时目录。 返回值供调用处构造夹具或断言复用。"""
     config_path = tmp_path / "config.toml"
     shutil.copyfile(DEFAULT_CONFIG, config_path)
     config = load_config(config_path)
@@ -120,6 +124,7 @@ def _fixture(tmp_path: Path):
 
 
 def _rebuild(tmp_path: Path, fixture, *, claimed: Path | None = None):
+    """私有测试辅助函数，用于重建。 参数：`tmp_path`：pytest 提供的临时目录；`fixture`：夹具场景输入；`claimed`：声称场景输入。 返回值供调用处构造夹具或断言复用。"""
     checkpoint, config, bars, calendar, identity, actions, manifest, rules, fees = fixture
     return rebuild_checkpoint_input_proof(
         checkpoint,
@@ -136,6 +141,7 @@ def _rebuild(tmp_path: Path, fixture, *, claimed: Path | None = None):
 
 
 def _event_proof_fixture(tmp_path: Path):
+    """私有测试辅助函数，用于事件证明夹具。 参数：`tmp_path`：pytest 提供的临时目录。 返回值供调用处构造夹具或断言复用。"""
     fixture = _fixture(tmp_path)
     checkpoint, config, bars, calendar, identity_path, actions_path, manifest, rules, fees = fixture
     identity_row = {
@@ -207,6 +213,7 @@ def _event_proof_fixture(tmp_path: Path):
 
 
 def _event_proof(fixture, registry: Path | None = None):
+    """私有测试辅助函数，用于事件证明。 参数：`fixture`：夹具场景输入；`registry`：登记簿场景输入。 返回值供调用处构造夹具或断言复用。"""
     checkpoint, config, bars, calendar, identity, actions, manifest, rules, fees = fixture
     return rebuild_checkpoint_input_proof(
         checkpoint,
@@ -223,6 +230,7 @@ def _event_proof(fixture, registry: Path | None = None):
 
 
 def _write_event_registry(tmp_path: Path, proof: dict, sources: dict[str, Path], *, review_status: str = "REVIEWED") -> Path:
+    """私有测试辅助函数，用于写入事件登记簿。 参数：`tmp_path`：pytest 提供的临时目录；`proof`：证明场景输入；`sources`：来源场景输入；`review_status`：复核状态场景输入。 返回：Path，供调用处构造夹具或断言复用。"""
     rows = []
     for family, input_type in (("identity_events", "SECURITY_IDENTITY_EVENT"), ("corporate_actions", "CORPORATE_ACTION")):
         for event in proof["inputs"][family]:
@@ -252,6 +260,7 @@ def _write_event_registry(tmp_path: Path, proof: dict, sources: dict[str, Path],
 
 
 def test_shared_checkpoint_v1_digest_functions_preserve_previous_serialization(tmp_path):
+    """验证共享检查点v1摘要函数保留之前序列化。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     compact = {
         name: config[name]
@@ -293,12 +302,14 @@ def test_shared_checkpoint_v1_digest_functions_preserve_previous_serialization(t
 
 
 def _bars_file(tmp_path: Path) -> Path:
+    """私有测试辅助函数，用于行情文件。 参数：`tmp_path`：pytest 提供的临时目录。 返回：Path，供调用处构造夹具或断言复用。"""
     path = tmp_path / "digest-bars.csv"
     _source_bars().to_csv(path, index=False)
     return path
 
 
 def test_builder_reconstructs_checkpoint_hashes_and_leaves_missing_proofs_unverified(tmp_path):
+    """验证构建器重建检查点哈希与保留缺失证明未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = _fixture(tmp_path)
     proof, report = _rebuild(tmp_path, fixture)
 
@@ -321,6 +332,7 @@ def test_builder_reconstructs_checkpoint_hashes_and_leaves_missing_proofs_unveri
 
 
 def test_v1_checkpoint_remains_readable_and_rebuildable_with_original_state_hash(tmp_path):
+    """验证v1检查点仍为可读取与可重建带有原始状态哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = list(_fixture(tmp_path))
     checkpoint: BacktestCheckpoint = fixture[0]
     legacy = replace(
@@ -347,6 +359,7 @@ def test_v1_checkpoint_remains_readable_and_rebuildable_with_original_state_hash
 
 
 def test_missing_history_manifest_is_unverified_not_reconstructed_from_final_hash(tmp_path):
+    """验证缺失历史清单未不重建从最终哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = list(_fixture(tmp_path))
     fixture[-3] = tmp_path / "missing-history.json"
     proof, report = _rebuild(tmp_path, tuple(fixture))
@@ -362,6 +375,7 @@ def test_missing_history_manifest_is_unverified_not_reconstructed_from_final_has
 
 
 def test_identity_and_corporate_actions_bind_stable_event_rows_and_multiple_sources(tmp_path):
+    """验证身份与公司行动绑定稳定事件行与多个来源。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture, sources = _event_proof_fixture(tmp_path)
     proof, report = _event_proof(fixture)
 
@@ -387,6 +401,7 @@ def test_identity_and_corporate_actions_bind_stable_event_rows_and_multiple_sour
 
 
 def test_event_source_hash_conflict_fails_but_pending_review_stays_unverified(tmp_path):
+    """验证事件来源哈希冲突失败但待处理复核保持未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture, sources = _event_proof_fixture(tmp_path)
     proof, _ = _event_proof(fixture)
     registry = _write_event_registry(tmp_path, proof, sources, review_status="PENDING")
@@ -404,6 +419,7 @@ def test_event_source_hash_conflict_fails_but_pending_review_stays_unverified(tm
 
 
 def test_event_source_review_can_pass_while_missing_known_at_stays_unverified(tmp_path):
+    """验证事件来源复核可以通过而缺失已知于保持未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture, sources = _event_proof_fixture(tmp_path)
     proof, _ = _event_proof(fixture)
     registry = _write_event_registry(tmp_path, proof, sources)
@@ -420,6 +436,7 @@ def test_event_source_review_can_pass_while_missing_known_at_stays_unverified(tm
 
 
 def test_event_content_change_invalidates_registered_canonical_row(tmp_path):
+    """验证事件内容变更使失效已登记规范化行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture, sources = _event_proof_fixture(tmp_path)
     original_proof, _ = _event_proof(fixture)
     registry = _write_event_registry(tmp_path, original_proof, sources)
@@ -442,6 +459,7 @@ def test_event_content_change_invalidates_registered_canonical_row(tmp_path):
 
 
 def test_event_provenance_registry_rejects_duplicate_source_role(tmp_path):
+    """验证事件来源链登记簿拒绝重复来源角色。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture, sources = _event_proof_fixture(tmp_path)
     proof, _ = _event_proof(fixture)
     registry = _write_event_registry(tmp_path, proof, sources)
@@ -454,6 +472,7 @@ def test_event_provenance_registry_rejects_duplicate_source_role(tmp_path):
 
 
 def test_self_consistent_claimed_proof_cannot_substitute_fabricated_normalized_rows(tmp_path):
+    """验证自身一致声称证明不能替代伪造规范化行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = _fixture(tmp_path)
     proof, _ = _rebuild(tmp_path, fixture)
     claimed = deepcopy(proof)
@@ -478,6 +497,7 @@ def test_self_consistent_claimed_proof_cannot_substitute_fabricated_normalized_r
 
 
 def test_changed_file_bytes_and_unchanged_normalized_config_are_reported_separately(tmp_path):
+    """验证变更文件字节与未变化规范化配置报告分别。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = _fixture(tmp_path)
     proof, _ = _rebuild(tmp_path, fixture)
     claimed_path = tmp_path / "claimed-proof.json"
@@ -494,6 +514,7 @@ def test_changed_file_bytes_and_unchanged_normalized_config_are_reported_separat
 
 
 def test_rebuild_cli_writes_expected_artifacts_without_mutating_checkpoint(tmp_path):
+    """验证重建CLI写入预期产物缺少改变检查点。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fixture = _fixture(tmp_path)
     checkpoint, config, bars, calendar, identity, actions, manifest, rules, fees = fixture
     assert checkpoint.schema_version == 3

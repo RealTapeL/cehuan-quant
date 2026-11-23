@@ -1,1 +1,1 @@
-"""Local command line entry points."""
+"""命令行接口包，聚合 argparse 命令入口并调用策环的数据、研究、回测与复盘模块。"""

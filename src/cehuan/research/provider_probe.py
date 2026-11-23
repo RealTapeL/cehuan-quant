@@ -1,3 +1,4 @@
+"""AKShare 分钟行情只读探测。模块对单证券、单日期、有限次数请求留存 SDK 序列化响应，验证原件到规范载荷的重建关系；不提供状态数据、前瞻排名或可交易结论。"""
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
@@ -24,7 +25,7 @@ from cehuan.research.observation_parsers import (
 def capture_akshare_minute_probe(
     *, symbol: str, trade_date: str, output_dir: str | Path, max_attempts: int = 1,
 ) -> dict[str, Any]:
-    """Make a bounded, read-only one-symbol AKShare minute query and archive its SDK result."""
+    """对一个证券和交易日执行有限 AKShare 分钟行情探测。参数：symbol/trade_date 定义查询，output_dir 必须是新目录，max_attempts 仅允许有限尝试。返回：试取报告和校验摘要。副作用：网络请求、写私有响应及来源哈希；保存的是 SDK 返回序列化，不是原始 HTTP 字节。异常：证券/日期/目录或响应校验不合约定时抛出异常。"""
     target = Path(output_dir).resolve()
     normalized_symbol = _normalize_symbol(symbol)
     parsed_date = date.fromisoformat(trade_date)
@@ -191,6 +192,7 @@ def capture_akshare_minute_probe(
 
 
 def validate_akshare_probe_directory(directory: str | Path) -> dict[str, Any]:
+    """从归档 SDK 返回重建分钟载荷并核对全部绑定。参数：directory 为试取目录。返回：原件哈希和规范载荷核验状态。异常：路径越界、文件摘要不匹配、解析结果与报告冲突时阻断；不证明供应商发布时间。"""
     root = Path(directory).resolve()
     report = json.loads((root / "probe-report.json").read_text(encoding="utf-8"))
     if report.get("record_type") != "READ_ONLY_PROVIDER_PROBE":
@@ -242,6 +244,7 @@ def validate_akshare_probe_directory(directory: str | Path) -> dict[str, Any]:
 
 
 def _normalize_symbol(value: str) -> str:
+    """检查并规范沪深北六位代码。参数：value 为输入证券代码。返回：大写 SH/SZ/BJ 前缀代码。异常：代码格式不合约定时抛 ValueError。"""
     symbol = str(value).strip().upper()
     if re.fullmatch(r"(SH|SZ|BJ)[0-9]{6}", symbol):
         return symbol
@@ -249,14 +252,17 @@ def _normalize_symbol(value: str) -> str:
 
 
 def _now_utc() -> str:
+    """读取当前 UTC 时间并序列化。返回：Z 后缀 ISO 字符串；用于记录本机请求时点，不代表供应商发布时间。"""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _binding(path: Path, relative: str, layer: str) -> dict[str, Any]:
+    """为目录内响应构造路径、SHA-256、格式和捕获层绑定。参数：path 为响应文件，relative 为相对名，layer 标明 SDK 序列化或本地错误记录。返回：绑定字典。"""
     return {"path": f"raw/{relative}", "sha256": _sha256(path), "format": "JSON", "capture_layer": layer}
 
 
 def _verified_relative_file(root: Path, binding: dict[str, Any], label: str) -> Path:
+    """解析归档目录内相对文件并验证摘要。参数：root 为归档根，binding 为路径/哈希记录，label 用于错误定位。返回：已核验文件路径。异常：绝对/越界路径、文件缺失或摘要不符时阻断。"""
     relative = Path(str(binding.get("path", "")))
     if not relative.parts or relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"{label} 路径无效")
@@ -270,6 +276,7 @@ def _verified_relative_file(root: Path, binding: dict[str, Any], label: str) -> 
 
 
 def _sha256(path: Path) -> str:
+    """流式计算文件 SHA-256。参数：path 为文件路径。返回：十六进制摘要。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -278,16 +285,19 @@ def _sha256(path: Path) -> str:
 
 
 def _sha256_json(value: Any) -> str:
+    """按稳定 JSON 序列化计算对象摘要。参数：value 为 JSON 兼容对象。返回：SHA-256；不可规范化值会被拒绝。"""
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def _redact_error(message: str) -> str:
+    """清理错误文本中的常见凭据字段并截断长度。参数：message 为供应商/解析错误。返回：有限长度安全文本；不能保证识别所有秘密格式。"""
     text_value = re.sub(r"(?i)(token|authorization|password|secret)=([^&\s]+)", r"\1=[REDACTED]", message)
     return text_value[:2000]
 
 
 def _git_revision() -> str | None:
+    """读取当前 Git 提交号。返回：哈希或 None；只执行只读 Git 查询。"""
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
@@ -295,6 +305,7 @@ def _git_revision() -> str | None:
 
 
 def _git_dirty() -> bool | None:
+    """检查工作区是否有未提交变化。返回：布尔值或 None；只执行只读 Git 查询。"""
     try:
         return bool(subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True).strip())
     except Exception:
@@ -302,10 +313,12 @@ def _git_dirty() -> bool | None:
 
 
 class _FrameAdapter:
-    """Tiny DataFrame-shaped serializer adapter used to test and reuse raw row parsing."""
+    """给解析器测试复用的 DataFrame 形状适配器。状态只包含传入记录；不连接 AKShare。"""
 
     def __init__(self, records: list[dict[str, Any]]) -> None:
+        """保存要序列化的记录。参数：records 为规范化字典列表。副作用：保存在实例字段中。"""
         self._records = records
 
     def to_json(self, **_: Any) -> str:
+        """提供 DataFrame 风格的 JSON 序列化接口。参数：关键字参数仅为兼容调用签名。返回：records 的 UTF-8 JSON 字符串。"""
         return json.dumps(self._records, ensure_ascii=False)

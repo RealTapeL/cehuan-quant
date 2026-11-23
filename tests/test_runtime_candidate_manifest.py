@@ -1,3 +1,5 @@
+"""策环测试模块：验证回测 CLI 将实际候选池封存进运行清单。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +17,7 @@ from test_core_workflow import bars
 
 
 def test_backtest_cli_seals_candidate_pool_in_run_manifest(tmp_path: Path, monkeypatch, capsys) -> None:
+    """验证回测CLI封存候选股票池在运行清单。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import cehuan.cli.main as cli_module
 
     data_path = tmp_path / "bars.csv"

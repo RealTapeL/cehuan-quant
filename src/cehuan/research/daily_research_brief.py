@@ -1,4 +1,4 @@
-"""Freshness-gated daily research brief built from sealed paper rankings."""
+"""每日研究简报生成器。它从本地交易日历识别最近已完成交易日，扫描封存纸面排名并调用现有研究 Agent 生成辅助假设；门控信息和程序事实与模型解释分开保存。"""
 
 from __future__ import annotations
 
@@ -35,11 +35,13 @@ REAL_CLASSIFICATION = "REAL_MARKET_DAILY_RESEARCH_BRIEF"
 
 
 def _repo_path(value: str | Path) -> Path:
+    """将配置路径解析到仓库根目录或保留绝对路径。参数：value 为路径。返回：解析后的绝对 Path。"""
     path = Path(value).expanduser()
     return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
 
 def _local_timestamp(value: Any) -> str | None:
+    """将可解析时间转换为上海本地时间字符串。参数：value 为 ISO 时间文本。返回：秒精度本地时间；非字符串/空值时返回 None。无时区值当前按 UTC 解释。"""
     if not isinstance(value, str) or not value:
         return None
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -49,6 +51,7 @@ def _local_timestamp(value: Any) -> str | None:
 
 
 def _write_json(value: Any, path: Path) -> None:
+    """以排序键和 UTF-8 编码写入 JSON。参数：value 为可序列化对象，path 为目标文件。副作用：覆盖指定输出文件。"""
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
@@ -56,7 +59,7 @@ def _write_json(value: Any, path: Path) -> None:
 
 
 def latest_completed_session(calendar: pd.DataFrame, now: datetime | None = None) -> str:
-    """Return the latest calendar-open day whose close has elapsed locally."""
+    """从交易日历选择收盘等待时间已过的最近开市日。参数：calendar 为规范或可规范化日历，now 为可选本机带时区时间。返回：YYYY-MM-DD 日期。限制：15:05 前将日期上限回退一天；这只是日历与本机时间判断，不证明行情已到达。异常：日历没有可确认完成日期时抛出 ValueError。"""
     local_now = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     normalized = normalize_trading_calendar(calendar)
     cutoff = local_now.date()
@@ -74,6 +77,7 @@ def latest_completed_session(calendar: pd.DataFrame, now: datetime | None = None
 
 
 def _load_calendar(path: Path, now: datetime | None) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """读取并核对日历文件及同目录采集清单。参数：path 为日历文件，now 用于判断最近完成日。返回：规范日历和来源/哈希/覆盖信息。副作用：只读 CSV/JSON 并计算哈希。异常：文件损坏或清单规范哈希不匹配时阻断；供应商发布时间缺证仍标 UNVERIFIED。"""
     if not path.is_file():
         raise FileNotFoundError(f"交易日历不存在：{path}")
     raw = pd.read_csv(path, low_memory=False)
@@ -109,6 +113,7 @@ def _load_calendar(path: Path, now: datetime | None) -> tuple[pd.DataFrame, dict
 
 
 def _scan_rank_manifests(root: Path) -> list[dict[str, Any]]:
+    """递归发现符合前瞻纸面类型的排名 manifest。参数：root 为扫描目录。返回：有效清单及其哈希、信号日、状态和来源抓取摘要；坏文件跳过，不执行排名。"""
     if not root.exists():
         return []
     results: list[dict[str, Any]] = []
@@ -143,6 +148,7 @@ def _scan_rank_manifests(root: Path) -> list[dict[str, Any]]:
 
 
 def _scan_incomplete_ranking_statuses(root: Path) -> list[dict[str, Any]]:
+    """发现历史 NEEDS_DATA 排名状态及已有行情覆盖摘要。参数：root 为私有实验根目录。返回：不完整运行和当前文件覆盖信息；不会把缺失转换为通过。"""
     if not root.exists():
         return []
     results: list[dict[str, Any]] = []
@@ -193,6 +199,7 @@ def _scan_incomplete_ranking_statuses(root: Path) -> list[dict[str, Any]]:
 def _make_agent_input(
     facts: Mapping[str, Any], *, run_id: str, config_path: Path, summary_path: Path,
 ) -> dict[str, Any]:
+    """从纸面排名事实构造受控研究 Agent 输入。参数：facts 为程序重建事实，run_id 标识本次简报，config_path/summary_path 绑定策略与摘要。返回：经过 schema 验证的输入字典；不含账户成交持仓。"""
     config = load_config(config_path)
     strategy = config.get("strategy", {})
     summary_facts = {
@@ -278,12 +285,13 @@ def _make_agent_input(
 
 
 class _DailyBriefStubModel:
-    """Deterministic, visibly non-LLM adapter used for local flow validation."""
+    """本地流程验证用的确定性 Stub 适配器。其文本不是 LLM 结论，也不表示真实市场研究。"""
 
     provider = "stub"
     model = "cehuan-daily-brief-stub-v1"
 
     def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
+        """为每日简报生成假设响应。参数：phase 为阶段，prompt/context 为受控输入。返回：结构化 ModelReply；Stub 模式不会访问外部服务。"""
         payload = context["research_input"]
         summary = payload["market_research_summary"]
         evidence = summary["evidence_catalog"][0]
@@ -322,6 +330,7 @@ def _report_markdown(
     proposal_review: Mapping[str, Any] | None, model_audit: Mapping[str, Any],
     blocking_reasons: list[str], latest_ranking: Mapping[str, Any] | None,
 ) -> str:
+    """生成面向用户的中文每日研究报告。参数：状态、目标日期、运行时间、日历信息、程序事实、可选模型假设/审查、模型审计、阻断原因和最近排名共同决定内容。返回：Markdown 文本，清楚区分事实与建议。"""
     lines = [
         f"# {target_date} 策环每日人工研究简报",
         "",
@@ -397,7 +406,7 @@ def run_daily_research_brief(
     agent_config_path: str | Path | None = None, config_path: str | Path = DEFAULT_CONFIG,
     now: datetime | None = None,
 ) -> Path:
-    """Build a freshness-gated brief from the newest completed session and sealed rank."""
+    """基于最近已完成交易日和封存排名生成每日研究简报。参数：calendar_path 为日历，ranking_root 为排名归档根目录，output_root 为新报告目录，model_mode 显式选择模型方式，agent/config 路径提供设置，now 可固定运行时点。返回：运行 ID、状态和报告路径。副作用：写运行产物；llm 模式可能发送脱敏研究输入并计费。若排名或数据新鲜度门控未通过，则不生成排名事实/模型调用。"""
     local_now = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     started = local_now.isoformat(timespec="seconds")
     calendar_file = _repo_path(calendar_path)

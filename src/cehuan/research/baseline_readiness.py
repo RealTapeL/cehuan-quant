@@ -1,3 +1,5 @@
+"""正式基线就绪度审计。模块汇总点时股票池、事件、交易规则、费用、基准和输入哈希的覆盖情况，并提供统一阻断入口；结构审计通过不代表来源内容或策略收益已验证。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -53,6 +55,9 @@ RULE_COLUMNS = MARKET_RULE_COLUMNS
 
 
 def _git_state() -> tuple[str | None, bool | None]:
+    """读取当前 Git 提交和工作区状态，供就绪报告绑定代码版本。
+    返回：包含提交标识和脏工作区状态的字典；Git 信息不可得时按实现返回未知状态。
+    副作用：执行只读 Git 查询。"""
     root = Path(__file__).resolve().parents[3]
     try:
         commit = subprocess.run(
@@ -67,6 +72,9 @@ def _git_state() -> tuple[str | None, bool | None]:
 
 
 def universe_input_hashes(universe: str | Path) -> dict[str, str]:
+    """计算股票池快照目录内参与审计文件的 SHA-256。
+    参数：universe 为股票池快照目录。
+    返回：相对文件名到摘要的映射；目录或文件读取失败时由文件系统异常阻断。"""
     root = Path(universe).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"股票池快照目录不存在：{root}")
@@ -96,6 +104,10 @@ def readiness_input_hashes(
     benchmark: str | Path,
     config: str | Path,
 ) -> dict[str, str]:
+    """为就绪审计所需输入计算并汇总文件哈希。
+    参数：关键字参数分别指向行情、点时质量、股票池、身份及退市证据、未知类型审查、公司行动、规则、费用、基准和配置文件。
+    返回：按输入角色索引的 SHA-256 映射。
+    异常：必需路径不可读或目录结构不符合预期时阻断。"""
     files = {
         "data": data,
         "point_in_time_quality": point_in_time_quality,
@@ -117,6 +129,10 @@ def readiness_input_hashes(
 
 
 def _read_dated_csv(path: str | Path, required: list[str], label: str) -> pd.DataFrame:
+    """读取并检查带日期字段的 CSV。
+    参数：path 为文件路径，required 为必需列名，label 用于错误消息。
+    返回：原始字符串列的 DataFrame。
+    异常：文件缺失、列缺失或 CSV 无法解析时抛出异常。"""
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"{label}文件不存在：{source}")
@@ -128,6 +144,10 @@ def _read_dated_csv(path: str | Path, required: list[str], label: str) -> pd.Dat
 
 
 def _dated_rows(frame: pd.DataFrame, label: str) -> tuple[pd.Series, pd.Series]:
+    """把已规范化的日期表转换为可审计行记录。
+    参数：frame 为日期表，label 为输入类别。
+    返回：适合写入报告的记录列表。
+    异常：日期、有效期或重复行不满足该表约定时阻断。"""
     start = pd.to_datetime(frame["valid_from"], errors="coerce")
     end_text = frame["valid_to"].replace("", pd.NA)
     end = pd.to_datetime(end_text, errors="coerce")
@@ -139,6 +159,9 @@ def _dated_rows(frame: pd.DataFrame, label: str) -> tuple[pd.Series, pd.Series]:
 
 
 def _audit_market_rules(bars: pd.DataFrame, rules_path: str | Path, start: str, end: str) -> dict[str, Any]:
+    """检查评价范围内每个证券日是否有唯一适用的市场规则。
+    参数：bars 为评价行情，rules_path 为规则表，start/end 为评价起止日。
+    返回：规则覆盖审计摘要及相关缺口；默认规则不能替代缺失历史规则的验证。"""
     rules = _read_dated_csv(rules_path, RULE_COLUMNS, "有效日期交易规则")
     rules["symbol"] = rules["symbol"].astype(str).str.strip().str.upper()
     rules["board"] = rules["board"].astype(str).str.strip()
@@ -257,6 +280,9 @@ def _audit_action_coverage(
     start: str,
     end: str,
 ) -> dict[str, Any]:
+    """核对持仓相关公司行动与覆盖登记表。
+    参数：bars 为持仓/行情范围，coverage_path 为覆盖证据表，actions 为规范事件，start/end 为评价窗口。
+    返回：覆盖状态和未解决事件列表；无事件记录不证明没有公司行动。"""
     coverage = _read_dated_csv(coverage_path, ACTION_COVERAGE_COLUMNS, "公司行动覆盖证明")
     coverage["symbol"] = coverage["symbol"].astype(str).str.strip().str.upper()
     coverage["valid_from"], coverage["valid_to"] = _dated_rows(coverage, "公司行动覆盖证明")
@@ -308,6 +334,9 @@ def _audit_action_coverage(
 
 
 def _audit_corporate_action_evidence(actions: pd.DataFrame) -> dict[str, Any]:
+    """检查公司行动事件是否具备要求的来源和复核证据。
+    参数：actions 为规范公司行动表。
+    返回：证据审计摘要；未核验来源或缺字段会作为阻断项保留。"""
     missing = []
     for row in actions.to_dict(orient="records"):
         for label, url, title, page, digest in (
@@ -336,6 +365,9 @@ def _audit_corporate_action_evidence(actions: pd.DataFrame) -> dict[str, Any]:
 
 
 def _audit_fee_schedule(fees_path: str | Path, bars: pd.DataFrame, start: str, end: str) -> dict[str, Any]:
+    """审计评价区间逐日适用的费用安排。
+    参数：fees_path 为费率文件，bars 为评价证券日，start/end 为窗口边界。
+    返回：覆盖与缺失摘要；配置回退费率不等同于历史或个人账户费率。"""
     fees = _read_dated_csv(fees_path, FEE_COLUMNS, "历史费率")
     fees["valid_from"], fees["valid_to"] = _dated_rows(fees, "历史费率")
     for column in ("commission_rate", "minimum_commission_cny", "stamp_duty_sell_rate", "transfer_fee_rate"):
@@ -402,7 +434,12 @@ def build_baseline_readiness(
     evaluation_start: str,
     evaluation_end: str,
 ) -> dict[str, Any]:
-    """Generate an input-bound readiness decision; never accept a user bool."""
+    """根据实际输入构建正式基线就绪报告。
+
+    参数：data、benchmark 和评价区间定义核验范围；各路径参数提供股票池、事件、交易规则、费用及证据文件；input_hashes 绑定本次实际输入。
+    返回：包含各门槛、阻断项和输入哈希的报告字典。
+    副作用：读取审计文件，不执行策略回测。
+    异常：必需字段或文件不可用时按审计结果记录失败/阻断。"""
     bars = normalize_bar_frame(data)
     start = pd.Timestamp(evaluation_start).strftime("%Y-%m-%d")
     end = pd.Timestamp(evaluation_end).strftime("%Y-%m-%d")
@@ -626,7 +663,10 @@ def require_baseline_ready(
     evaluation_end: str,
     current_git_commit: str | None = None,
 ) -> None:
-    """Reject missing, stale, hand-shaped, or input-mismatched readiness reports."""
+    """要求已保存的就绪报告与当前运行输入完全匹配且达到 READY。
+    参数：report 为报告，expected_input_hashes、evaluation_start/end 和可选 current_git_commit 用于绑定运行。
+    返回：通过时返回 None。
+    异常：状态未就绪、哈希/区间/代码不匹配时抛出 ValueError。"""
     if report.get("schema") != READINESS_SCHEMA or report.get("schema_version") != 1:
         raise ValueError("正式基线就绪报告缺失或 schema 版本不支持")
     report_copy = dict(report)
@@ -671,7 +711,10 @@ def require_baseline_ready(
 
 
 def require_report_matches_recomputed(saved: dict[str, Any], recomputed: dict[str, Any]) -> None:
-    """Ensure the persisted report is exactly the decision current code recomputes."""
+    """比较保存报告与从实际输入重新计算的就绪结果。
+    参数：saved 为磁盘报告，recomputed 为本次重建结果。
+    返回：一致时返回 None。
+    异常：任一关键字段不一致时拒绝复用旧报告。"""
     compared_fields = (
         "schema", "schema_version", "audit_program_git_commit", "audit_program_worktree_clean",
         "evaluation_window", "universe_snapshot_id", "input_hashes", "checks", "blockers",
@@ -691,12 +734,10 @@ def rebuild_baseline_readiness_from_context(
     evaluation_end: str,
     runtime_config: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Re-run the baseline audit from its bound files and return report plus actual hashes.
-
-    The caller must compare this result to the persisted readiness report and then
-    apply ``require_baseline_ready``. The report's own hashes are never used as
-    the source of truth.
-    """
+    """用统一上下文重新执行就绪审计。
+    参数：readiness_context 保存审计路径，evaluation_start/end 为窗口，runtime_config 为本次配置。
+    返回：由实际输入重建的就绪报告。
+    副作用：读取上下文中的审计文件；不能仅凭已保存布尔值放行。"""
     missing = set(READINESS_CONTEXT_KEYS).difference(readiness_context)
     if missing:
         raise ValueError("正式基线缺少 readiness 输入路径：" + ", ".join(sorted(missing)))

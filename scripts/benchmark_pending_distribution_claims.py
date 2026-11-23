@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Microbenchmark full event scans against the active-claim scheduler."""
+"""比较公司行动待处理权利的全量扫描与活动集合两种实现耗时；只做性能基准，不产生策略或收益结论。"""
 
 from __future__ import annotations
 
@@ -13,12 +13,14 @@ import tracemalloc
 
 @dataclass(frozen=True)
 class Event:
+    """表示性能基准中的待处理送转事件及其调度日期；仅用于合成计时。"""
     event_id: str
     effective_day: int
     registration_day: int
 
 
 def _measure_reference_scan(events: list[Event], session_count: int) -> tuple[float, int, str]:
+    """计时每个交易日扫描全部事件的参考实现；输出耗时和访问量，不改变事件。"""
     digest = hashlib.sha256()
     checks = 0
     tracemalloc.start()
@@ -37,6 +39,7 @@ def _measure_reference_scan(events: list[Event], session_count: int) -> tuple[fl
 
 
 def _measure_active_set(events: list[Event], session_count: int) -> tuple[float, int, str, int]:
+    """计时只遍历活动权利集合的实现；与参考扫描使用相同事件和交易日数。"""
     starts: dict[int, list[Event]] = {}
     ends: dict[int, list[Event]] = {}
     active: dict[str, Event] = {}
@@ -68,6 +71,7 @@ def _measure_active_set(events: list[Event], session_count: int) -> tuple[float,
 
 
 def run_benchmark(*, event_count: int, session_count: int, active_count: int) -> dict[str, object]:
+    """构造固定规模的合成事件并运行两种实现的对照计时；结果仅描述本机性能。"""
     if not 0 < active_count <= event_count:
         raise ValueError("active_count 必须在 1..event_count 范围内")
     events = [
@@ -98,6 +102,7 @@ def run_benchmark(*, event_count: int, session_count: int, active_count: int) ->
 
 
 def main() -> int:
+    """运行性能基准并输出计时结果；不调用外部数据源。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events", type=int, default=20_000)
     parser.add_argument("--sessions", type=int, default=250)

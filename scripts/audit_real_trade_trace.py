@@ -1,3 +1,5 @@
+"""重建既有研究信号、目标、模拟交易痕迹及相关事件证据；部分辅助流程会向指定目录采集公开来源，不能据此称为真实账户成交。"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,6 +20,7 @@ from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 
 
 def sha256_file(path: Path) -> str:
+    """计算来源文件的 SHA-256，用于审计输入和归档文件绑定。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -26,10 +29,12 @@ def sha256_file(path: Path) -> str:
 
 
 def _source_status(value: object) -> str:
+    """规范化来源状态字段；未知值保持未知，不推断为通过。"""
     return "RECORDED" if value is not None and not pd.isna(value) and str(value).strip() else "UNAVAILABLE"
 
 
 def _as_float(value: object) -> float | None:
+    """将可解析数值转为浮点数；无法解析时返回缺失状态供调用处处理。"""
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -38,7 +43,10 @@ def _as_float(value: object) -> float | None:
 
 
 def _suspension_state_counts(values: pd.Series) -> dict[str, int]:
-    """Count tri-state suspension observations without treating unknown as false."""
+    """分别统计停牌、未停牌和未知状态的观测行数。
+
+    参数：``values`` 为停牌状态序列。返回：三态计数映射；未知状态不会并入未停牌。
+    """
     states = parse_optional_bool(pd.Series(values, copy=False))
     suspended = int(states.eq(True).fillna(False).sum())
     not_suspended = int(states.eq(False).fillna(False).sum())
@@ -61,6 +69,7 @@ def _session_window_audit(
     lookback: int,
     symbol_history: pd.DataFrame,
 ) -> dict[str, Any]:
+    """审计单证券动量窗口的交易日、行数和价格状态；缺日、重复等问题单独报告。"""
     expected = [day for day in sessions if day <= signal_day][-lookback - 1:]
     actual = window["trade_date"].astype(str).tolist()
     counts = symbol_history["trade_date"].astype(str).value_counts()
@@ -88,6 +97,7 @@ def _session_window_audit(
 
 
 def _round_order_quantity(quantity: int, minimum: int, step: int) -> int:
+    """按传入的最小数量和增量规则计算研究用整数数量；该辅助值不构成可执行委托。"""
     if quantity < minimum:
         return 0
     return minimum + ((quantity - minimum) // step) * step
@@ -98,16 +108,12 @@ def _match_action_to_holding_windows(
     phase_dates: list[object],
     holding_windows: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Match record-date events to the recorded end-of-day holding interval.
+    """将登记日事件与记录的日终持仓区间做候选匹配。
 
-    Candidate-generation convention for this audit: an ordinary A-share
-    holding interval is a possible record-date match when it includes the
-    record date, including an interval that starts with a record-date buy. A
-    position closed before the simulated end-of-day snapshot is not matched.
-    This does not confirm the depository's account-level entitlement: the
-    available exchange education page and settlement materials do not fully
-    align on same-day transaction treatment. Later event phases remain linked
-    only after a possible record-date match is established.
+    参数：事件行、证券身份表、公司行动表和持仓区间表。返回：可能匹配的事件行。
+    本审计约定包含登记日买入并持有到日终的区间；日终快照前已卖清的区间不匹配。
+    这只是候选匹配，不确认结算机构最终权益；现有公开材料对同日交易处理并未完全一致。
+    后续事件阶段仅在登记日可能匹配后继续关联。
     """
     record_day = pd.to_datetime(record_date, errors="coerce")
     record_day = None if pd.isna(record_day) else record_day.date()
@@ -142,6 +148,7 @@ def _match_action_to_holding_windows(
 
 
 def _json(path: Path) -> dict[str, Any]:
+    """读取 JSON 文件并返回解析对象；读取错误由调用链记录。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"JSON 顶层必须为对象：{path}")
@@ -149,6 +156,7 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, value: object) -> None:
+    """将审计数据写为 JSON 文件；目标路径由调用方指定。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
@@ -159,6 +167,7 @@ def _rank_audit(
     market: dict[str, Any],
     signal_dates: list[str],
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    """用指定行情、候选池和策略配置重建信号日排名；不代表供应商当时已发布该排名。"""
     calculated = add_momentum(bars.copy(), int(strategy["lookback_sessions"]))
     saved = pd.read_csv(candidates_path, dtype={"signal_date": str, "execution_date": str, "symbol": str})
     output: list[pd.DataFrame] = []
@@ -198,6 +207,7 @@ def _signal_inputs(
     symbol: str,
     lookback: int,
 ) -> dict[str, Any]:
+    """抽取单证券信号日前指定长度的行情与特征输入；窗口边界按交易日序列计算。"""
     series = bars.loc[bars["symbol"].astype(str).eq(symbol)].sort_values("trade_date", kind="stable")
     signal_rows = series.loc[series["trade_date"].astype(str).le(signal_date)]
     current_matches = signal_rows.loc[signal_rows["trade_date"].astype(str).eq(signal_date)]
@@ -253,7 +263,11 @@ def _suspension_candidate_audit(
     strategy: dict[str, Any],
     symbol: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Rebuild one candidate's full row-based feature window and nearby ranks."""
+    """重建单个候选的逐行特征窗口及相邻排名。
+
+    参数：冻结行情、候选排名和策略设置。返回：窗口审计表与排名邻居表；
+    缺行或价格口径不合格时显式记录。
+    """
     symbol = str(symbol)
     candidate_rows = ranked.loc[ranked["symbol"].astype(str).eq(symbol)]
     if candidate_rows.empty:
@@ -401,6 +415,7 @@ def _reconstruct_targets(
     costs: dict[str, Any],
     initial_cash_cny: float,
 ) -> pd.DataFrame:
+    """根据候选、行情、日历、策略、市场规则及费用重建研究目标；资金参数只用于诊断假设。"""
     sessions = sorted(
         pd.to_datetime(calendar.loc[calendar["is_open"].astype(str).str.lower().isin(["true", "1"]), "trade_date"])
         .dt.strftime("%Y-%m-%d").unique()
@@ -556,6 +571,7 @@ def _trade_rows(
     strategy: dict[str, Any],
     costs: dict[str, Any],
 ) -> pd.DataFrame:
+    """把模拟成交、行情、账本和回退信息合成为逐笔解释记录；不把模拟记录说成账户成交。"""
     sessions = sorted(
         pd.to_datetime(calendar.loc[calendar["is_open"].astype(str).str.lower().isin(["true", "1"]), "trade_date"])
         .dt.strftime("%Y-%m-%d").unique()
@@ -682,6 +698,7 @@ def _trade_rows(
 
 
 def _capture_cninfo_dividends(symbols: list[str], out_dir: Path) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """在限定证券和输出目录内抓取分红公告相关材料；只保留来源证据，不自动完成公告审核。"""
     import akshare as ak
     import requests
 
@@ -689,6 +706,7 @@ def _capture_cninfo_dividends(symbols: list[str], out_dir: Path) -> tuple[pd.Dat
     captured: list[tuple[str, bytes]] = []
 
     def capture_post(*args: Any, **kwargs: Any):
+        """发送公告数据接口的 POST 请求并返回响应；网络或服务错误由调用方分类。"""
         response = original_post(*args, **kwargs)
         url = str(args[0] if args else kwargs.get("url", ""))
         if "p_sysapi1139" in url:
@@ -746,6 +764,7 @@ def _capture_cninfo_dividends(symbols: list[str], out_dir: Path) -> tuple[pd.Dat
 
 
 def _capture_tencent_quotes(symbols: list[str], out_dir: Path, start: str, end: str) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """在指定代码和日期范围内抓取腾讯行情响应；抓取时间不等同于供应商发布时间。"""
     import akshare as ak
     import requests
 
@@ -753,6 +772,7 @@ def _capture_tencent_quotes(symbols: list[str], out_dir: Path, start: str, end: 
     captured: list[tuple[str, bytes]] = []
 
     def capture_get(*args: Any, **kwargs: Any):
+        """发送行情来源的 GET 请求并返回响应；请求范围受调用方给定的代码和日期限制。"""
         response = original_get(*args, **kwargs)
         url = str(args[0] if args else kwargs.get("url", ""))
         if "finance.qq.com" in url:
@@ -815,6 +835,7 @@ def _capture_tencent_quotes(symbols: list[str], out_dir: Path, start: str, end: 
 
 
 def _archive_official_filing(out_dir: Path, filing: dict[str, Any]) -> dict[str, Any]:
+    """归档指定官方公告并记录文件哈希；哈希只证明归档字节未变。"""
     import requests
 
     symbol = str(filing["symbol"])
@@ -866,6 +887,7 @@ def _archive_official_filing(out_dir: Path, filing: dict[str, Any]) -> dict[str,
 
 
 def main() -> int:
+    """执行既有信号和模拟交易痕迹审计并写入新目录；可能按明确参数抓取有限公开来源。"""
     parser = argparse.ArgumentParser(description="Generate read-only, transaction-level audit of a frozen real-data research run.")
     parser.add_argument("--experiment-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)

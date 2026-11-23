@@ -1,3 +1,5 @@
+"""策环测试模块：验证正式基线 readiness 必须由实际审计输入重建，不能靠自报状态放行。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -31,6 +33,7 @@ from cehuan.research.baseline_readiness import (
 
 
 def _write_inputs(root: Path) -> dict[str, Path]:
+    """私有测试辅助函数，用于写入输入。 参数：`root`：代码标识“root”（含义待核实）场景输入。 返回：dict[str, Path]，供调用处构造夹具或断言复用。"""
     root.mkdir(parents=True, exist_ok=True)
     data_path = root / "bars.csv"
     dates = ["2025-01-02", "2025-01-03"]
@@ -141,6 +144,7 @@ def _write_inputs(root: Path) -> dict[str, Path]:
 
 
 def _formal_inputs(paths: dict[str, Path]):
+    """私有测试辅助函数，用于正式输入。 参数：`paths`：代码标识“paths”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
     context = {
         "data": paths["data"],
         "point_in_time_quality": paths["quality"],
@@ -177,6 +181,7 @@ def _formal_inputs(paths: dict[str, Path]):
 
 @pytest.mark.parametrize(("path_key", "hash_key"), [("fees", "fees"), ("rules", "market_rules")])
 def test_actual_readiness_rebuild_detects_replaced_fee_or_rule_input(tmp_path, path_key, hash_key):
+    """验证实际就绪门控重建检测替换费用或规则输入。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`path_key`：路径密钥场景输入；`hash_key`：哈希密钥场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / f"rebuild-{hash_key}")
     context, _, saved = _formal_inputs(paths)
     with paths[path_key].open("a", encoding="utf-8") as handle:
@@ -194,6 +199,7 @@ def test_actual_readiness_rebuild_detects_replaced_fee_or_rule_input(tmp_path, p
 
 
 def test_forged_healthy_quality_alone_never_marks_baseline_ready(tmp_path):
+    """验证伪造健康质量单独不会标记基线就绪。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "ready")
     hashes = readiness_input_hashes(
         data=paths["data"], point_in_time_quality=paths["quality"], universe=paths["universe"],
@@ -236,6 +242,7 @@ def test_forged_healthy_quality_alone_never_marks_baseline_ready(tmp_path):
 
 
 def test_readiness_rule_audit_rejects_infinite_limit_and_fee_values(tmp_path):
+    """验证就绪门控规则审计拒绝无穷涨跌停与费用数值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars = pd.read_csv(_write_inputs(tmp_path / "finite-audit")['data'])
     rules = pd.DataFrame([{
         "symbol": "SH600000", "board": "MAIN", "valid_from": "2025-01-01", "valid_to": "2025-01-31",
@@ -266,6 +273,7 @@ def test_readiness_rule_audit_rejects_infinite_limit_and_fee_values(tmp_path):
 
 
 def test_formal_backtest_recomputes_complete_readiness_and_reports_blockers(tmp_path):
+    """验证正式回测重算完整就绪门控与报告阻断项。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-complete")
     context, hashes, report = _formal_inputs(paths)
 
@@ -281,6 +289,7 @@ def test_formal_backtest_recomputes_complete_readiness_and_reports_blockers(tmp_
 
 
 def test_formal_backtest_accepts_event_frames_matching_bound_files(tmp_path):
+    """验证正式回测接受事件数据表匹配绑定文件。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-matching-events")
     context, hashes, report = _formal_inputs(paths)
 
@@ -297,6 +306,7 @@ def test_formal_backtest_accepts_event_frames_matching_bound_files(tmp_path):
 
 
 def test_formal_backtest_rejects_identity_events_different_from_bound_file(tmp_path):
+    """验证正式回测拒绝身份事件不同从绑定文件。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-mismatched-identity")
     context, hashes, report = _formal_inputs(paths)
 
@@ -311,6 +321,7 @@ def test_formal_backtest_rejects_identity_events_different_from_bound_file(tmp_p
 
 
 def test_formal_backtest_rejects_corporate_actions_different_from_bound_file(tmp_path):
+    """验证正式回测拒绝公司行动不同从绑定文件。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-mismatched-actions")
     context, hashes, report = _formal_inputs(paths)
 
@@ -325,6 +336,7 @@ def test_formal_backtest_rejects_corporate_actions_different_from_bound_file(tmp
 
 
 def test_formal_backtest_rejects_changed_readiness_input_hash(tmp_path):
+    """验证正式回测拒绝变更就绪门控输入哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-stale-hash")
     context, hashes, report = _formal_inputs(paths)
     paths["identity"].write_text(paths["identity"].read_text(encoding="utf-8") + "\n", encoding="utf-8")
@@ -339,6 +351,7 @@ def test_formal_backtest_rejects_changed_readiness_input_hash(tmp_path):
 
 
 def test_formal_backtest_rejects_incomplete_readiness_context_before_reaudit(tmp_path):
+    """验证正式回测拒绝不完整就绪门控上下文之前重新审计。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-missing-context")
     context, hashes, report = _formal_inputs(paths)
     context.pop("unknown_type_review")
@@ -354,6 +367,7 @@ def test_formal_backtest_rejects_incomplete_readiness_context_before_reaudit(tmp
 
 
 def test_market_rules_with_missing_required_column_are_rejected(tmp_path):
+    """验证市场规则带有缺失必需列拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "missing-rule-column")
     paths["rules"].write_text("symbol,board,valid_from\n", encoding="utf-8")
     hashes = readiness_input_hashes(
@@ -379,6 +393,7 @@ def test_market_rules_with_missing_required_column_are_rejected(tmp_path):
 
 
 def test_changing_identity_event_file_breaks_quality_hash_binding(tmp_path):
+    """验证变更身份事件文件破坏质量哈希绑定。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "identity-hash")
     with paths["identity"].open("a", encoding="utf-8") as handle:
         handle.write("\n")
@@ -404,6 +419,7 @@ def test_changing_identity_event_file_breaks_quality_hash_binding(tmp_path):
 
 
 def test_baseline_readiness_cli_writes_a_blocked_report_without_running_backtest(tmp_path, capsys):
+    """验证基线就绪门控CLI写入阻断报告缺少运行回测。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "cli")
     output = tmp_path / "cli-readiness.json"
     exit_code = main([
@@ -433,6 +449,7 @@ def test_baseline_readiness_cli_writes_a_blocked_report_without_running_backtest
 
 
 def test_formal_cli_requires_prevalidated_filtered_bars_and_rejects_universe(tmp_path, capsys):
+    """验证正式CLI要求预已筛选行情与拒绝股票池。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     paths = _write_inputs(tmp_path / "formal-cli-contract")
     common = [
         "--data", str(paths["data"]), "--cash", "100000",

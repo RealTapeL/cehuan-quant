@@ -1,3 +1,10 @@
+"""定义账本、持仓批次、费用、权益与净值结果的数据模型。
+
+这些不可变对象由 ``PortfolioLedger`` 创建和校验，并通过快照模块持久化；金额使用
+人民币元 Decimal，股数为整数，日期按交易日解释。模型只校验结构与内部约束，不自行
+推断未知的市场规则、公司行动结果或账户税费事实。
+"""
+
 from __future__ import annotations
 
 import re
@@ -13,6 +20,7 @@ Side = Literal["BUY", "SELL"]
 
 
 def decimal_value(value: Decimal | int | str, field: str, *, nonnegative: bool = False) -> Decimal:
+    """把金额或比例转换为有限 Decimal；禁止 float 以避免二进制精度误差。"""
     if isinstance(value, bool) or isinstance(value, float):
         raise ValueError(f"{field} 必须使用 Decimal、整数或十进制字符串，不能传 float")
     try:
@@ -25,6 +33,7 @@ def decimal_value(value: Decimal | int | str, field: str, *, nonnegative: bool =
 
 
 def share_count(value: int | Decimal | str, field: str, *, allow_zero: bool = False) -> int:
+    """校验并规范整数股数；可选允许零股，拒绝 bool、float 和小数股。"""
     if isinstance(value, bool) or isinstance(value, float):
         raise ValueError(f"{field} 必须是整数股数，不能传 bool/float")
     if isinstance(value, int):
@@ -44,6 +53,7 @@ def share_count(value: int | Decimal | str, field: str, *, allow_zero: bool = Fa
 
 
 def calendar_date(value: date | str, field: str, *, optional: bool = False) -> date | None:
+    """校验 ISO 日历日期；可选字段可返回 None，不接受含时刻的 datetime。"""
     if value is None and optional:
         return None
     if isinstance(value, datetime):
@@ -61,6 +71,7 @@ def calendar_date(value: date | str, field: str, *, optional: bool = False) -> d
 
 
 def security_symbol(value: object, field: str) -> str:
+    """将证券代码规范化，并要求沪深北交易所前缀加六位数字。"""
     symbol = canonical_symbol(value)
     if not re.fullmatch(r"(?:SH|SZ|BJ)\d{6}", symbol):
         raise ValueError(f"{field} 必须是带沪深北交易所前缀的六位证券代码")
@@ -69,6 +80,7 @@ def security_symbol(value: object, field: str) -> str:
 
 @dataclass(frozen=True)
 class PositionLot:
+    """持仓批次，分别保存总股数、可卖股数、成本和取得/可卖日期。"""
     lot_id: str
     symbol: str
     total_shares: int
@@ -79,6 +91,7 @@ class PositionLot:
     source_event_id: str | None = None
 
     def __post_init__(self) -> None:
+        """规范批次字段并校验股数、成本与 T+1 可卖日期关系。"""
         lot_id = str(self.lot_id).strip()
         if not lot_id:
             raise ValueError("lot_id 不能为空")
@@ -103,6 +116,7 @@ class PositionLot:
             object.__setattr__(self, "source_event_id", str(self.source_event_id).strip() or None)
 
     def sellable_on(self, trade_date: date) -> int:
+        """返回指定交易日该批次可卖股数；新买批次到 ``sellable_from`` 才全量可卖。"""
         day = calendar_date(trade_date, "trade_date")
         if day >= self.sellable_from:
             return self.total_shares
@@ -111,10 +125,12 @@ class PositionLot:
 
 @dataclass(frozen=True)
 class FeeItem:
+    """一项人民币交易费用；名称用于区分佣金、税费等账务分项。"""
     name: str
     amount_cny: Decimal
 
     def __post_init__(self) -> None:
+        """校验费用名称非空且金额为有限非负数。"""
         name = str(self.name).strip()
         if not name:
             raise ValueError("费用项目 name 不能为空")
@@ -124,6 +140,7 @@ class FeeItem:
 
 @dataclass(frozen=True)
 class TradeFill:
+    """一笔模拟或导入成交，记录方向、股数、价格、费用及买入可卖日。"""
     fill_id: str
     trade_date: date
     symbol: str
@@ -134,6 +151,7 @@ class TradeFill:
     sellable_from: date | None = None
 
     def __post_init__(self) -> None:
+        """规范成交字段并校验方向、费用唯一性、正价格和买入 T+1 约束。"""
         fill_id = str(self.fill_id).strip()
         if not fill_id:
             raise ValueError("fill_id 不能为空")
@@ -166,6 +184,7 @@ class TradeFill:
 
 @dataclass(frozen=True)
 class CashReceivable:
+    """公司行动产生的现金应收，区分税前金额、税额、支付和税务证据状态。"""
     receivable_id: str
     event_id: str
     gross_cny: Decimal
@@ -184,6 +203,7 @@ class CashReceivable:
     payment_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        """校验应收金额、税务口径、发放证据和状态字段之间的一致性。"""
         if not str(self.receivable_id).strip() or not str(self.event_id).strip():
             raise ValueError("应收款 receivable_id/event_id 不能为空")
         gross = decimal_value(self.gross_cny, "gross_cny", nonnegative=True)
@@ -241,6 +261,7 @@ class CashReceivable:
 
 @dataclass(frozen=True)
 class DividendTaxLotRecord:
+    """按持仓批次跟踪分红权益及后续卖出产生的待核实税务状态。"""
     record_id: str
     event_id: str
     symbol: str
@@ -267,6 +288,7 @@ class DividendTaxLotRecord:
     account_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        """校验批次股数守恒、税务状态及政策/账户证据哈希。"""
         for field in ("record_id", "event_id", "lot_id"):
             if not str(getattr(self, field)).strip():
                 raise ValueError(f"DividendTaxLotRecord.{field} 不能为空")
@@ -335,6 +357,7 @@ class DividendTaxLotRecord:
 
 @dataclass(frozen=True)
 class NoncashClaim:
+    """尚未转成现金或可交易股份的公司行动权益及其估值、成本与阶段状态。"""
     claim_id: str
     event_id: str
     old_symbol: str
@@ -354,6 +377,7 @@ class NoncashClaim:
     source_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        """校验权益数量、分批分配、估值来源和批次成本汇总的一致性。"""
         if not str(self.claim_id).strip() or not str(self.event_id).strip():
             raise ValueError("权利 claim_id/event_id 不能为空")
         exact = None if self.exact_entitlement is None else decimal_value(
@@ -419,12 +443,14 @@ class NoncashClaim:
 
 @dataclass(frozen=True)
 class PriceMark:
+    """持仓估值标记，记录人民币价格、价格日期、来源和滞后开市日数。"""
     price_cny: Decimal
     price_date: date
     source: str
     age_sessions: int
 
     def __post_init__(self) -> None:
+        """校验正价格、非负滞后期数及非空来源。"""
         price = decimal_value(self.price_cny, "price_cny")
         if price <= 0:
             raise ValueError("估值价格必须大于 0")
@@ -440,6 +466,7 @@ class PriceMark:
 
 @dataclass(frozen=True)
 class LedgerEntry:
+    """不可变账簿流水，记录幂等键、事件阶段、现金变化和持仓变化。"""
     entry_id: str
     operation_key: str
     event_id: str
@@ -453,6 +480,7 @@ class LedgerEntry:
 
 @dataclass(frozen=True)
 class EntitledLot:
+    """公司行动登记时的一笔有权益持仓快照，保留原批次成本和取得日。"""
     lot_id: str
     quantity: int
     cost_basis_cny: Decimal
@@ -460,6 +488,7 @@ class EntitledLot:
     sellable_from: date
 
     def __post_init__(self) -> None:
+        """校验权益股数、成本与取得日至可卖日的先后关系。"""
         lot_id = str(self.lot_id).strip()
         if not lot_id:
             raise ValueError("EntitledLot.lot_id 不能为空")
@@ -478,12 +507,14 @@ class EntitledLot:
 
 @dataclass(frozen=True)
 class EntitlementSnapshot:
+    """某事件登记日的持仓批次快照，供后续分红、送转或配股阶段使用。"""
     event_id: str
     symbol: str
     captured_on: date
     lots: tuple[EntitledLot, ...]
 
     def __post_init__(self) -> None:
+        """规范证券和登记日期，并验证批次类型及 lot_id 唯一。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("EntitlementSnapshot.event_id 不能为空")
@@ -499,15 +530,18 @@ class EntitlementSnapshot:
 
     @property
     def total_shares(self) -> int:
+        """返回快照中所有有权益批次的合计股数。"""
         return sum(lot.quantity for lot in self.lots)
 
     @property
     def total_cost_basis_cny(self) -> Decimal:
+        """返回快照中所有有权益批次的人民币成本合计。"""
         return sum((lot.cost_basis_cny for lot in self.lots), start=Decimal("0"))
 
 
 @dataclass(frozen=True)
 class NavResult:
+    """单日净值计算结果及未估值原因、陈旧价格和税务范围标记。"""
     status: Literal["VALUED", "VALUED_WITH_UNRESOLVED_DIVIDEND_TAX", "UNVALUED"]
     valuation_date: date
     nav_cny: Decimal | None
@@ -523,6 +557,7 @@ class NavResult:
 
 @dataclass(frozen=True)
 class LedgerSnapshot:
+    """可续跑的账本状态，含现金、持仓、应收、权利、流水与税务批次。"""
     portfolio_id: str
     cash_cny: Decimal
     positions: tuple[PositionLot, ...]
@@ -534,6 +569,7 @@ class LedgerSnapshot:
     as_of_date: date | None = None
 
     def __post_init__(self) -> None:
+        """规范快照字段，并拒绝晚于快照日期的账务流水。"""
         portfolio_id = str(self.portfolio_id).strip()
         if not portfolio_id:
             raise ValueError("LedgerSnapshot.portfolio_id 不能为空")

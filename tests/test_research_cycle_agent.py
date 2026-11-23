@@ -1,3 +1,5 @@
+"""策环测试模块：验证研究 Agent 的 schema、模型适配、假设验证和研究周期闭环。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import copy
@@ -39,6 +41,7 @@ ROOT = Path(__file__).parents[1]
 
 
 def _agent_input() -> dict:
+    """私有测试辅助函数，用于Agent输入。 返回：dict，供调用处构造夹具或断言复用。"""
     payload = json.loads((ROOT / "examples/strategy-research-agent-input.synthetic.json").read_text(encoding="utf-8"))
     config = synthetic_cycle_config()
     payload["frozen_strategy"]["parameters"] = config["strategy"]
@@ -47,6 +50,7 @@ def _agent_input() -> dict:
 
 
 def test_agent_input_schema_and_stub_hypothesis_are_validated():
+    """验证Agent输入结构与stub假设已。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = validate_strategy_research_input(_agent_input())
     digest = "a" * 64
     context = {
@@ -70,6 +74,7 @@ def test_agent_input_schema_and_stub_hypothesis_are_validated():
 
 
 def test_model_prompt_capability_list_is_generated_from_executor_contract():
+    """验证模型提示词能力列表生成从执行器契约。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     capability = payload["experiment_capabilities"]
     paths = [item["config_path"] for item in capability["supported_parameters"]]
@@ -92,6 +97,7 @@ def test_model_prompt_capability_list_is_generated_from_executor_contract():
 
 
 def test_research_agent_rejects_order_or_unknown_action_fields():
+    """验证研究Agent拒绝订单或未知行动字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     digest = "b" * 64
     good, _ = generate_validated_hypothesis(
@@ -100,13 +106,16 @@ def test_research_agent_rejects_order_or_unknown_action_fields():
     )
 
     class UnsafeModel:
+        """测试辅助类“UnsafeModel”，用于承载不安全模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         provider = "test"
         model = "unsafe-fixture"
 
         def __init__(self):
+            """初始化测试辅助对象`UnsafeModel`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.calls = 0
 
         def generate(self, **kwargs):
+            """实现测试替身UnsafeModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.calls += 1
             response = copy.deepcopy(good)
             response["action"] = "BUY"
@@ -123,6 +132,7 @@ def test_research_agent_rejects_order_or_unknown_action_fields():
 
 
 def test_model_auto_mode_uses_stub_when_endpoint_or_key_is_missing(monkeypatch):
+    """验证模型自动模式使用stub当接口或密钥缺失。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     monkeypatch.delenv("CEHUAN_LLM_MODEL", raising=False)
     monkeypatch.delenv("CEHUAN_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("CEHUAN_LLM_API_KEY", raising=False)
@@ -135,6 +145,7 @@ def test_model_auto_mode_uses_stub_when_endpoint_or_key_is_missing(monkeypatch):
 
 
 def test_configured_llm_metadata_never_contains_api_key(monkeypatch):
+    """验证已配置LLM元数据不会包含API密钥。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     monkeypatch.setenv("CEHUAN_LLM_MODEL", "example-model")
     monkeypatch.setenv("CEHUAN_LLM_BASE_URL", "https://llm.example/v1")
     monkeypatch.setenv("CEHUAN_LLM_API_KEY", "synthetic-secret-for-test")
@@ -151,6 +162,7 @@ def test_configured_llm_metadata_never_contains_api_key(monkeypatch):
 
 
 def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body():
+    """验证OpenAI兼容适配器使用JSON请求与保持密钥退出的正文。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     captured = {}
     response_body = json.dumps({
         "choices": [{"message": {"content": '{"synthetic": true}'}}],
@@ -158,7 +170,9 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
     }).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
+        """测试辅助类“Handler”，用于承载处理器相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def do_POST(self):
+            """实现测试替身Handler的POST行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
             captured.setdefault("requests", []).append({
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
@@ -171,6 +185,7 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
             self.wfile.write(response_body)
 
         def log_message(self, format, *args):
+            """实现测试替身Handler的日志消息行为；用于控制被测代码与断言，不访问真实服务。 参数：`format`：代码标识“format”（含义待核实）场景输入；`*args`：参数场景输入。 返回值供调用处构造夹具或断言复用。"""
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -208,6 +223,7 @@ def test_openai_compatible_adapter_uses_json_request_and_keeps_key_out_of_body()
 
 
 def test_openai_compatible_403_extracts_provider_code_and_redacts_sensitive_values(monkeypatch):
+    """验证OpenAI兼容403提取供应商代码与脱敏敏感数值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     api_key = "fixture-secret-token-403"
     body = json.dumps({
         "error": {
@@ -221,6 +237,7 @@ def test_openai_compatible_403_extracts_provider_code_and_redacts_sensitive_valu
     )
 
     def raise_http_error(request, timeout):
+        """实现测试替身test_openai_compatible_403_extracts_provider_code_and_redacts_sensitive_values的抛出HTTP错误行为；用于控制被测代码与断言，不访问真实服务。 参数：`request`：pytest 提供的参数化请求上下文；`timeout`：超时场景输入。 返回值供调用处构造夹具或断言复用。"""
         raise http_error
 
     monkeypatch.setattr(research_agent_module.urllib.request, "urlopen", raise_http_error)
@@ -241,6 +258,7 @@ def test_openai_compatible_403_extracts_provider_code_and_redacts_sensitive_valu
 
 
 def test_openai_compatible_403_reads_top_level_error_and_never_echoes_malformed_body(monkeypatch):
+    """验证OpenAI兼容403读取前列层级错误与不会照搬格式错误正文。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     api_key = "fixture-key-to-redact"
     payload = {
         "type": "access_denied",
@@ -287,18 +305,22 @@ def test_openai_compatible_403_reads_top_level_error_and_never_echoes_malformed_
 
 
 def test_llm_transport_timeout_is_not_retried_to_avoid_duplicate_requests():
+    """验证LLM传输超时不重试到避免重复请求。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     digest = "c" * 64
 
     class TimeoutModel:
+        """测试辅助类“TimeoutModel”，用于承载超时模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         provider = "test"
         model = "timeout-fixture"
         safe_endpoint = "https://llm.example/v1"
 
         def __init__(self):
+            """初始化测试辅助对象`TimeoutModel`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.calls = 0
 
         def generate(self, **kwargs):
+            """实现测试替身TimeoutModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.calls += 1
             raise ResearchModelRequestError("LLM 请求失败：TimeoutError")
 
@@ -317,6 +339,7 @@ def test_llm_transport_timeout_is_not_retried_to_avoid_duplicate_requests():
 
 
 def test_invalid_synthetic_evidence_retry_includes_specific_binding_feedback():
+    """验证无效合成证据重试包含特定绑定反馈。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     payload["data_trust"]["overall"] = "SYNTHETIC_ONLY_NOT_MARKET_EVIDENCE"
     digest = "d" * 64
@@ -326,13 +349,16 @@ def test_invalid_synthetic_evidence_retry_includes_specific_binding_feedback():
     )
 
     class CorrectingModel:
+        """测试辅助类“CorrectingModel”，用于承载修正模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         provider = "test"
         model = "evidence-retry-fixture"
 
         def __init__(self):
+            """初始化测试辅助对象`CorrectingModel`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
             self.prompts = []
 
         def generate(self, *, phase, prompt, context):
+            """实现测试替身CorrectingModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`phase`：阶段场景输入；`prompt`：提示词场景输入；`context`：上下文场景输入。 返回值供调用处构造夹具或断言复用。"""
             self.prompts.append(prompt)
             response = copy.deepcopy(good)
             if len(self.prompts) == 1:
@@ -355,6 +381,7 @@ def test_invalid_synthetic_evidence_retry_includes_specific_binding_feedback():
 
 
 def test_unknown_experiment_rule_is_marked_pending_not_ignored():
+    """验证未知实验规则标记待处理不忽略。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = synthetic_cycle_config()
     candidate, reason = _apply_one_change(config, {
         "config_path": "market.new_rule",
@@ -366,6 +393,7 @@ def test_unknown_experiment_rule_is_marked_pending_not_ignored():
 
 
 def test_stub_completes_synthetic_research_experiment_review_and_next_hypothesis(tmp_path):
+    """验证stub完成合成研究实验复核与下一条假设。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     before = (ROOT / "configs/default.toml").read_bytes()
     run_dir = run_research_cycle(
         output_root=tmp_path / "research",
@@ -424,6 +452,7 @@ def test_stub_completes_synthetic_research_experiment_review_and_next_hypothesis
 
 @pytest.mark.parametrize("status", ["FAILED", "NEEDS_IMPLEMENTATION_OR_REVIEW", "BLOCKED_BY_HYPOTHESIS_STATUS"])
 def test_next_round_context_does_not_invent_candidate_metrics_when_experiment_not_completed(tmp_path, status):
+    """验证下一条轮次上下文不编造候选指标当实验不完成。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`status`：状态场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline_metrics = {"total_return": 0.12, "trade_count": 4}
     baseline_path = tmp_path / "baseline_metrics.json"
     baseline_path.write_text(json.dumps(baseline_metrics), encoding="utf-8")
@@ -456,6 +485,7 @@ def test_next_round_context_does_not_invent_candidate_metrics_when_experiment_no
 
 
 def test_next_round_context_blocks_metrics_with_mismatched_artifact_hash(tmp_path):
+    """验证下一条轮次上下文阻断指标带有不匹配产物哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline_path = tmp_path / "baseline_metrics.json"
     candidate_path = tmp_path / "candidate_metrics.json"
     baseline_path.write_text(json.dumps({"total_return": 0.1}), encoding="utf-8")

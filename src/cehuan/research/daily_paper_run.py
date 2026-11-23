@@ -1,4 +1,4 @@
-"""Same-day, fixed-pool paper capture, ranking, and human research brief."""
+"""每日小范围纸面采集与简报流程。模块按固定研究池串行抓取日历、成员、基础资料、原始/后复权行情及状态，先封存输入再调用现有排名和简报入口；门控失败时记录 NEEDS_DATA，不回填、不生成委托。"""
 
 from __future__ import annotations
 
@@ -35,10 +35,12 @@ REQUIRED_RAW_FIELDS = set(RAW_HISTORY_FIELDS.split(","))
 
 
 class _DailyCaptureBlocked(ValueError):
+    """每日采集关键输入不完整时使用的流程阻断异常。调用层将其转成带原因的 NEEDS_DATA 产物，避免缺失输入进入排名。"""
     pass
 
 
 def _sha(path: Path) -> str:
+    """流式计算文件 SHA-256。参数：path 为待封存文件。返回：小写十六进制摘要；文件不可读时抛出文件系统异常。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -47,22 +49,26 @@ def _sha(path: Path) -> str:
 
 
 def _iso(value: datetime) -> str:
+    """把带时区时间规范为 UTC 字符串。参数：value 为采集时点。返回：秒精度 ISO 8601 字符串。异常：时间无时区时抛出 ValueError。"""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("每日采集时间必须带时区")
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _canonical_vendor_symbol(value: object) -> str:
+    """规范 BaoStock 风格代码或项目代码。参数：value 为供应商代码值。返回：项目 SH/SZ 代码；无法规范化时由 canonical_symbol 抛出异常。"""
     raw = str(value).strip().upper()
     match = re.fullmatch(r"(SH|SZ)\.(\d{6})", raw)
     return f"{match.group(1)}{match.group(2)}" if match else canonical_symbol(value)
 
 
 def _vendor_code(symbol: str) -> str:
+    """把项目证券代码转成 BaoStock 的市场前缀格式。参数：symbol 为 SH/SZ 规范代码。返回：小写市场前缀加点号的代码字符串。"""
     return f"{symbol[:2].lower()}.{symbol[2:]}"
 
 
 def _listed(basic: pd.Series | None, day: str) -> Any:
+    """用基础资料的 IPO/退市日期判断目标日是否处于上市区间。参数：basic 为单证券基础资料，day 为目标日期。返回：布尔值；无基础资料或上市日期时返回 pandas 缺失值。"""
     if basic is None:
         return pd.NA
     ipo = pd.to_datetime(basic.get("ipoDate", ""), errors="coerce")
@@ -74,11 +80,13 @@ def _listed(basic: pd.Series | None, day: str) -> Any:
 
 
 def _status_flag(value: Any) -> Any:
+    """解析 BaoStock 0/1 状态字段。参数：value 为供应商状态。返回：0→False、1→True，其他值保持缺失/未知。"""
     text = str(value).strip()
     return {"0": False, "1": True}.get(text, pd.NA)
 
 
 def _suspension(list_status: Any, raw_status: Any, adjusted_status: Any) -> Any:
+    """对照成员表及原始/复权日线的交易状态推导停牌标记。参数：三项均为来源状态值。返回：一致且明确时返回是否停牌；缺失或冲突时返回未知。"""
     values = [str(value).strip() for value in (list_status, raw_status, adjusted_status) if str(value).strip() in {"0", "1"}]
     if not values or len(set(values)) != 1:
         return pd.NA
@@ -86,6 +94,7 @@ def _suspension(list_status: Any, raw_status: Any, adjusted_status: Any) -> Any:
 
 
 def _st(raw_row: pd.Series | None, adjusted_row: pd.Series | None) -> Any:
+    """对照原始与复权日线的 isST 字段。参数：raw_row/adjusted_row 为对应日期行情行。返回：两来源一致时返回 ST 布尔值，否则返回未知。"""
     values = []
     for row in (raw_row, adjusted_row):
         if row is None:
@@ -99,6 +108,7 @@ def _st(raw_row: pd.Series | None, adjusted_row: pd.Series | None) -> Any:
 
 
 def _row_for_day(frame: pd.DataFrame | None, day: str) -> pd.Series | None:
+    """从单证券行情中取唯一指定日期记录。参数：frame 为行情表，day 为 YYYY-MM-DD。返回：唯一行 Series；缺失、空表或重复时返回 None。"""
     if frame is None or frame.empty or "date" not in frame:
         return None
     rows = frame.loc[frame["date"].astype(str).eq(day)]
@@ -106,6 +116,7 @@ def _row_for_day(frame: pd.DataFrame | None, day: str) -> pd.Series | None:
 
 
 def _request_validation(request_id: str, frame: pd.DataFrame, symbols: tuple[str, ...]) -> str | None:
+    """验证一次 BaoStock 请求响应的字段、固定证券范围及关键唯一性。参数：request_id 标识请求类型/证券，frame 为响应 DataFrame，symbols 为冻结池。返回：通过时 None，否则返回安全错误类别字符串；不推断非空响应必然完整。"""
     if request_id == "calendar":
         needed = {"calendar_date", "is_trading_day"}
     elif request_id.startswith("membership:"):
@@ -172,11 +183,7 @@ def run_daily_paper_workflow(
     clock_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     session_factory: Callable[..., Any] = BaoStockSession,
 ) -> Path:
-    """Collect today's 21-session fixed-pool input, rank through the existing gate, then build a brief.
-
-    Each invocation gets a unique directory and performs one serial attempt per request.
-    A failed or stale input is sealed as NEEDS_DATA and cannot reach ranking or the model.
-    """
+    """执行一次固定池每日纸面流程：检查运行时点、串行采集 21 个开市日输入、封存哈希、经现有门控生成排名并构建研究简报。参数：output_root/pool/config/identity 指定输入与私有运行根目录，brief/agent 配置简报输出与模型配置，model_mode 必须显式选择；now/clock_fn 可注入时钟，session_factory 提供数据会话。返回：唯一运行目录。副作用：发起 BaoStock 请求并保存原始及规范输入；只有排名有效后模型选项才可能运行。异常/阻断：收盘等待时间、数据缺口或哈希变化会留存 NEEDS_DATA；不连券商。"""
     if model_mode not in {"stub", "llm"}:
         raise ValueError("model_mode 必须显式为 stub 或 llm")
     local_value = now or clock_fn()
@@ -498,6 +505,7 @@ def _collect_daily_inputs(
     raw_frames: dict[str, pd.DataFrame], symbols: tuple[str, ...],
     sessions: list[str], signal_day: str, clock_fn: Callable[[], datetime],
 ) -> None:
+    """按固定顺序为所有证券和窗口日期串行发起数据请求。参数：session 为 BaoStock 会话，manifest/raw_dir/raw_frames 保存审计和响应，symbols/sessions/signal_day 定义冻结范围，clock_fn 提供请求时钟。返回：None；副作用：写入每个请求的原始响应与状态。请求失败会记录而继续其余已登记请求，不扩展股票池。"""
     for symbol in symbols:
         _request(session, manifest, raw_dir, raw_frames, f"basic:{symbol}", lambda symbol=symbol: session.stock_basic(symbol), symbols, clock_fn)
     for day in sessions:
@@ -515,6 +523,7 @@ def _request(
     call: Callable[[], pd.DataFrame], symbols: tuple[str, ...],
     clock_fn: Callable[[], datetime],
 ) -> pd.DataFrame | None:
+    """执行并记录单次数据请求及响应校验。参数：session/manifest/raw_dir/raw_frames 为采集状态，request_id 标识任务，call 为供应商调用，symbols 为固定证券集合，clock_fn 记录本机时点。返回：响应 DataFrame 或 None。副作用：保存原始响应文件、行数/字段、哈希和脱敏请求日志；每项只尝试一次，响应校验失败不伪装成功。"""
     started = _clock_now(clock_fn, None)
     log_start = len(getattr(session, "request_log", []))
     frame: pd.DataFrame | None = None
@@ -569,6 +578,7 @@ def _build_daily_frames(
     *, symbols: tuple[str, ...], sessions: list[str], raw_frames: dict[str, pd.DataFrame],
     manifest: dict[str, Any], raw_dir: Path,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None, list[str]]:
+    """把已校验原始响应组装为行情、逐日成员状态及阻断原因。参数：symbols/sessions 为冻结范围，raw_frames/manifest 保存请求结果，raw_dir 提供原件位置。返回：状态表、规范行情（缺失时为 None）和原因列表。限制：窗口必须是完整 21 开市日；成员缺失或来源状态冲突保持未知并阻断。"""
     reasons: list[str] = []
     if len(sessions) != 21:
         return None, None, ["21 个开市日窗口不可用"]
@@ -691,7 +701,7 @@ def _build_signal_status(
     *, universe: pd.DataFrame, symbols: tuple[str, ...], signal_day: str,
     manifest: dict[str, Any],
 ) -> pd.DataFrame:
-    """Project only vendor-backed signal-day status for the brief verifier."""
+    """将规范状态表投影成简报验证器需要的信号日逐证券字段。参数：universe 为逐日状态，symbols 为固定池，signal_day 为目标日期，manifest 保存统计。返回：每只证券的交易状态和 ST 状态；记录不唯一时明确标 UNKNOWN。"""
     rows = universe.loc[
         universe["trade_date"].astype(str).eq(signal_day)
         & universe["symbol"].astype(str).isin(symbols)
@@ -716,6 +726,7 @@ def _signal_status_requests(
     symbols: tuple[str, ...], signal_day: str, manifest: dict[str, Any],
     status_frame: pd.DataFrame,
 ) -> list[dict[str, Any]]:
+    """把信号日状态值与实际来源请求和本机请求时间关联。参数：symbols/signal_day 定义范围，manifest 保存请求证据，status_frame 为状态投影。返回：逐证券来源、请求起止时间和状态记录；不声称这些时间是供应商发布时间。"""
     requests = manifest.get("requests", {})
     membership = requests.get(f"membership:{signal_day}", {})
     records = []
@@ -746,6 +757,7 @@ def _signal_status_requests(
 def _adjusted_price_requests(
     symbols: tuple[str, ...], manifest: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """生成后复权价格请求的来源索引。参数：symbols 为固定池，manifest 含请求及原始响应记录。返回：逐证券复权方式、接口、文件路径和本机请求时间；没有成功封存原件的项不输出。"""
     requests = manifest.get("requests", {})
     response_by_id = {
         item.get("request_id"): item
@@ -778,6 +790,7 @@ def _seal_capture(
     pool_file: Path, config_file: Path, identity_file: Path, raw_dir: Path,
     completed_at: datetime,
 ) -> None:
+    """复核采集期间输入未变并封存原始/规范产物哈希。参数：run_dir/manifest 为本次运行状态，blockers 为阻断列表，各输出路径为规范文件，pool/config/identity 为冻结输入，raw_dir 为原始响应目录，completed_at 为封存时点。返回：None。副作用：更新 manifest 和 seal 文件。异常条件以 NEEDS_DATA 阻断；供应商发布时间仍标未验证。"""
     current_sources = {
         "pool": _sha(pool_file), "config": _sha(config_file), "identity_events": _sha(identity_file),
     }
@@ -845,6 +858,7 @@ def _seal_capture(
 
 
 def _finish_blocked(run_dir: Path, manifest: dict[str, Any], blockers: list[str], status: str) -> Path:
+    """以指定阻断状态完成运行归档。参数：run_dir、manifest、blockers 和 status 描述本次结果。返回：运行目录。副作用：写报告与 manifest seal；不会调用排名或模型。"""
     manifest["status"] = status
     manifest["blocking_reasons"] = sorted(set(blockers))
     manifest["finished_at_utc"] = _iso(datetime.now(timezone.utc))
@@ -858,6 +872,7 @@ def _finish_blocked(run_dir: Path, manifest: dict[str, Any], blockers: list[str]
 
 
 def _write_needs_data_report(run_dir: Path, manifest: dict[str, Any]) -> Path:
+    """保存当前 NEEDS_DATA manifest、中文运行报告和封条。参数：run_dir 为唯一运行目录，manifest 为状态事实。返回：运行目录。"""
     _write_json(manifest, run_dir / "daily-run-manifest.json")
     _write_daily_run_report(run_dir, manifest)
     _write_manifest_seal(run_dir)
@@ -865,6 +880,7 @@ def _write_needs_data_report(run_dir: Path, manifest: dict[str, Any]) -> Path:
 
 
 def _block_manifest(manifest: dict[str, Any], reason: str) -> dict[str, Any]:
+    """将一个阻断原因追加到内存 manifest。参数：manifest 为运行状态，reason 为具体原因。返回：同一 manifest 对象；会将排名和模型调用标记为未发生。"""
     manifest["status"] = "NEEDS_DATA"
     manifest.setdefault("blocking_reasons", []).append(reason)
     manifest["rankings_generated"] = False
@@ -873,6 +889,7 @@ def _block_manifest(manifest: dict[str, Any], reason: str) -> dict[str, Any]:
 
 
 def _write_daily_run_report(run_dir: Path, manifest: dict[str, Any]) -> None:
+    """根据程序采集状态生成中文简报运行记录。参数：run_dir 为运行目录，manifest 为数据和门控事实。返回：None。副作用：写 Markdown；不从缺失记录推断正常状态。"""
     reasons = manifest.get("blocking_reasons", [])
     lines = [
         "# 每日小范围纸面研究运行记录", "",
@@ -898,7 +915,7 @@ def _write_daily_run_report(run_dir: Path, manifest: dict[str, Any]) -> None:
 
 
 def _write_post_rank_program_report(rank_dir: Path) -> None:
-    """Create the existing facts builder's required post-seal report from program outputs."""
+    """从已封存排名文件生成程序事实简报。参数：rank_dir 为排名归档目录。返回：None。副作用：写入研究报告；只复述 CSV 和 manifest，不把排名解释为收益或成交。"""
     ranking = pd.read_csv(rank_dir / "ranking.csv", dtype={"symbol": str})
     h1 = pd.read_csv(rank_dir / "h1-ranking.csv", dtype={"symbol": str})
     manifest = json.loads((rank_dir / "paper-ranking-manifest.json").read_text(encoding="utf-8"))
@@ -931,6 +948,7 @@ def _write_post_rank_program_report(rank_dir: Path) -> None:
 
 
 def _write_manifest_seal(run_dir: Path) -> None:
+    """为每日运行 manifest 写入 SHA-256 封条。参数：run_dir 为运行目录。返回：None；manifest 需先完成写入。"""
     manifest_path = run_dir / "daily-run-manifest.json"
     (run_dir / "daily-run-manifest.sha256").write_text(
         f"{_sha(manifest_path)}  daily-run-manifest.json\n", encoding="ascii",
@@ -938,6 +956,7 @@ def _write_manifest_seal(run_dir: Path) -> None:
 
 
 def _sanitize_request_log(items: Any) -> list[dict[str, Any]]:
+    """从供应商请求日志中剔除凭据类字段。参数：items 为原始日志列表。返回：保留非密钥字段的字典列表；不写入环境变量或 API Key。"""
     result = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -947,10 +966,12 @@ def _sanitize_request_log(items: Any) -> list[dict[str, Any]]:
 
 
 def _safe_name(value: str) -> str:
+    """把请求标识转换为适合文件名的字符集。参数：value 为逻辑请求名。返回：仅由安全文件名字符构成的字符串。"""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
 def _clock_now(clock_fn: Callable[[], datetime], fallback: datetime | None) -> datetime:
+    """通过注入时钟取得 UTC 时间并校验时区。参数：clock_fn 为时钟函数，fallback 为兼容参数。返回：UTC datetime。异常：时钟返回无时区值时抛出 ValueError。当前实现两条分支都调用 clock_fn，fallback 不提供备用时间，语义待核实。"""
     value = clock_fn() if fallback is None else clock_fn()
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("clock_fn 必须返回带时区的时间")
@@ -958,5 +979,6 @@ def _clock_now(clock_fn: Callable[[], datetime], fallback: datetime | None) -> d
 
 
 def _write_json(value: Any, path: Path) -> None:
+    """创建父目录并写入可读 JSON。参数：value 为 JSON 兼容对象，path 为目标文件。副作用：创建或覆盖目标路径；调用方负责运行目录唯一性。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")

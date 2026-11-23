@@ -1,3 +1,5 @@
+"""策环测试模块：验证有效日期交易规则、费用、公司行动调度及 checkpoint 续跑。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -24,6 +26,7 @@ from cehuan.data.market_rules import attach_market_rule_schedule, normalize_mark
 
 
 def _bars(days: int = 16) -> pd.DataFrame:
+    """私有测试辅助函数，用于行情。 参数：`days`：日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     rows = []
     start = date(2025, 1, 1)
     for symbol, drift, initial in (("SZ000001", 0.25, 10.0), ("SZ000002", -0.05, 30.0)):
@@ -59,6 +62,7 @@ def _bars(days: int = 16) -> pd.DataFrame:
 
 
 def _rule_row(symbol: str, valid_from: str, valid_to: str, *, suspended: bool = False, step: int = 100) -> dict[str, object]:
+    """私有测试辅助函数，用于规则行。 参数：`symbol`：证券代码场景输入；`valid_from`：有效从场景输入；`valid_to`：有效到场景输入；`suspended`：停牌场景输入；`step`：代码标识“step”（含义待核实）场景输入。 返回：dict[str, object]，供调用处构造夹具或断言复用。"""
     return {
         "symbol": symbol,
         "board": "MAIN",
@@ -82,6 +86,7 @@ def _rule_row(symbol: str, valid_from: str, valid_to: str, *, suspended: bool = 
 
 
 def _rules(*, step: int = 100, suspended_on: str | None = None) -> pd.DataFrame:
+    """私有测试辅助函数，用于规则。 参数：`step`：代码标识“step”（含义待核实）场景输入；`suspended_on`：停牌在场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     rows = []
     for symbol in ("SZ000001", "SZ000002"):
         rows.append(_rule_row(symbol, "2025-01-01", "2025-01-16", step=step))
@@ -97,6 +102,7 @@ def _rules(*, step: int = 100, suspended_on: str | None = None) -> pd.DataFrame:
 
 
 def _fee_row(valid_from: str, valid_to: str, source: str, commission_rate: str) -> dict[str, str]:
+    """私有测试辅助函数，用于费用行。 参数：`valid_from`：有效从场景输入；`valid_to`：有效到场景输入；`source`：来源场景输入；`commission_rate`：代码标识“commission”（含义待核实）代码标识“rate”（含义待核实）场景输入。 返回：dict[str, str]，供调用处构造夹具或断言复用。"""
     return {
         "valid_from": valid_from,
         "valid_to": valid_to,
@@ -114,6 +120,7 @@ def _fee_row(valid_from: str, valid_to: str, source: str, commission_rate: str) 
 
 
 def _fees() -> pd.DataFrame:
+    """私有测试辅助函数，用于费用。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     return pd.DataFrame([
         _fee_row("2025-01-01", "2025-01-05", "synthetic_low_fee", "0.000001"),
         _fee_row("2025-01-06", "2025-01-16", "synthetic_high_fee", "0.0001"),
@@ -121,6 +128,7 @@ def _fees() -> pd.DataFrame:
 
 
 def _open_calendar(start: date, days: int) -> pd.DataFrame:
+    """私有测试辅助函数，用于开盘日历。 参数：`start`：代码标识“start”（含义待核实）场景输入；`days`：日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     return pd.DataFrame({
         "trade_date": [(start + timedelta(days=index)).isoformat() for index in range(days)],
         "is_open": True,
@@ -129,6 +137,7 @@ def _open_calendar(start: date, days: int) -> pd.DataFrame:
 
 
 def _rights_event(start: date) -> RightsOfferingEvent:
+    """私有测试辅助函数，用于配股权利事件。 参数：`start`：代码标识“start”（含义待核实）场景输入。 返回：RightsOfferingEvent，供调用处构造夹具或断言复用。"""
     return RightsOfferingEvent(
         event_id="synthetic-rights-001",
         symbol="SZ000001",
@@ -153,6 +162,7 @@ def _rights_event(start: date) -> RightsOfferingEvent:
 
 
 def test_rights_schedule_indexes_lifecycle_across_input_windows():
+    """验证配股权利调度建立索引生命周期跨输入窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     start = date(2025, 1, 2)
     event = _rights_event(start)
     decision = RightsOfferingDecision(
@@ -191,6 +201,7 @@ def test_rights_schedule_indexes_lifecycle_across_input_windows():
 
 
 def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_signal(tmp_path):
+    """验证完整规则基于检查点匹配连续运行与携带最终信号。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import json
 
     config = load_config()
@@ -363,6 +374,7 @@ def test_full_rule_based_checkpoint_matches_continuous_run_and_carries_final_sig
 
 
 def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(tmp_path):
+    """验证回测检查点拒绝变更嵌入的历史与日历缺口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = _bars(12).copy()
@@ -525,6 +537,7 @@ def test_backtest_checkpoint_rejects_changed_embedded_history_and_calendar_gap(t
 
 
 def test_cli_rejects_checkpoint_with_empty_state_hash(tmp_path, monkeypatch, capsys):
+    """验证CLI拒绝检查点带有空状态哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import json
 
     from cehuan.cli import main as cli_module
@@ -593,6 +606,7 @@ def test_cli_rejects_checkpoint_with_empty_state_hash(tmp_path, monkeypatch, cap
 
 
 def test_rule_schedule_asof_join_overwrites_bar_status_and_respects_effective_boundary():
+    """验证规则调度截至连接覆盖行情行状态与遵守生效边界。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     rules = pd.DataFrame([
         _rule_row("SZ000001", "2025-01-01", "2025-01-07", step=100),
         _rule_row("SZ000001", "2025-01-08", "2025-01-16", step=200),
@@ -611,6 +625,7 @@ def test_rule_schedule_asof_join_overwrites_bar_status_and_respects_effective_bo
 
 
 def test_rule_schedule_rejects_uncovered_dates_and_overlapping_intervals():
+    """验证规则调度拒绝未覆盖日期与重叠区间。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     incomplete = _rules().loc[lambda table: table["symbol"] == "SZ000001"]
     with pytest.raises(ValueError, match="未覆盖全部行情证券日"):
         attach_market_rule_schedule(_bars(), incomplete)
@@ -624,6 +639,7 @@ def test_rule_schedule_rejects_uncovered_dates_and_overlapping_intervals():
 
 
 def test_fee_schedule_uses_inclusive_effective_dates_and_directional_stamp_duty():
+    """验证费用调度使用包含端点生效日期与按方向印花税税。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     mapped = map_fee_schedule_to_sessions(_fees(), ["2025-01-05", "2025-01-06"])
     assert mapped["2025-01-05"]["source"] == "synthetic_low_fee"
     assert mapped["2025-01-06"]["source"] == "synthetic_high_fee"
@@ -636,6 +652,7 @@ def test_fee_schedule_uses_inclusive_effective_dates_and_directional_stamp_duty(
 
 @pytest.mark.parametrize("bad_value", [None, float("inf"), float("-inf")])
 def test_market_rule_schedule_rejects_missing_or_infinite_required_values(bad_value):
+    """验证市场规则调度拒绝缺失或无穷必需数值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`bad_value`：代码标识“bad”（含义待核实）值场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     rules = pd.DataFrame([_rule_row("SZ000001", "2025-01-01", "2025-01-16")])
     if bad_value is None:
         rules.loc[0, "source"] = bad_value
@@ -650,6 +667,7 @@ def test_market_rule_schedule_rejects_missing_or_infinite_required_values(bad_va
 
 @pytest.mark.parametrize("column", ["source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"])
 def test_market_rule_schedule_rejects_none_evidence_and_review_fields(column):
+    """验证市场规则调度拒绝无证据与复核字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`column`：列场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     rules = pd.DataFrame([_rule_row("SZ000001", "2025-01-01", "2025-01-16")])
     rules.loc[0, column] = None
     with pytest.raises(ValueError, match="来源 SHA-256 或人工复核字段"):
@@ -658,6 +676,7 @@ def test_market_rule_schedule_rejects_none_evidence_and_review_fields(column):
 
 @pytest.mark.parametrize("bad_value", [None, float("inf"), float("-inf")])
 def test_fee_schedule_rejects_missing_or_infinite_values(bad_value):
+    """验证费用调度拒绝缺失或无穷数值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`bad_value`：代码标识“bad”（含义待核实）值场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fees = _fees()
     fees.loc[0, "commission_rate"] = bad_value
     with pytest.raises(ValueError, match="非有限值"):
@@ -666,6 +685,7 @@ def test_fee_schedule_rejects_missing_or_infinite_values(bad_value):
 
 @pytest.mark.parametrize("column", ["source", "source_sha256", "review_status", "reviewed_by", "reviewed_at"])
 def test_fee_schedule_rejects_none_evidence_and_review_fields(column):
+    """验证费用调度拒绝无证据与复核字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`column`：列场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fees = _fees()
     fees.loc[0, column] = None
     with pytest.raises(ValueError, match="来源 SHA-256 或人工复核字段"):
@@ -673,6 +693,7 @@ def test_fee_schedule_rejects_none_evidence_and_review_fields(column):
 
 
 def test_fee_schedule_requires_parseable_review_date():
+    """验证费用调度要求可解析复核日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fees = _fees()
     fees.loc[0, "reviewed_at"] = "not-a-date"
     with pytest.raises(ValueError, match="人工复核字段"):
@@ -680,6 +701,7 @@ def test_fee_schedule_requires_parseable_review_date():
 
 
 def _action_source() -> ActionSource:
+    """私有测试辅助函数，用于行动来源。 返回：ActionSource，供调用处构造夹具或断言复用。"""
     return ActionSource(
         source_id="synthetic-fixture",
         url="https://example.invalid/synthetic-fixture",
@@ -692,6 +714,7 @@ def _action_source() -> ActionSource:
 
 
 def test_ledger_v2_schedules_cash_dividend_and_1_to_1_code_change():
+    """验证账本v2调度现金分红与1到1代码变更。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = _bars(days=16)
@@ -771,6 +794,7 @@ def test_ledger_v2_schedules_cash_dividend_and_1_to_1_code_change():
 
 
 def test_code_change_without_pending_rebalance_does_not_liquidate_other_holdings():
+    """验证代码变更缺少待处理调仓不清仓其他持仓。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = _bars(days=16)
@@ -811,6 +835,7 @@ def test_code_change_without_pending_rebalance_does_not_liquidate_other_holdings
 
 
 def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type():
+    """验证账本事件调度器拒绝缺失交易日与未知事件类型。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.backtest.event_scheduler import AccountingEventSchedule
     from cehuan.accounting import ShareDistributionEvent
 
@@ -834,6 +859,7 @@ def test_ledger_event_scheduler_rejects_missing_session_and_unknown_event_type()
 
 
 def test_ledger_v2_schedules_share_distribution_record_effective_registration_and_tradability():
+    """验证账本v2调度股份送转登记生效登记与可交易状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import ShareDistributionEvent
 
     config = load_config()
@@ -905,6 +931,7 @@ def test_ledger_v2_schedules_share_distribution_record_effective_registration_an
 
 
 def test_distribution_window_can_end_before_registration_and_preserves_pending_right():
+    """验证送转窗口可以结束之前登记与保留待处理权利。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import ShareDistributionEvent
 
     config = load_config()
@@ -978,6 +1005,7 @@ def test_distribution_window_can_end_before_registration_and_preserves_pending_r
 
 
 def test_pre_window_distribution_requires_validated_opening_rights_and_resumes():
+    """验证之前窗口送转要求已开盘配股权利与续跑。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import LedgerSnapshot, PortfolioLedger, PositionLot, ShareDistributionEvent
 
     config = load_config()
@@ -1049,6 +1077,7 @@ def test_pre_window_distribution_requires_validated_opening_rights_and_resumes()
 
 
 def test_rights_offering_full_strategy_checkpoint_matches_continuous_run():
+    """验证配股权利配股完整策略检查点匹配连续运行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import PositionLot
 
     config = load_config()
@@ -1176,6 +1205,7 @@ def test_rights_offering_full_strategy_checkpoint_matches_continuous_run():
 
 
 def test_rights_decline_is_applied_by_engine_and_survives_checkpoint():
+    """验证配股权利放弃应用截至引擎与仍保留检查点。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import PositionLot
 
     config = load_config()
@@ -1259,6 +1289,7 @@ def test_rights_decline_is_applied_by_engine_and_survives_checkpoint():
 
 
 def test_rights_checkpoint_resume_before_decision_and_after_registration():
+    """验证配股权利检查点续跑之前决策与之后登记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import PositionLot
 
     config = load_config()
@@ -1326,6 +1357,7 @@ def test_rights_checkpoint_resume_before_decision_and_after_registration():
     )
 
     def assert_split_matches_continuous(split_index: int):
+        """实现测试替身test_rights_checkpoint_resume_before_decision_and_after_registration的断言分割匹配连续行为；用于控制被测代码与断言，不访问真实服务。 参数：`split_index`：分割索引场景输入。 返回值供调用处构造夹具或断言复用。"""
         first = run_backtest(
             data.iloc[:split_index + 1].copy(), float(opening_snapshot.cash_cny), config,
             opening_accounting_snapshot=opening_snapshot, **common,
@@ -1440,6 +1472,7 @@ def test_rights_checkpoint_resume_before_decision_and_after_registration():
 
 
 def test_legacy_v1_empty_pending_target_uses_frozen_rebalance_schedule(tmp_path):
+    """验证旧版v1空待处理目标使用冻结调仓调度。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import PositionLot
 
     config = load_config()
@@ -1500,6 +1533,7 @@ def test_legacy_v1_empty_pending_target_uses_frozen_rebalance_schedule(tmp_path)
 
 
 def test_pre_window_snapshot_json_round_trip_and_snapshot_date_validation():
+    """验证之前窗口快照JSON轮次三段与快照日期校验。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from dataclasses import asdict
     import json
 
@@ -1519,6 +1553,7 @@ def test_pre_window_snapshot_json_round_trip_and_snapshot_date_validation():
 
 
 def test_share_distribution_result_not_available_after_window_is_never_guessed():
+    """验证股份送转结果不可用之后窗口不会猜测。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import PortfolioLedger, PositionLot, ShareDistributionEvent
 
     event = ShareDistributionEvent(
@@ -1547,6 +1582,7 @@ def test_share_distribution_result_not_available_after_window_is_never_guessed()
 
 
 def test_distribution_full_and_snapshot_resumed_accounting_are_identical():
+    """验证送转完整与快照续跑账务一致。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from dataclasses import asdict
 
     from cehuan.accounting import PortfolioLedger, PositionLot, PriceMark, ShareDistributionEvent
@@ -1564,6 +1600,7 @@ def test_distribution_full_and_snapshot_resumed_accounting_are_identical():
     )
 
     def initial_ledger() -> PortfolioLedger:
+        """实现测试替身test_distribution_full_and_snapshot_resumed_accounting_are_identical的初始账本行为；用于控制被测代码与断言，不访问真实服务。 返回：PortfolioLedger，供调用处构造夹具或断言复用。"""
         ledger = PortfolioLedger(
             Decimal("10000"),
             portfolio_id="full-vs-split",
@@ -1578,6 +1615,7 @@ def test_distribution_full_and_snapshot_resumed_accounting_are_identical():
         return ledger
 
     def mark(ledger: PortfolioLedger, day: str) -> None:
+        """实现测试替身test_distribution_full_and_snapshot_resumed_accounting_are_identical的估值标记行为；用于控制被测代码与断言，不访问真实服务。 参数：`ledger`：账本场景输入；`day`：日场景输入。 返回：None，供调用处构造夹具或断言复用。"""
         ledger.mark_share_distribution_claim(
             event,
             as_of=day,
@@ -1621,6 +1659,7 @@ def test_distribution_full_and_snapshot_resumed_accounting_are_identical():
 
 
 def test_unpriced_or_suspended_interim_distribution_claim_blocks_diagnostic_nav():
+    """验证无估值或停牌期间送转声明阻断诊断净值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.accounting import ShareDistributionEvent
 
     config = load_config()
@@ -1679,6 +1718,7 @@ def test_unpriced_or_suspended_interim_distribution_claim_blocks_diagnostic_nav(
 
 
 def test_code_change_open_decision_uses_open_and_point_in_time_status_only():
+    """验证代码变更开盘决策使用开盘与时点在时间状态仅。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     row = pd.Series({
         "open": 10.0,
         "high": float("nan"),
@@ -1696,6 +1736,7 @@ def test_code_change_open_decision_uses_open_and_point_in_time_status_only():
 
 
 def test_ledger_v2_execution_consumes_reviewed_rule_and_fee_schedule():
+    """验证账本v2成交使用已审核规则与费用调度。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     config["costs"].update({"commission_rate": 0.0, "minimum_commission_cny": 0.0, "stamp_duty_sell_rate": 0.0, "transfer_fee_rate": 0.0})
@@ -1733,6 +1774,7 @@ def test_ledger_v2_execution_consumes_reviewed_rule_and_fee_schedule():
 
 
 def test_ledger_v2_with_rule_schedule_does_not_trade_when_rule_marks_security_suspended():
+    """验证账本v2带有规则调度不交易当规则标记证券停牌。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     suspended_date = "2025-01-05"
@@ -1754,6 +1796,7 @@ def test_ledger_v2_with_rule_schedule_does_not_trade_when_rule_marks_security_su
 
 
 def test_effective_schedule_blocks_no_limit_day_without_quote_boundary_data():
+    """验证生效调度阻断没有涨跌停日缺少报价边界数据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     rules = _rules().loc[lambda table: table["symbol"] != "SZ000001"].copy()
@@ -1781,6 +1824,7 @@ def test_effective_schedule_blocks_no_limit_day_without_quote_boundary_data():
 
 
 def test_scheduled_rules_and_fees_are_research_only_and_must_be_paired():
+    """验证已排程规则与费用研究仅与必须配对。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     with pytest.raises(ValueError, match="必须成对提供"):
@@ -1802,6 +1846,7 @@ def test_scheduled_rules_and_fees_are_research_only_and_must_be_paired():
 
 
 def test_cli_scheduled_diagnostic_saves_bound_tables_and_ledger_outputs(tmp_path, monkeypatch, capsys):
+    """验证CLI已排程诊断保存绑定表与账本输出。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import json
 
     from cehuan.cli import main as cli_main

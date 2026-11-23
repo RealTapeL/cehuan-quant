@@ -1,1 +1,1 @@
-"""Optional external research integrations; no third-party agent is enabled by default."""
+"""可选外部研究集成包。当前模块仅作为扩展边界，不默认启用第三方 Agent 或交易接口。"""

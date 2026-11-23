@@ -1,3 +1,5 @@
+"""策环测试模块：验证证券身份变更、吸收合并和换股权利的日期及可交易状态。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -12,6 +14,7 @@ from cehuan.data.security_identity import normalize_security_identity_events, re
 
 
 def test_code_change_table_rejects_merger_ratio():
+    """验证代码变更表拒绝合并比例。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = read_security_identity_events()
     event.loc[0, "share_ratio"] = 0.1339
     with pytest.raises(ValueError, match="严格为 1.0"):
@@ -19,6 +22,7 @@ def test_code_change_table_rejects_merger_ratio():
 
 
 def test_absorption_merger_has_explicit_dates_and_never_trades_before_new_shares_list():
+    """验证吸收合并有明确日期与不会交易之前新股份列表。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     action = read_corporate_actions().iloc[0]
     assert action["old_last_trade_date"] == "2025-08-12"
     assert action["record_date"] == "2025-09-04"
@@ -42,6 +46,7 @@ def test_absorption_merger_has_explicit_dates_and_never_trades_before_new_shares
     [(100, 13, 14, "13.3900"), (1000, 133, 134, "133.9000"), (1, 0, 1, "0.1339")],
 )
 def test_share_swap_claim_keeps_fractional_tail_as_unresolved_right(old_shares, lower, upper, exact):
+    """验证股份换股声明保持小数尾部为未解决权利。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`old_shares`：旧股份场景输入；`lower`：代码标识“lower”（含义待核实）场景输入；`upper`：代码标识“upper”（含义待核实）场景输入；`exact`：完全一致场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     action = read_corporate_actions().iloc[0]
     claim = make_share_swap_claim(action, old_shares, 12345.67, "2025-01-15")
     assert claim["expected_new_shares_exact"] == exact
@@ -55,6 +60,7 @@ def test_share_swap_claim_keeps_fractional_tail_as_unresolved_right(old_shares, 
 
 
 def test_unresolved_merger_does_not_accept_an_assumed_final_allocation():
+    """验证未解决合并不接受假设最终分配。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     action = read_corporate_actions().iloc[0]
     with pytest.raises(ValueError, match="不得注入一个假定整数股数"):
         make_share_swap_claim(

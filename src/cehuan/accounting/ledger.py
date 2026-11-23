@@ -1,3 +1,10 @@
+"""提供 ledger_v2 研究账本及可复现的公司行动、成交状态变更。
+
+账本以不可变模型表示持仓批次、现金应收、非现金权利和流水；每个操作先在候选副本上
+原子执行，再检查现金/股数恒等式并按幂等键提交。此实现仅由诊断回测使用，金额用
+Decimal、股数用整数；未确认估值、公司行动分配或税务事实不会静默补零。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -38,11 +45,10 @@ from cehuan.accounting.models import (
 
 
 class PortfolioLedger:
-    """Pure-Python research ledger with atomic, idempotent state transitions.
+    """研究用纯 Python 账本，提供原子且幂等的状态变更。
 
-    The ledger is consumed by the explicitly non-formal ledger_v2 diagnostic
-    path. Monetary values use Decimal, and unknown valuations never silently
-    become zero.
+    由明确非正式的 ledger_v2 诊断路径调用。状态由现金、持仓批次、应收、权利和流水组成；
+    每次操作在副本上校验后提交。金额使用 Decimal；未知估值不自动记为零。
     """
 
     def __init__(
@@ -55,6 +61,11 @@ class PortfolioLedger:
         claims: Iterable[NoncashClaim] = (),
         dividend_tax_records: Iterable[DividendTaxLotRecord] = (),
     ) -> None:
+        """创建期初账本并校验现金、批次和账务索引。
+
+        ``cash_cny`` 是人民币期初现金；其他可迭代参数提供期初持仓批次、应收、权利和
+        分红税务记录。重复 ID、负现金或模型不一致会抛出异常。
+        """
         self.portfolio_id = str(portfolio_id).strip()
         if not self.portfolio_id:
             raise ValueError("portfolio_id 不能为空")
@@ -75,11 +86,10 @@ class PortfolioLedger:
 
     @classmethod
     def from_snapshot(cls, snapshot: LedgerSnapshot) -> "PortfolioLedger":
-        """Restore a ledger state for a later research window.
+        """从快照恢复账本状态以继续后续研究窗口。
 
-        The snapshot contains the open state and complete prior journal, so the
-        original opening balances can be reconstructed and the normal ledger
-        invariants remain active after restoration.
+        快照含当前状态和此前完整流水，账本据此重建期初余额并继续执行恒等校验。
+        非 ``LedgerSnapshot`` 输入、流水不一致或无法还原非负期初状态时阻断恢复。
         """
         if not isinstance(snapshot, LedgerSnapshot):
             raise TypeError("from_snapshot 只接受 LedgerSnapshot")
@@ -152,6 +162,7 @@ class PortfolioLedger:
 
     @staticmethod
     def _index_unique(items: Iterable[object], key: str, label: str) -> dict[str, object]:
+        """按对象指定属性建立索引，并拒绝空标识或重复标识。"""
         result: dict[str, object] = {}
         for item in items:
             identifier = str(getattr(item, key, ""))
@@ -163,6 +174,7 @@ class PortfolioLedger:
         return result
 
     def _copy(self) -> PortfolioLedger:
+        """复制当前可变账本容器，供一次状态变更先行试算。"""
         candidate = object.__new__(PortfolioLedger)
         candidate.portfolio_id = self.portfolio_id
         candidate._cash_cny = self._cash_cny
@@ -179,6 +191,7 @@ class PortfolioLedger:
         return candidate
 
     def _adopt(self, candidate: PortfolioLedger) -> None:
+        """将已通过校验的候选账本状态原子接纳为当前状态。"""
         self._cash_cny = candidate._cash_cny
         self._positions = candidate._positions
         self._receivables = candidate._receivables
@@ -191,6 +204,7 @@ class PortfolioLedger:
 
     @staticmethod
     def _digest(payload: Mapping[str, object]) -> str:
+        """对操作输入按排序 JSON 计算幂等摘要。"""
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -205,6 +219,7 @@ class PortfolioLedger:
         position_deltas: tuple[tuple[str, int], ...],
         details: Mapping[str, object],
     ) -> LedgerEntry:
+        """构造带确定性流水 ID 的单条账簿分录。"""
         sequence = len(self._journal)
         entry_id = hashlib.sha256(f"{operation_key}:{sequence}".encode("utf-8")).hexdigest()
         return LedgerEntry(
@@ -226,6 +241,11 @@ class PortfolioLedger:
         payload: Mapping[str, object],
         mutate: Callable[[PortfolioLedger, str], tuple[LedgerEntry, ...]],
     ) -> tuple[LedgerEntry, ...]:
+        """按事件与阶段执行一次账本变更；重复同输入返回旧流水，异输入拒绝。
+
+        ``mutate`` 仅作用于候选副本；只有交易日期顺序和账本恒等式均通过后才提交状态。
+        历史补录不能插入当前流水之前，需从受影响日期重放。
+        """
         event_id = str(event_id).strip()
         phase = str(phase).strip().upper()
         if not event_id or not phase:
@@ -273,36 +293,44 @@ class PortfolioLedger:
 
     @property
     def cash_cny(self) -> Decimal:
+        """当前现金余额，单位为人民币元。"""
         return self._cash_cny
 
     @property
     def positions(self) -> tuple[PositionLot, ...]:
+        """按证券、取得日和批次 ID 排序的当前持仓批次。"""
         return tuple(sorted(self._positions.values(), key=lambda lot: (lot.symbol, lot.acquired_on, lot.lot_id)))
 
     @property
     def receivables(self) -> tuple[CashReceivable, ...]:
+        """按应收 ID 排序的现金应收记录。"""
         return tuple(sorted(self._receivables.values(), key=lambda item: item.receivable_id))
 
     @property
     def claims(self) -> tuple[NoncashClaim, ...]:
+        """按权利 ID 排序的未结非现金权益记录。"""
         return tuple(sorted(self._claims.values(), key=lambda item: item.claim_id))
 
     @property
     def dividend_tax_records(self) -> tuple[DividendTaxLotRecord, ...]:
+        """按记录 ID 排序的分红权益及递延税务批次状态。"""
         return tuple(sorted(self._dividend_tax_records.values(), key=lambda item: item.record_id))
 
     @property
     def journal(self) -> tuple[LedgerEntry, ...]:
+        """返回按过账顺序排列的不可变账簿流水。"""
         return tuple(self._journal)
 
     @staticmethod
     def _position_totals(lots: Iterable[PositionLot]) -> dict[str, int]:
+        """把持仓批次汇总为证券代码到总股数的映射。"""
         totals: dict[str, int] = {}
         for lot in lots:
             totals[lot.symbol] = totals.get(lot.symbol, 0) + lot.total_shares
         return totals
 
     def snapshot(self, *, as_of_date: date | str | None = None) -> LedgerSnapshot:
+        """导出当前账本状态和完整流水；可选日期标记该快照的截至日。"""
         return LedgerSnapshot(
             portfolio_id=self.portfolio_id,
             cash_cny=self._cash_cny,
@@ -318,6 +346,7 @@ class PortfolioLedger:
         )
 
     def assert_invariants(self) -> None:
+        """核对现金、持仓批次、公司行动权益和流水之间的账务恒等式。"""
         if not self.portfolio_id:
             raise ValueError("portfolio_id 不能为空")
         if not self._cash_cny.is_finite() or self._cash_cny < 0:
@@ -376,6 +405,7 @@ class PortfolioLedger:
 
     @staticmethod
     def _source_details(source: ActionSource) -> dict[str, str]:
+        """生成统一的来源 ID、URL、哈希、标题、页码和审核信息字段。"""
         return {
             "source_id": source.source_id,
             "source_url": source.url,
@@ -388,10 +418,12 @@ class PortfolioLedger:
 
     @classmethod
     def _prefixed_source_details(cls, source: ActionSource, prefix: str) -> dict[str, str]:
+        """为多个来源字段加前缀，避免同一流水中的来源信息互相覆盖。"""
         return {f"{prefix}_{key}": value for key, value in cls._source_details(source).items()}
 
     @staticmethod
     def _cent(value: Decimal) -> Decimal:
+        """按人民币分四舍五入，使用 ROUND_HALF_UP。"""
         return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def _capture_entitlement(
@@ -406,7 +438,9 @@ class PortfolioLedger:
         source_details_extra: Mapping[str, object] | None = None,
         dividend_gross_per_share_cny: Decimal | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """在登记日收盘冻结证券持仓批次，并可同时建立分红税务批次记录。"""
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """在候选状态冻结登记日权益，并按需要建立分红税务批次。"""
             if event_id in candidate._action_entitlements:
                 raise ValueError(f"公司行动 event_id 已有持仓权利快照：{event_id}")
             lots = tuple(sorted(
@@ -459,6 +493,7 @@ class PortfolioLedger:
     def _require_entitlement(
         self, event_id: str, symbol: str, record_date: date
     ) -> EntitlementSnapshot:
+        """读取并核对登记日持仓快照的事件、证券和日期。"""
         entitlement = self._action_entitlements.get(event_id)
         if entitlement is None:
             raise ValueError(f"{event_id}: 缺少登记日收盘持仓快照")
@@ -468,6 +503,7 @@ class PortfolioLedger:
 
     @staticmethod
     def _event_source_payload(source: ActionSource) -> dict[str, str]:
+        """将公司行动来源字段展开为幂等 payload 的稳定字典。"""
         return {
             "source_id": source.source_id,
             "source_url": source.url,
@@ -481,6 +517,11 @@ class PortfolioLedger:
     def record_cash_dividend(
         self, event: CashDividendEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """在现金分红登记日收盘冻结有权益持仓，并建立税务批次关联。
+
+        ``as_of`` 必须等于事件登记日；返回新增流水。事件类型错误、日期不符或重复快照
+        会拒绝，发放日到账和后续税务在独立阶段处理。
+        """
         if not isinstance(event, CashDividendEvent):
             raise TypeError("record_cash_dividend 只接受 CashDividendEvent")
         day = calendar_date(as_of, "as_of")
@@ -514,6 +555,11 @@ class PortfolioLedger:
         allocated_new_shares: int | None = None,
         allocation_evidence: str | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """在送转登记日冻结有权益批次并创建待处理新股权利。
+
+        ``allocated_new_shares`` 是已有账户证据支持的最终整数股数；小数股必须同时提供
+        ``allocation_evidence``。返回权利流水；没有可信分配数时不四舍五入猜股数。
+        """
         if not isinstance(event, ShareDistributionEvent):
             raise TypeError("record_share_distribution 只接受 ShareDistributionEvent")
         day = calendar_date(as_of, "as_of")
@@ -534,6 +580,7 @@ class PortfolioLedger:
             key=lambda item: (item.acquired_on, item.lot_id),
         ))
         entitlement = EntitlementSnapshot(event.event_id, event.symbol, event.record_date, lots)
+        # exact 是理论新增股数，单位为股；整数获配数必须来自事件规则或账户证据。
         exact = Decimal(entitlement.total_shares) * event.shares_per_old_share
         floor_shares = int(exact.to_integral_value(rounding=ROUND_FLOOR))
         ceiling_shares = int(exact.to_integral_value(rounding=ROUND_CEILING))
@@ -564,6 +611,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """在候选状态写入送转资格、权利股数和批次成本分摊。"""
             if event.event_id in candidate._action_entitlements:
                 raise ValueError(f"公司行动 event_id 已有持仓权利快照：{event.event_id}")
             if f"distribution:{event.event_id}" in candidate._claims:
@@ -572,6 +620,7 @@ class PortfolioLedger:
 
             lot_share_allocations: dict[str, int] = {}
             if allocated_new_shares and entitlement.total_shares:
+                # 按批次持股比例分配整数股；余数按最大尾数顺序分配，不改变组合总股数。
                 raw_allocations = [
                     (lot, Decimal(allocated_new_shares) * Decimal(lot.quantity) / Decimal(entitlement.total_shares))
                     for lot in entitlement.lots
@@ -659,6 +708,7 @@ class PortfolioLedger:
     def record_rights_offering(
         self, event: RightsOfferingEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """在配股登记日冻结资格批次并登记尚未处理的配股权利。"""
         if not isinstance(event, RightsOfferingEvent):
             raise TypeError("record_rights_offering 只接受 RightsOfferingEvent")
         day = calendar_date(as_of, "as_of")
@@ -677,6 +727,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """在候选状态冻结配股登记日持仓并创建配股权利凭证。"""
             if event.event_id in candidate._action_entitlements:
                 raise ValueError(f"公司行动 event_id 已有持仓权利快照：{event.event_id}")
             if claim_id in candidate._claims:
@@ -736,6 +787,11 @@ class PortfolioLedger:
         tax_treatment: str | None = None,
         payment_withholding_per_share_cny: Decimal | int | str | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """在除息日按登记日快照确认现金应收及税务口径。
+
+        ``tax_cny`` 为已知最终税额；递延税务需区分发放日预扣和后续卖出结算。日期、
+        事件、税额或持仓快照不匹配时拒绝过账。
+        """
         if not isinstance(event, CashDividendEvent):
             raise TypeError("accrue_cash_dividend 只接受 CashDividendEvent")
         day = calendar_date(as_of, "as_of")
@@ -786,6 +842,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按登记日批次计算除息应收，并更新分红税务记录状态。"""
             if event.ex_date < entitlement.captured_on:
                 raise ValueError("分红除息日早于登记日权利快照")
             if receivable_id in candidate._receivables:
@@ -858,6 +915,11 @@ class PortfolioLedger:
         payment_evidence_id: str | None = None,
         payment_evidence_sha256: str | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """按实收现金结清分红应收，并登记实际预扣税证据。
+
+        ``settled_on`` 是到账日；若提供实际扣税，必须按模型要求绑定账户证据。重复相同
+        操作幂等返回原流水，金额或证据变化则由幂等校验拒绝。
+        """
         identifier = str(receivable_id).strip()
         if not identifier:
             raise ValueError("receivable_id 不能为空")
@@ -887,6 +949,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """将待结应收改为已结清，并按实际到账金额更新现金。"""
             current = candidate._receivables[identifier]
             if current.status != "PENDING":
                 raise ValueError(f"应收款 {identifier} 当前状态不是 PENDING")
@@ -1002,11 +1065,10 @@ class PortfolioLedger:
         account_evidence_id: str,
         account_evidence_sha256: str,
     ) -> tuple[LedgerEntry, ...]:
-        """Book account-confirmed later tax for sold dividend-entitled shares.
+        """按批次和账户证据核对已卖出分红对应的最终税额。
 
-        The ledger never derives a tax rate from holding duration. The caller
-        must supply the amount and a hashed account statement or settlement
-        record. Cash is reduced once, on the evidence date.
+        本账本不按持有期限自行推导税率；调用方必须提供税额及带哈希的交割/账户证据。
+        多个取得日批次分别核对，现金在证据结算日扣减一次；股数或证据不足时拒绝处理。
         """
         identifier = str(record_id).strip()
         if not identifier:
@@ -1036,6 +1098,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """用账户证据核对指定已卖出股数对应的分红税额。"""
             current = candidate._dividend_tax_records[identifier]
             if shares > current.sold_shares - current.tax_reconciled_shares:
                 raise ValueError(
@@ -1097,6 +1160,7 @@ class PortfolioLedger:
         allocated_new_shares: int | None = None,
         allocation_evidence: str | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """送转生效时按已登记快照生成非现金权利并分摊持仓成本。"""
         if not isinstance(event, ShareDistributionEvent):
             raise TypeError("apply_share_distribution 只接受 ShareDistributionEvent")
         day = calendar_date(as_of, "as_of")
@@ -1125,6 +1189,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """将登记的送转权利推进至生效状态并更新对应权益凭证。"""
             current_claim = candidate._claims.get(claim_id)
             if current_claim is None:
                 raise ValueError(f"送转权利 {claim_id} 不存在")
@@ -1185,6 +1250,7 @@ class PortfolioLedger:
         event: ShareDistributionEvent,
         claim: NoncashClaim,
     ) -> None:
+        """将已确认的送转权利股数和成本分摊写入候选账本持仓批次。"""
         for lot_id, shares, basis, acquired_on in claim.lot_allocations:
             if shares <= 0:
                 continue
@@ -1212,6 +1278,7 @@ class PortfolioLedger:
         price_date: date | str,
         is_suspended: bool | None,
     ) -> tuple[LedgerEntry, ...]:
+        """用底层收盘价代理记录送转权利估值，并保留代理估值来源和状态。"""
         day = calendar_date(as_of, "as_of")
         if not event.effective_date <= day < event.registration_date:
             raise ValueError("送转权利估值只能在生效日至新增股份登记日前处理")
@@ -1250,6 +1317,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """把底层价格代理及其来源、日期写入送转权利估值状态。"""
             current = candidate._claims[claim_id]
             candidate._claims[claim_id] = replace(
                 current,
@@ -1290,11 +1358,10 @@ class PortfolioLedger:
         price_date: date | str,
         is_suspended: bool | None,
     ) -> tuple[LedgerEntry, ...]:
-        """Mark an open research right with an explicitly non-market proxy.
+        """为配股权利记录有来源的研究估值代理，不代表权利实际成交价格。
 
-        Before subscription, the proxy is intrinsic value only. After a frozen
-        subscription, it values the pending shares at the underlying close.
-        This is a research estimate, never an actual right trade price.
+        认购前代理值表示权利估值；冻结认购后，代理值对应待登记股份的底层收盘价值。
+        收盘价、日期、来源和停牌状态必须可核验。
         """
         day = calendar_date(as_of, "as_of")
         if not event.record_date <= day < event.registration_date:
@@ -1343,6 +1410,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """写入配股权利的代理估值和来源，不将代理价记为成交价。"""
             current = candidate._claims[claim_id]
             if current.status == "SUBSCRIBED_PENDING_ALLOTMENT":
                 next_phase_date = event.registration_date
@@ -1388,6 +1456,7 @@ class PortfolioLedger:
         *,
         as_of: date | str,
     ) -> tuple[LedgerEntry, ...]:
+        """在新增股份登记阶段把已确认权利转为独立持仓批次。"""
         day = calendar_date(as_of, "as_of")
         if day != event.registration_date:
             raise ValueError("送转新股批次只能在公告的登记日登记")
@@ -1407,6 +1476,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按确认的整数股权利创建送转新股登记批次。"""
             current = candidate._claims[claim_id]
             if current.status != "DISTRIBUTION_PENDING_REGISTRATION":
                 raise ValueError(f"送转权利 {claim_id} 不在待登记状态")
@@ -1438,7 +1508,7 @@ class PortfolioLedger:
     def mark_share_distribution_tradable(
         self, event: ShareDistributionEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
-        """Record the date on which registered distribution shares become sellable."""
+        """到达公告登记的可流通日后开放送转新增股数的卖出资格。"""
         day = calendar_date(as_of, "as_of")
         if day != event.tradable_date:
             raise ValueError("送转新增股份只能在公告的可流通日开放卖出")
@@ -1457,6 +1527,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """在可流通日更新送转批次的 sellable_from 与可卖股数。"""
             current = candidate._claims[claim_id]
             candidate._claims[claim_id] = replace(current, next_phase_date=None)
             return (candidate._entry(
@@ -1483,6 +1554,7 @@ class PortfolioLedger:
         allocation_evidence: str | None = None,
         subscription_fee_cny: Decimal | int | str,
     ) -> tuple[LedgerEntry, ...]:
+        """按显式 SUBSCRIBE、DECLINE 或 MANUAL_REVIEW 决策处理配股权利。"""
         if not isinstance(event, RightsOfferingEvent):
             raise TypeError("decide_rights_offering 只接受 RightsOfferingEvent")
         if disposition not in {"SUBSCRIBE", "DECLINE"}:
@@ -1531,6 +1603,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按配股决策冻结认购/放弃状态，并检查现金与认购股数。"""
             claim = candidate._claims.get(claim_id)
             if claim is None or claim.status != "RIGHTS_DISPOSITION_REQUIRED":
                 raise ValueError(f"配股权利 {claim_id} 不在待处置状态")
@@ -1582,6 +1655,7 @@ class PortfolioLedger:
         as_of: date | str,
         final_allocated_shares: int | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """在登记阶段按最终确认的配股获配股数形成待流通持仓批次。"""
         if not isinstance(event, RightsOfferingEvent):
             raise TypeError("allot_rights_shares 只接受 RightsOfferingEvent")
         day = calendar_date(as_of, "as_of")
@@ -1611,6 +1685,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按最终获配股数生成待登记配股批次并分摊现金成本。"""
             current_claim = candidate._claims[claim_id]
             if current_claim.status != "SUBSCRIBED_PENDING_ALLOTMENT":
                 raise ValueError(f"配股权利 {claim_id} 不在待登记状态")
@@ -1648,6 +1723,7 @@ class PortfolioLedger:
     def record_share_swap(
         self, event: ShareSwapMergerEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """登记吸收合并换股事件的来源及事件状态，不将其当作普通代码变更。"""
         if not isinstance(event, ShareSwapMergerEvent):
             raise TypeError("record_share_swap 只接受 ShareSwapMergerEvent")
         day = calendar_date(as_of, "as_of")
@@ -1685,6 +1761,7 @@ class PortfolioLedger:
     def begin_share_swap(
         self, event: ShareSwapMergerEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """旧股停止交易时将持仓转成换股权益凭证，保留批次和成本信息。"""
         if not isinstance(event, ShareSwapMergerEvent):
             raise TypeError("begin_share_swap 只接受 ShareSwapMergerEvent")
         day = calendar_date(as_of, "as_of")
@@ -1714,6 +1791,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """在旧股停止交易阶段创建换股权利，保留来源批次信息。"""
             if claim_id in candidate._claims:
                 raise ValueError(f"換股權利已存在：{claim_id}")
             entitled_ids = {lot.lot_id for lot in entitlement.lots}
@@ -1789,6 +1867,7 @@ class PortfolioLedger:
         valuation_cny: Decimal | int | str | None = None,
         valuation_source: str | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """依据结算/账户来源确认换股整数股分配，可选登记有来源的估值。"""
         if not isinstance(event, ShareSwapMergerEvent):
             raise TypeError("confirm_share_swap_allocation 只接受 ShareSwapMergerEvent")
         day = calendar_date(as_of, "as_of")
@@ -1829,6 +1908,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """绑定结算确认的换股股数和分配来源，更新待决权利状态。"""
             claim = candidate._claims.get(claim_id)
             if claim is None or claim.status != "ALLOCATION_UNRESOLVED":
                 raise ValueError(f"換股權利 {claim_id} 不在待確認分配狀態")
@@ -1863,6 +1943,7 @@ class PortfolioLedger:
         as_of: date | str,
         final_allocated_new_shares: int | None = None,
     ) -> tuple[LedgerEntry, ...]:
+        """在新股登记及可流通阶段结算换股权益并生成对应持仓批次。"""
         if not isinstance(event, ShareSwapMergerEvent):
             raise TypeError("settle_share_swap 只接受 ShareSwapMergerEvent")
         day = calendar_date(as_of, "as_of")
@@ -1892,6 +1973,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按已确认获配股数生成新证券批次，并处理换股权利结算。"""
             current_claim = candidate._claims[claim_id]
             if current_claim.status != "ALLOCATED_NOT_YET_TRADABLE":
                 raise ValueError(f"換股權利 {claim_id} 尚未確認分配或已完成結算")
@@ -1935,6 +2017,7 @@ class PortfolioLedger:
     def record_delisting(
         self, event: DelistingEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """登记退市事件和公告来源；是否有现金结算需另行确认。"""
         if not isinstance(event, DelistingEvent):
             raise TypeError("record_delisting 只接受 DelistingEvent")
         day = calendar_date(as_of, "as_of")
@@ -1964,6 +2047,7 @@ class PortfolioLedger:
         as_of: date | str,
         tax_cny: Decimal | int | str | None,
     ) -> tuple[LedgerEntry, ...]:
+        """最后交易日后将退市持仓转为未决退市权益，不沿用最后收盘价假装可交易。"""
         if not isinstance(event, DelistingEvent):
             raise TypeError("apply_delisting 只接受 DelistingEvent")
         day = calendar_date(as_of, "as_of")
@@ -2009,6 +2093,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """将退市日持仓转为未决权益，避免以旧收盘价继续当作持仓估值。"""
             current_lots = {
                 lot.lot_id: lot for lot in candidate._positions.values() if lot.symbol == event.symbol
             }
@@ -2078,6 +2163,7 @@ class PortfolioLedger:
         as_of: date | str,
         tax_cny: Decimal | int | str | None,
     ) -> tuple[LedgerEntry, ...]:
+        """按已核实现金结算证据处理退市权益并结清相关持仓/现金。"""
         if not isinstance(event, DelistingEvent):
             raise TypeError("resolve_delisted_cash_settlement 只接受 DelistingEvent")
         day = calendar_date(as_of, "as_of")
@@ -2126,6 +2212,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """按已核实结算金额建立退市现金应收并清理相应权益凭证。"""
             if claim_id in candidate._receivables:
                 raise ValueError(f"退市现金应收款已存在：{claim_id}")
             claim = candidate._claims[claim_id]
@@ -2168,6 +2255,7 @@ class PortfolioLedger:
         valuation_cny: Decimal | int | str,
         valuation_source: str,
     ) -> tuple[LedgerEntry, ...]:
+        """为退市后的非现金权益补充有来源的估值和状态，未确认价值仍阻断净值。"""
         if not isinstance(event, DelistingEvent):
             raise TypeError("resolve_delisted_claim 只接受 DelistingEvent")
         day = calendar_date(as_of, "as_of")
@@ -2186,6 +2274,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """为退市后非现金权利登记确认估值和来源，并推进账本权益状态。"""
             claim = candidate._claims.get(claim_id)
             if claim is None or claim.status in {"SETTLED", "CANCELLED"}:
                 raise ValueError(f"退市权利 {claim_id} 不存在或已结清")
@@ -2213,6 +2302,7 @@ class PortfolioLedger:
     def apply_code_change(
         self, event: CodeChangeEvent, *, as_of: date | str
     ) -> tuple[LedgerEntry, ...]:
+        """在生效日按 1:1 身份事件迁移旧代码持仓，不生成普通买卖成交。"""
         if not isinstance(event, CodeChangeEvent):
             raise TypeError("apply_code_change 只接受 CodeChangeEvent")
         day = calendar_date(as_of, "as_of")
@@ -2231,6 +2321,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """将旧证券各持仓批次按 1:1 迁移到新代码，不生成成交或现金流。"""
             old_lots = [lot for lot in candidate._positions.values() if lot.symbol == event.old_symbol]
             migrated_shares = 0
             for lot in old_lots:
@@ -2257,6 +2348,7 @@ class PortfolioLedger:
         return self._apply_once(event.event_id, "IDENTITY_MIGRATION", payload, mutate)
 
     def apply_fill(self, fill: TradeFill) -> tuple[LedgerEntry, ...]:
+        """将一笔模拟或导入成交写入账本，更新现金、批次和费用流水。"""
         if not isinstance(fill, TradeFill):
             raise TypeError("apply_fill 只接受 TradeFill")
         notional = fill.price_cny * fill.quantity
@@ -2274,6 +2366,7 @@ class PortfolioLedger:
         }
 
         def mutate(candidate: PortfolioLedger, operation_key: str) -> tuple[LedgerEntry, ...]:
+            """应用买入或卖出成交，更新现金、费用、持仓批次及可卖股数。"""
             if fill.side == "BUY":
                 cash_out = notional + total_fees
                 if candidate._cash_cny < cash_out:
@@ -2400,6 +2493,12 @@ class PortfolioLedger:
         *,
         max_stale_age_sessions: int = 0,
     ) -> NavResult:
+        """按价格标记计算单日账面 NAV，并保留未估值权益、陈旧价和递延税状态。
+
+        ``valuation_date`` 是组合估值日，``prices`` 提供带来源和日期的价格标记；
+        ``max_stale_age_sessions`` 限制价格允许滞后开市日数。返回 NAV 状态与构成，缺少
+        可接受价格或未决权利价值时结果可能为 UNVALUED，不以零替代未知金额。
+        """
         day = calendar_date(valuation_date, "valuation_date")
         latest_booking = max((entry.booking_date for entry in self._journal), default=None)
         if latest_booking is not None and day < latest_booking:
@@ -2519,14 +2618,14 @@ class PortfolioLedger:
         )
 
     def _seed_receivable(self, receivable: CashReceivable) -> None:
-        """Internal hook for event handlers; T2 will provide atomic public operations."""
+        """装载期初现金应收的内部入口；拒绝覆盖同 ID 并重新校验账本不变量。"""
         if receivable.receivable_id in self._receivables:
             raise ValueError(f"应收款已存在：{receivable.receivable_id}")
         self._receivables[receivable.receivable_id] = receivable
         self.assert_invariants()
 
     def _seed_claim(self, claim: NoncashClaim) -> None:
-        """Internal hook for event handlers; T2 will provide atomic public operations."""
+        """装载期初非现金权利的内部入口；拒绝覆盖同 ID 并重新校验账本不变量。"""
         if claim.claim_id in self._claims:
             raise ValueError(f"非现金权利已存在：{claim.claim_id}")
         self._claims[claim.claim_id] = claim

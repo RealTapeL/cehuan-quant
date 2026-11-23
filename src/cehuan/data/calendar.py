@@ -1,3 +1,9 @@
+"""规范交易日历并审计证券行情窗口。
+
+日历中的开市状态和来源由输入提供；窗口审计只按开市日计数，缺失行情、
+停牌状态未知和价格口径混用分别报告，不把缺日自动解释成停牌。
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -11,6 +17,11 @@ CALENDAR_COLUMNS = ["trade_date", "is_open", "previous_trade_date", "source", "r
 
 
 def _parse_calendar_date(series: pd.Series) -> pd.Series:
+    """解析紧凑或常规日期列，失败值保留为 NaT。
+
+    ``series`` 是外部日历的日期字段；返回同索引的日期序列，调用方负责
+    将无法解析的值作为输入错误阻断。
+    """
     values = series.astype("string").str.strip()
     compact = values.str.fullmatch(r"\d{8}").fillna(False)
     parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
@@ -20,7 +31,11 @@ def _parse_calendar_date(series: pd.Series) -> pd.Series:
 
 
 def normalize_trading_calendar(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize an imported exchange calendar while retaining provenance."""
+    """规范导入的交易日历，同时保留来源和抓取时间等溯源字段。
+
+    ``frame`` 可使用项目约定的日期列别名；返回按日期排序的规范列。缺必需字段、
+    无效日期、未知开市标记、空来源或重复日期均抛出 ``ValueError``。
+    """
     data = frame.copy()
     data.columns = [str(column).strip() for column in data.columns]
     aliases = {"cal_date": "trade_date", "pretrade_date": "previous_trade_date"}
@@ -49,6 +64,11 @@ def normalize_trading_calendar(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def validate_bars_against_calendar(bars: pd.DataFrame, calendar: pd.DataFrame) -> dict[str, object]:
+    """核对行情日期是否存在于日历且被标记为开市。
+
+    参数分别为规范行情和带来源的交易日历。返回覆盖日期、错误和
+    ``healthy`` 状态；不判断行情供应商是否完整，也不验证证券状态。
+    """
     data = normalize_bar_frame(bars)
     sessions = normalize_trading_calendar(calendar)
     lookup = sessions.set_index("trade_date")["is_open"]
@@ -73,6 +93,11 @@ def validate_bars_against_calendar(bars: pd.DataFrame, calendar: pd.DataFrame) -
 
 
 def next_open_session(calendar: pd.DataFrame, after: object) -> tuple[str, str] | None:
+    """查找 ``after`` 之后首个明确开市日及其来源。
+
+    日历日期按日期比较，不推断周末或节假日；没有后续开市日时返回
+    ``None``，日历格式错误时由规范化函数抛出异常。
+    """
     sessions = normalize_trading_calendar(calendar)
     cutoff = pd.Timestamp(after).date()
     next_rows = sessions.loc[(sessions["trade_date"] > cutoff) & sessions["is_open"].fillna(False)]
@@ -90,7 +115,12 @@ def audit_security_windows(
     signal_date: object,
     lookback_sessions: int,
 ) -> pd.DataFrame:
-    """Audit a per-security calendar window without inferring missing bars as suspensions."""
+    """逐证券审计按开市日计数的信号窗口，不把缺行情推断成停牌。
+
+    ``bars``、``calendar`` 和证券集合构成审计输入；``signal_date`` 必须为日历中的
+    开市日，``lookback_sessions`` 是信号日前的开市日数。返回每证券窗口的缺日、重复、
+    状态和价格口径结果；窗口不完整时会标出缺口或阻断。
+    """
     if isinstance(lookback_sessions, bool) or lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须是正整数")
     data = normalize_bar_frame(bars)
@@ -100,6 +130,7 @@ def audit_security_windows(
     if signal_day not in opens:
         raise ValueError(f"signal_date {signal_day} 不在交易日历开市日中")
     end = opens.index(signal_day)
+    # required 是信号日及其前 lookback_sessions 个开市日，不含自然日推算。
     required = opens[max(0, end - lookback_sessions):end + 1]
     window_length = lookback_sessions + 1
     normalized_symbols = sorted({canonical_symbol(symbol) for symbol in symbols})

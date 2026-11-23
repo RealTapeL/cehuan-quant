@@ -1,3 +1,5 @@
+"""策环测试模块：验证真实行情摘要 Agent 的证据绑定、能力清单和安全限制。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -27,6 +29,7 @@ FACT_SHA256 = hashlib.sha256(b"recorded local test artifact").hexdigest()
 
 
 def _summary() -> dict:
+    """私有测试辅助函数，用于摘要。 返回：dict，供调用处构造夹具或断言复用。"""
     return {
         "summary_id": "summary-test-01",
         "classification": REAL_SUMMARY_CLASSIFICATION,
@@ -53,6 +56,7 @@ def _summary() -> dict:
 
 
 def _hypothesis(digest: str, experiment_id: str, fact_sha: str = FACT_SHA256) -> dict:
+    """私有测试辅助函数，用于假设。 参数：`digest`：摘要场景输入；`experiment_id`：实验编号场景输入；`fact_sha`：事实SHA场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     return {
         "schema_version": 1,
         "hypothesis_id": "summary-test-01-initial-hypothesis",
@@ -83,15 +87,18 @@ def _hypothesis(digest: str, experiment_id: str, fact_sha: str = FACT_SHA256) ->
 
 
 class DeterministicTestModel:
+    """测试辅助类“DeterministicTestModel”，用于承载确定性模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     provider = "test-only"
     model = "deterministic-test-model"
     safe_endpoint = None
 
     def __init__(self, fact_sha: str = FACT_SHA256):
+        """初始化测试辅助对象`DeterministicTestModel`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.fact_sha = fact_sha
         self.prompts: list[str] = []
 
     def generate(self, *, phase: str, prompt: str, context: dict) -> ModelReply:
+        """实现测试替身DeterministicTestModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`phase`：阶段场景输入；`prompt`：提示词场景输入；`context`：上下文场景输入。 返回：ModelReply，供调用处构造夹具或断言复用。"""
         self.prompts.append(prompt)
         result = _hypothesis(context["input_data_digest"], f"{context['research_id']}-test", self.fact_sha)
         # The orchestrator supplies its registered experiment id in the prompt/context contract.
@@ -101,11 +108,13 @@ class DeterministicTestModel:
 
 
 def _agent_input() -> dict:
+    """私有测试辅助函数，用于Agent输入。 返回：dict，供调用处构造夹具或断言复用。"""
     config = load_config()
     return _build_agent_input(_summary(), FAKE_SUMMARY_SHA256, config, "test-real-research")
 
 
 def test_real_summary_agent_input_is_not_synthetic_and_uses_live_capability_map():
+    """验证真实摘要Agent输入不合成与使用实时能力映射。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     assert payload["data_trust"]["overall"] == REAL_SUMMARY_CLASSIFICATION
     assert payload["market_research_summary"]["summary_sha256"] == FAKE_SUMMARY_SHA256
@@ -116,6 +125,7 @@ def test_real_summary_agent_input_is_not_synthetic_and_uses_live_capability_map(
 
 
 def test_real_summary_prompt_uses_catalog_and_does_not_request_synthetic_evidence():
+    """验证真实摘要提示词使用清单与不请求合成证据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     prompt = build_hypothesis_prompt(
         input_payload=payload,
@@ -130,6 +140,7 @@ def test_real_summary_prompt_uses_catalog_and_does_not_request_synthetic_evidenc
 
 
 def test_real_hypothesis_requires_exact_summary_fact_binding():
+    """验证真实假设要求完全一致摘要事实绑定。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
     model = DeterministicTestModel()
     hypothesis, audit = generate_validated_hypothesis(
@@ -158,6 +169,7 @@ def test_real_hypothesis_requires_exact_summary_fact_binding():
 
 
 def test_unsupported_rule_proposal_is_explicitly_pending_implementation():
+    """验证不支持规则提案明确地待处理实现。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     hypothesis = _hypothesis(FAKE_SUMMARY_SHA256, "test")
     hypothesis["proposed_changes"][0]["config_path"] = "strategy.unimplemented_rule"
     result = _proposal_review(hypothesis, load_config())
@@ -166,6 +178,7 @@ def test_unsupported_rule_proposal_is_explicitly_pending_implementation():
 
 
 def test_frozen_summary_rechecks_all_source_hashes_before_reuse(tmp_path: Path):
+    """验证冻结摘要重新核对全部来源哈希之前复用。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     (tmp_path / "outputs").mkdir()
     source_ids = {
         "bars", "snapshot_manifest", "quality", "universe", "universe_audit",
@@ -220,14 +233,17 @@ def test_frozen_summary_rechecks_all_source_hashes_before_reuse(tmp_path: Path):
 
 
 def test_real_summary_hypothesis_cannot_claim_ready_or_contain_order_fields():
+    """验证真实摘要假设不能声明就绪或包含订单字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
 
     class UnsafeTestModel:
+        """测试辅助类“UnsafeTestModel”，用于承载不安全模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         provider = "test-only"
         model = "unsafe-test-model"
         safe_endpoint = None
 
         def generate(self, *, phase: str, prompt: str, context: dict) -> ModelReply:
+            """实现测试替身UnsafeTestModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`phase`：阶段场景输入；`prompt`：提示词场景输入；`context`：上下文场景输入。 返回：ModelReply，供调用处构造夹具或断言复用。"""
             invalid = _hypothesis(context["input_data_digest"], context["experiment_id"])
             invalid["status"] = "PROPOSED"
             invalid["orders"] = []
@@ -245,14 +261,17 @@ def test_real_summary_hypothesis_cannot_claim_ready_or_contain_order_fields():
 
 
 def test_real_summary_network_failure_is_classified_as_request_failure():
+    """验证真实摘要网络失败归类为请求失败。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _agent_input()
 
     class NoNetworkTestModel:
+        """测试辅助类“NoNetworkTestModel”，用于承载没有网络模型相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         provider = "test-only"
         model = "offline-test-model"
         safe_endpoint = None
 
         def generate(self, *, phase: str, prompt: str, context: dict) -> ModelReply:
+            """实现测试替身NoNetworkTestModel的生成行为；用于控制被测代码与断言，不访问真实服务。 参数：`phase`：阶段场景输入；`prompt`：提示词场景输入；`context`：上下文场景输入。 返回：ModelReply，供调用处构造夹具或断言复用。"""
             raise ResearchModelRequestError("LLM 请求失败：TimeoutError")
 
     with pytest.raises(ResearchHypothesisRejected) as raised:

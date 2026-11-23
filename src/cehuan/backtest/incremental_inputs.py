@@ -1,8 +1,8 @@
-"""Report-only preflight for proposed checkpoint input increments.
+"""只生成报告的 checkpoint 增量输入预检器。
 
-This module does not alter or relax ``run_backtest`` checkpoint validation.
-It evaluates a versioned proof document and returns an auditable compatibility
-report for synthetic and future integration work.
+本模块不修改或放宽 ``run_backtest`` 的 checkpoint 校验；它读取带版本的证明文档，
+比较事件、日历、规则和费率变化，输出可审计兼容性报告。报告可评估追加条件，但
+当前通过预检不代表引擎可以执行增量续跑。
 """
 
 from __future__ import annotations
@@ -20,12 +20,14 @@ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _sha(value: Any, field: str) -> str:
+    """校验摘要字段为 64 位十六进制 SHA-256 并返回小写形式。"""
     if not isinstance(value, str) or not _SHA256.fullmatch(value.strip()):
         raise ValueError(f"{field} 必须是 64 位十六进制 SHA-256")
     return value.strip().lower()
 
 
 def _day(value: Any, field: str) -> date:
+    """严格解析 YYYY-MM-DD 日期；不接受宽松格式或额外时间信息。"""
     if not isinstance(value, str):
         raise ValueError(f"{field} 必须是 YYYY-MM-DD")
     try:
@@ -38,6 +40,7 @@ def _day(value: Any, field: str) -> date:
 
 
 def _instant(value: Any, field: str) -> datetime:
+    """解析带时区 ISO 时间并转 UTC；只有日期或无时区时间不能用于点时审计。"""
     if not isinstance(value, str):
         raise ValueError(f"{field} 必须是带时区的 ISO 时间；仅有日期不能用于点时判断")
     try:
@@ -50,6 +53,7 @@ def _instant(value: Any, field: str) -> datetime:
 
 
 def _unique_rows(value: Any, key: str, label: str) -> dict[str, dict[str, Any]]:
+    """把 proof 数组转为唯一键映射，拒绝非对象、空键和重复键。"""
     if not isinstance(value, list):
         raise ValueError(f"{label} 必须是数组")
     result: dict[str, dict[str, Any]] = {}
@@ -66,6 +70,7 @@ def _unique_rows(value: Any, key: str, label: str) -> dict[str, dict[str, Any]]:
 
 
 def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """验证 proof 结构、哈希格式、时间字段和各类输入行的基本契约。"""
     if not isinstance(proof, Mapping) or proof.get("schema_version") not in {1, 2}:
         raise ValueError(f"{label} 必须是 schema_version=1 或 2 的对象")
     schema_version = int(proof["schema_version"])
@@ -148,27 +153,31 @@ def _validate_proof(proof: Any, label: str) -> tuple[dict[str, Any], dict[str, A
 
 
 def validate_incremental_proof(proof: Any, label: str = "proof") -> tuple[dict[str, Any], dict[str, Any]]:
-    """Validate the proof schema without asserting that it binds real inputs."""
+    """只验证证明结构，不声称证明绑定了真实输入文件。"""
     return _validate_proof(proof, label)
 
 
 def _proof_evidence_status(proof: Mapping[str, Any], key: str) -> str:
+    """读取 proof 中的证据状态；缺失或未知枚举统一保留为 UNVERIFIED。"""
     evidence = proof.get("evidence_status")
     status = evidence.get(key) if isinstance(evidence, Mapping) else None
     return status if status in {"VERIFIED", "UNVERIFIED", "FAILED"} else "UNVERIFIED"
 
 
 def _row_fingerprint(row: Mapping[str, Any], field: str, label: str) -> str:
+    """读取并验证指定行摘要字段。"""
     return _sha(row.get(field), f"{label}.{field}")
 
 
 def _canonical_digest(value: Any) -> str | None:
+    """对映射型规范内容计算摘要；其他类型返回 None。"""
     if not isinstance(value, Mapping):
         return None
     return canonical_payload_digest(value)
 
 
 def _event_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
+    """提取事件的可得时点、首次影响日、来源摘要和身份字段元数据。"""
     try:
         known_at: Any = _instant(row.get("known_at_utc"), f"{label}.known_at_utc").isoformat()
     except ValueError:
@@ -190,6 +199,7 @@ def _event_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
 
 
 def _schedule_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
+    """提取规则或费率行的有效区间、来源时点及市场身份元数据。"""
     try:
         valid_from: Any = _day(row.get("valid_from"), f"{label}.valid_from").isoformat()
     except ValueError:
@@ -218,6 +228,7 @@ def _schedule_metadata(row: Mapping[str, Any], label: str) -> tuple[Any, ...]:
 
 
 def _increment_digest(additions: Mapping[str, Any]) -> str:
+    """对待追加输入集合按确定性 JSON 生成增量内容摘要。"""
     payload = {"additions": additions}
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -227,11 +238,10 @@ def audit_incremental_inputs(
     baseline_proof: Mapping[str, Any],
     candidate_proof: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Compare two proofs without making an engine continuation executable.
+    """比较基线与候选证明并输出增量兼容性诊断，不开放回测续跑。
 
-    A clean report means only that the candidate input set satisfies this
-    preflight contract. The current backtest engine still requires exact full
-    input hashes and cannot consume candidate additions.
+    输入是两份版本化 proof；返回变化、阻断项、可追加内容及历史影响日期。即使无阻断，
+    也只表示满足预检契约；当前引擎仍要求完整输入哈希相等，不能消费候选追加项。
     """
     base_cp, base = _validate_proof(baseline_proof, "baseline")
     candidate_cp, current = _validate_proof(candidate_proof, "candidate")
@@ -259,6 +269,7 @@ def audit_incremental_inputs(
     affected_dates: list[date] = []
 
     def block(code: str, detail: str, affected: date | None = None) -> None:
+        """登记一条阻断原因，并可选记录最早受影响日期。"""
         blockers.append({"code": code, "detail": detail})
         if affected is not None:
             affected_dates.append(affected)
@@ -278,6 +289,7 @@ def audit_incremental_inputs(
     canonical_content_unverified = False
 
     def verify_canonical_row(row: Mapping[str, Any], label: str, family: str) -> str:
+        """核对规范行摘要与外层元数据，返回可区分失败原因的状态码。"""
         declared = _row_fingerprint(row, "content_sha256", label)
         observed = _canonical_digest(row.get("canonical_content"))
         if observed is None:
@@ -404,6 +416,7 @@ def audit_incremental_inputs(
 
     # Preserve all calendar history and the originally recorded next open session.
     def calendar_map(rows: list[dict[str, Any]], label: str) -> dict[date, bool]:
+        """将日历行转换为日期到开市状态的映射，供前后缀比较使用。"""
         return {_day(row["date"], f"{label}.date"): row["is_open"] for row in rows}
 
     base_calendar = calendar_map(base["calendar"], "baseline.calendar")

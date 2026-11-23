@@ -1,3 +1,4 @@
+"""前瞻纸面候选排名。模块读取冻结配置、行情、日历、点时股票池和抓取清单，生成原排名及可选 H1 对照，并通过唯一输出目录封存输入哈希；产物是研究候选，不是订单。"""
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
@@ -27,7 +28,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class _ForwardWindowNeedsData(ValueError):
-    """A valid forward run was blocked by incomplete selected-pool windows."""
+    """前瞻排名窗口输入不完整时使用的阻断异常。它把“数据不足”与程序内部错误分开，供调用层产出 NEEDS_DATA 状态。"""
 
 
 def _build_h1_ranking_comparison(
@@ -36,7 +37,7 @@ def _build_h1_ranking_comparison(
     *,
     max_positions: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Re-rank the frozen baseline candidate set after the existing H1 window audit."""
+    """仅在原始排名候选集合内应用 H1 状态并重新排序。参数：ranking 为基线完整排名，window_audit 为逐证券窗口状态，max_positions 为目标数量上限。返回：H1 排名、逐证券差异表和 Top N 变更摘要。异常：重复证券或所需字段缺失时拒绝比较。"""
     required = {"signal_date", "symbol", "momentum", "rank", "selected_target"}
     if not required.issubset(ranking.columns) or not {"symbol", "window_status"}.issubset(window_audit.columns):
         raise ValueError("H1 重排输入缺少排名或窗口审计字段")
@@ -89,7 +90,7 @@ def create_paper_ranking_artifact(
     universe_path: str | Path | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Generate and seal a non-order candidate ranking; forward mode needs same-day capture evidence."""
+    """从冻结输入生成并封存纸面排名归档。参数：bars_path/config_path 指向行情与配置，signal_date 为排名日，output_dir 必须是新目录；classification 指明 SYNTHETIC 或 FORWARD_PAPER，其他路径分别绑定抓取清单、日历和点时股票池，now_utc 可用于确定性运行。返回：排名状态和 manifest。副作用：写入唯一归档目录及哈希；目标已存在时拒绝覆盖。异常：输入门控失败会写失败状态，格式或文件错误按具体校验阻断；不生成股数/委托。"""
     if classification not in {"SYNTHETIC", "FORWARD_PAPER"}:
         raise ValueError("classification 只能是 SYNTHETIC 或 FORWARD_PAPER")
     signal_day = date.fromisoformat(signal_date)
@@ -382,6 +383,7 @@ def _forward_input_readiness(
     bars_file: Path, config_file: Path, capture_file: Path | None,
     calendar_file: Path | None, universe_file: Path | None,
 ) -> dict[str, Any]:
+    """评估前瞻运行是否满足当日、收盘后和来源清单门槛。参数：classification、signal_day、now 描述运行类型/日期/当前时点，bars/config 及可选来源文件提供输入。返回：逐项检查、阻断原因和可信度状态。限制：本地抓取时间不等于供应商发布时间证据。"""
     checks: dict[str, str] = {}
     reasons = []
     if not bars_file.is_file():
@@ -477,6 +479,7 @@ def _forward_input_readiness(
 
 
 def _parse_aware(value: Any, field: str) -> datetime:
+    """解析必须带时区的时间值并转为 UTC。参数：value 为原始值，field 用于错误定位。返回：UTC datetime。异常：缺失或不带时区时抛出 ValueError。"""
     if value is None or str(value).strip() == "":
         raise ValueError(f"{field} 缺失")
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -488,6 +491,7 @@ def _parse_aware(value: Any, field: str) -> datetime:
 def _validate_signal_window_availability(
     bars: pd.DataFrame, *, signal_day: date, lookback_sessions: int, available_by: datetime,
 ) -> None:
+    """验证动量信号窗口内行情在指定运行截止时点前已记录可用。参数：bars 为窗口行情，signal_day/ lookback_sessions 定义窗口，available_by 为运行开始截止时间。返回：通过时返回 None。异常：缺 available_at、窗口不完整或记录时间晚于截止时点时抛出 ValueError；该字段仍不证明供应商发布时间。"""
     if "available_at" not in bars.columns:
         raise ValueError("行情缺少 available_at，不能确定用于排名的数据是否已到达")
     sessions = sorted(bars["trade_date"].astype(str).unique())
@@ -508,16 +512,19 @@ def _validate_signal_window_availability(
 
 
 def _coerce_utc(value: datetime) -> datetime:
+    """拒绝无时区时间并规范为 UTC。参数：value 为当前运行时间。返回：UTC datetime。异常：无时区时抛出 ValueError。"""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("now_utc 必须带时区")
     return value.astimezone(timezone.utc)
 
 
 def _iso_utc(value: datetime) -> str:
+    """把时区时间序列化为带 Z 后缀的 UTC 字符串。参数：value 为带时区 datetime。返回：ISO 8601 字符串。"""
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _sha256(path: Path) -> str:
+    """流式计算文件 SHA-256。参数：path 为文件路径。返回：小写十六进制摘要；读取异常向上传递。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -526,6 +533,7 @@ def _sha256(path: Path) -> str:
 
 
 def _git_revision() -> str | None:
+    """读取当前 Git HEAD 标识。返回：提交哈希；Git 查询失败时返回 None。副作用：只执行只读 Git 命令。"""
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
@@ -533,6 +541,7 @@ def _git_revision() -> str | None:
 
 
 def _git_dirty() -> bool | None:
+    """检查当前工作区是否存在未提交改动。返回：布尔状态；Git 查询失败时返回 None。副作用：只执行只读 Git 命令。"""
     try:
         return bool(subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True).strip())
     except Exception:

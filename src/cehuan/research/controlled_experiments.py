@@ -1,4 +1,4 @@
-"""Map a small allowlist of hypotheses to reproducible, non-active candidate runs."""
+"""受控候选实验器。它只允许通过登记的参数路径创建独立候选配置，并复用现有回测入口比较候选与基线；不修改当前有效策略，未实现规则必须明确阻断。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,10 @@ MAX_CHANGES_PER_EXPERIMENT = 1
 
 
 def build_experiment_capabilities(baseline_config: dict[str, Any]) -> dict[str, Any]:
-    """Build model-visible parameter limits from the executor's authoritative map."""
+    """根据执行器白名单和冻结配置生成 Agent 可见的实验能力说明。
+    参数：baseline_config 为只读基线配置。
+    返回：受支持路径、类型/范围、当前值和单变量限制。
+    限制：能力清单是提示信息，输出仍需由执行器再次校验。"""
     parameters: list[dict[str, Any]] = []
     for path, contract in SUPPORTED_HYPOTHESIS_PATHS.items():
         section, key = path.split(".", 1)
@@ -47,14 +50,24 @@ def build_experiment_capabilities(baseline_config: dict[str, Any]) -> dict[str, 
 
 
 def _sha256(path: Path) -> str:
+    """计算文件的 SHA-256。
+    参数：path 为待摘要文件。
+    返回：十六进制摘要；读取失败时抛出异常。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _json_write(value: object, path: Path) -> None:
+    """以项目约定写入 JSON 文件。
+    参数：value 为可序列化对象，path 为目标路径。
+    副作用：创建或写入目标文件；调用方需保证 run_dir 唯一以避免覆盖。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def _apply_one_change(baseline_config: dict[str, Any], change: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """将一项已登记的参数变更应用到配置副本。
+    参数：baseline_config 为冻结配置，change 描述单一路径和值。
+    返回：新的候选配置及规范化变更记录。
+    异常：路径不受支持、值越界或类型不符时拒绝，不触碰基线配置。"""
     path = str(change["config_path"])
     contract = SUPPORTED_HYPOTHESIS_PATHS.get(path)
     if contract is None:
@@ -84,7 +97,11 @@ def run_candidate_experiment(
     baseline_backtest: dict[str, Any],
     hypothesis: dict[str, Any],
 ) -> dict[str, str]:
-    """Run at most one one-factor candidate against the already-run synthetic baseline."""
+    """在相同输入和初始条件下运行一个受控候选实验。
+    参数：run_dir 为独立目录，bars 为规范行情，baseline_config/backtest 为基线，hypothesis 为候选假设。
+    返回：实验状态、参数差异、指标和产物清单。
+    副作用：写入候选配置、结果和哈希；复用回测引擎。
+    异常：假设不是单一受支持改动或回测被门控时明确失败。"""
     run_dir = run_dir.expanduser().resolve()
     bars_path = run_dir / "synthetic_bars.csv"
     baseline_metrics_path = run_dir / "baseline_metrics.json"

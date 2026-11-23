@@ -1,3 +1,9 @@
+"""生成可重复的合成日线示例文件，供本地演示数据读取和研究流程使用。
+
+数据由固定随机种子构造，不代表真实市场或历史行情；运行会写入仓库内
+``examples/demo_daily.csv``，因此仅在需要刷新示例文件时执行。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,8 +17,15 @@ OUT = ROOT / "examples" / "demo_daily.csv"
 
 
 def main() -> None:
+    """生成固定证券集合的合成日线并写入 CSV。
+
+    参数：无。返回：无；副作用是覆盖示例路径 ``OUT`` 并向终端输出行数。
+    日期采用工作日序列，不使用 A 股交易日历；价格、状态和规则均为合成假设。
+    """
     rng = np.random.default_rng(20261025)
+    # 固定随机种子，使每次生成的演示价格和成交量序列可复现。
     dates = pd.bdate_range("2025-01-02", periods=180)
+    # 每个条目依次给出示例名称、初始价格和日收益漂移参数。
     securities = {
         "SIM001": ("合成示例甲", 20.0, 0.0012),
         "SIM002": ("合成示例乙", 35.0, 0.0003),

@@ -1,3 +1,9 @@
+"""在模拟回测成交上运行账本投影，核对交易记账与持仓状态。
+
+该模块把回测器产出的成交和价格标记映射到 ``PortfolioLedger``；用于账务诊断，
+不替代正式交易规则、公司行动覆盖或真实账户对账。
+"""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -17,11 +23,11 @@ def run_accounting_shadow(
     open_positions: pd.DataFrame,
     tolerance_cny: Decimal = Decimal("0.01"),
 ) -> dict[str, Any]:
-    """Replay an event-free research run through the ledger and compare daily state.
+    """用回测成交及期初快照生成影子账本和逐日核对结果。
 
-    The legacy engine remains authoritative in this diagnostic mode. Stale closes
-    are permitted up to the input window to mirror its last-close carry behavior;
-    this is deliberately not a production valuation policy.
+    输入为期初现金、模拟成交、行情、净值曲线、期初持仓和人民币容差；返回每日核对及
+    差异报告。此影子账本不含公司行动处理，沿用 legacy 引擎窗口内最后收盘价的诊断口径，
+    不是生产估值政策；遇到账务或价格差异会报告，不代表正式 NAV。
     """
     ledger = PortfolioLedger(Decimal(str(initial_cash_cny)), portfolio_id="accounting-shadow")
     dates = [str(value) for value in equity_curve["trade_date"].tolist()]

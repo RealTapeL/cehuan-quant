@@ -1,3 +1,5 @@
+"""策环测试模块：验证前瞻观察尝试、响应解析、哈希绑定和状态未知的处理。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +16,7 @@ from cehuan.research.paper_observation import (
 
 
 def test_synthetic_paper_observation_rehearsal_tracks_missing_and_retry(tmp_path: Path) -> None:
+    """验证合成纸面观察演练跟踪缺失与重试。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     result = build_synthetic_paper_observation(output)
     report = result["validation"]
@@ -34,6 +37,7 @@ def test_synthetic_paper_observation_rehearsal_tracks_missing_and_retry(tmp_path
 
 
 def test_paper_observation_rejects_raw_response_hash_mismatch(tmp_path: Path) -> None:
+    """验证纸面观察拒绝原始响应哈希不符。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     raw = output / "raw/decision-quote-retry.json"
@@ -43,6 +47,7 @@ def test_paper_observation_rejects_raw_response_hash_mismatch(tmp_path: Path) ->
 
 
 def test_paper_observation_rejects_overwritten_retry_sequence(tmp_path: Path) -> None:
+    """验证纸面观察拒绝被覆盖重试顺序。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record = output / "paper-observation.json"
@@ -54,6 +59,7 @@ def test_paper_observation_rejects_overwritten_retry_sequence(tmp_path: Path) ->
 
 
 def test_payload_must_rebuild_from_hash_matching_raw_response(tmp_path: Path) -> None:
+    """验证载荷必须重建从哈希匹配原始响应。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record_path = output / "paper-observation.json"
@@ -65,6 +71,7 @@ def test_payload_must_rebuild_from_hash_matching_raw_response(tmp_path: Path) ->
 
 
 def test_parser_version_and_market_event_timeline_are_enforced(tmp_path: Path) -> None:
+    """验证解析器版本与市场事件时间线强制。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record_path = output / "paper-observation.json"
@@ -83,6 +90,7 @@ def test_parser_version_and_market_event_timeline_are_enforced(tmp_path: Path) -
 
 
 def test_legacy_v1_remains_readable_but_payload_binding_is_unverified(tmp_path: Path) -> None:
+    """验证旧版v1仍为可读取但载荷绑定未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "legacy"
     output.mkdir()
     ranking = output / "ranking.json"
@@ -113,6 +121,7 @@ def test_legacy_v1_remains_readable_but_payload_binding_is_unverified(tmp_path: 
 
 
 def test_can_buy_is_derived_and_distinguishes_blocked_from_unknown() -> None:
+    """验证可以买入派生与区分阻断从未知。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     unknown = derive_research_eligibility(
         quote_available=True, is_listed=True, is_suspended=False, is_st=False, exclude_st=True,
         market_rules_complete=None, price_within_limits=None, account_cash_sufficient=None,
@@ -130,6 +139,7 @@ def test_can_buy_is_derived_and_distinguishes_blocked_from_unknown() -> None:
 
 
 def test_structured_eligibility_evidence_is_bound_but_not_claimed_verified() -> None:
+    """验证结构化资格证据绑定但不声称已。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = derive_research_eligibility(
         quote_available=True, is_listed=True, is_suspended=False, is_st=False, exclude_st=True,
         market_rules_complete={
@@ -147,6 +157,7 @@ def test_structured_eligibility_evidence_is_bound_but_not_claimed_verified() -> 
 
 
 def test_parse_failed_preserves_response_but_does_not_publish_business_payload(tmp_path: Path) -> None:
+    """验证解析失败保留响应但不发布业务载荷。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record_path = output / "paper-observation.json"
@@ -166,6 +177,7 @@ def test_parse_failed_preserves_response_but_does_not_publish_business_payload(t
 
 
 def test_unknown_raw_status_cannot_be_reported_as_non_suspended(tmp_path: Path) -> None:
+    """验证未知原始状态不能报告为非停牌。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record_path = output / "paper-observation.json"
@@ -183,6 +195,7 @@ def test_unknown_raw_status_cannot_be_reported_as_non_suspended(tmp_path: Path) 
 
 
 def test_attempt_array_order_does_not_change_latest_payload_selection(tmp_path: Path) -> None:
+    """验证尝试数组订单不变更最新载荷选择。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "rehearsal"
     build_synthetic_paper_observation(output)
     record_path = output / "paper-observation.json"

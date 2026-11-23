@@ -1,3 +1,4 @@
+"""研究假设原型。集中实现 H1 停牌窗口筛选和 H2 延迟开盘替补决策的可检验逻辑；函数只处理传入的规范数据，不改变有效策略，也不连接券商。"""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -11,11 +12,13 @@ from cehuan.data.calendar import normalize_trading_calendar
 
 
 def _date_text(value: object) -> str:
+    """把输入日期规范为 YYYY-MM-DD。参数：value 为日期或可解析时间。返回：有效日期字符串；不能解析时返回空字符串。"""
     parsed = pd.to_datetime(value, errors="coerce")
     return "" if pd.isna(parsed) else parsed.strftime("%Y-%m-%d")
 
 
 def _aware_utc(value: object, *, field: str) -> pd.Timestamp:
+    """解析带时区时间并转为 UTC。参数：value 为时间值，field 用于错误定位。返回：UTC 时间戳。异常：时间缺失、无效或不带时区时抛出 ValueError。"""
     parsed = pd.Timestamp(value)
     if parsed.tzinfo is None:
         raise ValueError(f"{field} 必须带时区")
@@ -23,11 +26,13 @@ def _aware_utc(value: object, *, field: str) -> pd.Timestamp:
 
 
 def _optional_flag(value: object) -> bool | None:
+    """将单个状态值解析为三态布尔值。参数：value 为原始状态。返回：True、False 或 None；无法判定时保持未知。"""
     parsed = parse_optional_bool(pd.Series([value])).iloc[0]
     return None if pd.isna(parsed) else bool(parsed)
 
 
 def _positive_number(value: object) -> float | None:
+    """解析有限正数。参数：value 为数值字段。返回：有效正浮点数，否则返回 None。"""
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -45,11 +50,7 @@ def evaluate_h1_window(
     signal_date: str,
     lookback_sessions: int = 20,
 ) -> dict[str, Any]:
-    """Evaluate the H1 research filter using exactly lookback+1 open sessions.
-
-    The function is read-only and only uses bars and calendar rows dated on or
-    before the signal date. It does not replace the active signal pipeline.
-    """
+    """检查证券截至信号日的停牌观察窗口。参数：bars 为证券行情/状态表，calendar 为交易日历，symbol 为规范代码，signal_date 为信号日，lookback_sessions 为回看开市日数。返回：窗口日期、缺失/重复/停牌及未知原因和资格状态。副作用：无；只读取信号日及以前数据。异常：字段缺失、日期无效或 lookback_sessions 非正时抛出 ValueError。"""
     if lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须大于 0")
     signal_day = _date_text(signal_date)
@@ -156,7 +157,7 @@ def compare_h1_candidate_pool(
     *,
     lookback_sessions: int = 20,
 ) -> pd.DataFrame:
-    """Keep baseline candidates unchanged and recompute only H1 pool/ranks."""
+    """对冻结的基线候选逐行执行 H1 检查并重排合格候选。参数：baseline_candidates 为原候选排名，bars/calendar 为同一行情和交易日历，lookback_sessions 为窗口长度。返回：保留原字段并附 H1 状态、原因和新排名的完整候选表。异常：必需字段缺失或窗口参数无效时阻断。"""
     required = {"symbol", "signal_date", "momentum", "rank"}
     if not required.issubset(baseline_candidates.columns):
         raise ValueError("baseline_candidates 缺少 symbol/signal_date/momentum/rank")
@@ -195,18 +196,7 @@ def filter_h1_candidate_pool(
     signal_date: str,
     lookback_sessions: int = 20,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply H1 to one already-ranked buy-candidate pool.
-
-    The baseline pool is the only source of candidates. A row is retained only
-    when its full ``lookback_sessions + 1`` open-session window has one valid
-    price row per session and an explicitly known, non-suspended status on
-    every row. Missing bars and unknown suspension status are exclusions, never
-    evidence of normal trading.
-
-    ``bars`` is expected to be the canonical, unique security-day frame already
-    used by the caller. The helper is vectorized across the input frame so it
-    can be used at each rebalance without rescanning all bars once per symbol.
-    """
+    """对一个已排名的买入候选池执行 H1 过滤并重排。参数：baseline_candidates 为唯一候选来源，bars 为规范且唯一的证券日行情，calendar 为交易日历，signal_date 为信号日，lookback_sessions 为窗口长度。返回：合格并按原动量规则重排的候选表，以及包含排除原因和两套排名的完整审计表。副作用：无。异常：字段、日期或窗口输入不合约定时抛出 ValueError；未知停牌和缺行均排除。"""
     required = {"symbol", "momentum", "rank"}
     if not required.issubset(baseline_candidates.columns):
         raise ValueError("baseline_candidates 缺少 symbol/momentum/rank")
@@ -305,6 +295,7 @@ def filter_h1_candidate_pool(
 
 
 def _round_lot(shares: int, minimum: int, step: int) -> int:
+    """按最小交易单位和增量向下取整股数。参数：shares 为拟买股数，minimum 为最小股数，step 为后续增量。返回：满足规则的股数；低于最小单位时为 0。异常：minimum 或 step 非正时抛出 ValueError。"""
     if minimum < 1 or step < 1:
         raise ValueError("minimum 和 step 必须为正整数")
     if shares < minimum:
@@ -313,6 +304,7 @@ def _round_lot(shares: int, minimum: int, step: int) -> int:
 
 
 def _quote_lookup(frame: pd.DataFrame, *, trade_date: str, field: str) -> dict[str, dict[str, Any]]:
+    """筛选指定交易日的报价并按证券代码索引。参数：frame 为报价表，trade_date 为交易日，field 用于错误消息。返回：证券代码到报价记录的映射。异常：必需列缺失或同一证券日重复时拒绝。"""
     required = {
         "symbol", "trade_date", "open_price_cny", "price_available_at_utc", "price_source",
         "status_available_at_utc", "status_source", "is_suspended", "is_listed", "can_buy",
@@ -330,6 +322,7 @@ def _quote_lookup(frame: pd.DataFrame, *, trade_date: str, field: str) -> dict[s
 
 
 def _quote_block_reason(quote: Mapping[str, Any], *, decision_at: pd.Timestamp) -> str | None:
+    """判断决策时点是否具备可用的候选报价和状态。参数：quote 为单证券记录，decision_at 为带时区决策时点。返回：首个阻断原因代码；全部通过时为 None。异常：时间字段无效时抛出 ValueError。"""
     price_available = _aware_utc(quote["price_available_at_utc"], field="quote.price_available_at_utc")
     status_available = _aware_utc(quote["status_available_at_utc"], field="quote.status_available_at_utc")
     if price_available > decision_at:
@@ -365,6 +358,7 @@ def _quote_block_reason(quote: Mapping[str, Any], *, decision_at: pd.Timestamp) 
 def _execution_block_reason(
     quote: Mapping[str, Any], *, decision_at: pd.Timestamp, execution_at: pd.Timestamp,
 ) -> str | None:
+    """判断执行时点的报价、状态和可买条件是否满足原型要求。参数：quote 为执行日记录，decision_at/execution_at 为带时区决策及执行时点。返回：首个阻断原因代码或 None。异常：时间格式不合法时抛出 ValueError。"""
     price_available = _aware_utc(quote["price_available_at_utc"], field="execution_quote.price_available_at_utc")
     status_available = _aware_utc(quote["status_available_at_utc"], field="execution_quote.status_available_at_utc")
     if price_available <= decision_at:
@@ -406,7 +400,7 @@ def validate_h2_session_sequence(
     decision_session_date: str,
     execution_session_date: str,
 ) -> list[str]:
-    """Require three consecutive open sessions using the canonical calendar."""
+    """验证信号、决策和执行依次落在连续三个开市日。参数：trading_calendar 为规范日历，其余为三个日期。返回：这三个开市日列表。异常：日期无效、日历自然日缺口或顺序不符时抛出 ValueError。"""
     signal_day = _date_text(signal_date)
     decision_day = _date_text(decision_session_date)
     execution_day = _date_text(execution_session_date)
@@ -463,13 +457,7 @@ def build_h2_open_based_replacement_plan(
     minimum_commission_cny: float,
     existing_positions: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Prototype H2 with an explicit delayed execution boundary.
-
-    The trading calendar proves that signal, decision, and execution sessions
-    are consecutive open sessions. Price and status availability are checked
-    separately. The execution open is an explicit synthetic fill assumption,
-    not evidence that a real order could fill at that price.
-    """
+    """生成 H2 开盘观察后延迟替补的研究计划原型。参数：候选排名、决策/执行开盘报价、日历、时点、仓位预算、现金、交易单位及费用参数共同定义模拟约束；existing_positions 为可选已有持仓。返回：逐候选决策和阻断原因的研究结果，不是券商订单。副作用：无。异常：时点、行情、规则或预算不满足时抛出 ValueError；执行开盘价只是显式模拟假设。"""
     if max_positions < 1:
         raise ValueError("max_positions 必须大于 0")
     for name, value in {

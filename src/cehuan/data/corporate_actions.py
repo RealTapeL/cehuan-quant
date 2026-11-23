@@ -1,3 +1,9 @@
+"""规范公司行动证据并描述合并换股权益阶段。
+
+公司行动不同于 1:1 代码身份变更；未确认个人最终获配数时只保留未决权益，
+不把权利提前计作可交易新股或虚构现金。
+"""
+
 from __future__ import annotations
 
 import math
@@ -45,7 +51,12 @@ CORPORATE_ACTION_COLUMNS = [
 
 
 def normalize_corporate_actions(frame: pd.DataFrame | None) -> pd.DataFrame:
-    """Validate corporate actions separately from simple code identity changes."""
+    """校验吸收合并换股事件及公告、日期和审核字段。
+
+    ``frame`` 为事件表；返回按旧证券最后交易日排序的规范表。当前只接受
+    ``SHARE_SWAP_MERGER``，字段缺失、事件日期顺序错误、比例/来源/审核证据
+    不合格或 event_id 重复时抛出 ``ValueError``。
+    """
     if frame is None or frame.empty:
         return pd.DataFrame(columns=CORPORATE_ACTION_COLUMNS)
     missing = set(CORPORATE_ACTION_COLUMNS).difference(frame.columns)
@@ -113,6 +124,7 @@ def normalize_corporate_actions(frame: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def read_corporate_actions(path: str | Path = DEFAULT_CORPORATE_ACTIONS) -> pd.DataFrame:
+    """读取公司行动 CSV 并运行严格规范化校验。"""
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"公司行动表不存在：{source}")
@@ -120,7 +132,7 @@ def read_corporate_actions(path: str | Path = DEFAULT_CORPORATE_ACTIONS) -> pd.D
 
 
 def corporate_action_phase(action: pd.Series | dict[str, Any], trade_date: str) -> dict[str, Any]:
-    """Return trading availability without treating an unallocated right as stock."""
+    """根据交易日期返回旧股、待登记权利或新股可交易阶段。"""
     row = dict(action)
     day = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
     if day <= str(row["old_last_trade_date"]):
@@ -140,11 +152,12 @@ def make_share_swap_claim(
     *,
     final_allocated_new_shares: int | None = None,
 ) -> dict[str, Any]:
-    """Represent the unlisted merger entitlement without inventing fractional shares.
+    """生成保留原持仓成本的合并换股权益凭证。
 
-    An exact per-position allocation is required before tradable new shares can
-    be issued. Until then the entitlement exposes a floor/ceiling scenario range.
-    Cost basis remains attached to the claim and no cash is created.
+    ``old_shares`` 为整数旧股数，``cost_basis_cny`` 为该批次成本，
+    ``holding_since`` 保留取得日期；只有账户分配已确认时才接受最终获配数。
+    返回含精确比例和整数股上下界的权益记录，不产生现金。非法股数、成本或
+    与证据状态不符的最终获配数会被拒绝。
     """
     row = dict(action)
     old_shares = int(old_shares)

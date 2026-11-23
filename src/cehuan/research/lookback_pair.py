@@ -1,3 +1,4 @@
+"""10/20 日动量配对排名器。它读取冻结登记、固定研究池、日历、点时成员与来源绑定，在共同资格集合上只改变回看窗口并生成排名差异；不计算收益或交易，不接受哈希不符的采集输入。"""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -39,6 +40,7 @@ AUDIT_COLUMNS = [
 
 
 class _BlockedInput(ValueError):
+    """冻结输入、点时资格或来源证据不满足配对排名要求时抛出的阻断异常。它用于将缺数据与代码错误区分。"""
     pass
 
 
@@ -57,11 +59,7 @@ def create_lookback_pair_ranking(
     mode: str = "FORWARD_PAPER",
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Generate a paired 10/20-session ranking only; no orders or returns.
-
-    ``SYNTHETIC`` mode is intended for offline tests. ``FORWARD_PAPER`` adds
-    same-day and capture-time gates and must only be used with a fresh capture.
-    """
+    """在固定研究池和同一资格集合上生成 20 日/10 日动量配对排名。参数：bars/config/calendar/universe/pool/identity/freeze/capture 路径构成冻结输入，signal_date 为唯一实验日，output_dir 必须是新目录，mode 区分合成与前瞻，now_utc 固定运行时点。返回：状态、两组排名、差异和文件哈希。副作用：创建封存归档；不生成收益、股数或委托。异常：冻结哈希、窗口、来源、状态门控失败时明确阻断。"""
     if mode not in {"SYNTHETIC", "FORWARD_PAPER"}:
         raise ValueError("mode 只能是 SYNTHETIC 或 FORWARD_PAPER")
     signal_day = date.fromisoformat(signal_date)
@@ -307,6 +305,7 @@ def create_lookback_pair_ranking(
 
 
 def _read_registration_freeze(path: Path) -> dict[str, Any]:
+    """读取实验冻结 JSON 并验证旁置 SHA-256 封条及实验 ID/日期/固定池。参数：path 为冻结文件。返回：冻结字典。异常：封条缺失/不匹配或登记内容与入口契约不一致时抛 _BlockedInput。"""
     freeze = _read_json(path)
     seal = path.with_suffix(".sha256")
     if not seal.is_file():
@@ -325,6 +324,7 @@ def _read_registration_freeze(path: Path) -> dict[str, Any]:
 
 
 def _validate_frozen_sources(freeze: dict[str, Any], paths: dict[str, Path], hashes: dict[str, str | None]) -> None:
+    """核对登记中冻结的配置、股票池、登记文档、策略实现及日历前缀。参数：freeze 为登记清单，paths/hashes 为本次输入及其哈希。返回：全部一致时 None。异常：路径、摘要、代码顺序或已冻结日历前缀变化时阻断。"""
     frozen = freeze.get("frozen_input_files", {})
     for freeze_key, runtime_key in (("strategy_config", "config"), ("pool", "pool")):
         item = frozen.get(freeze_key)
@@ -376,6 +376,7 @@ def _validate_capture_manifest(
     capture: dict[str, Any], *, signal_day: date, paths: dict[str, Path],
     hashes: dict[str, str | None], mode: str, now: datetime,
 ) -> dict[str, str]:
+    """验证采集清单与本次排名输入、来源接口及封存响应绑定。参数：capture 为清单，signal_day/paths/hashes/mode/now 定义核验范围。返回：逐项来源核验状态。异常：固定池、哈希、响应原件、请求接口、抓取时间或封条不一致时阻断；供应商发布时间仍须单独标未验证。"""
     if capture.get("experiment_id") != EXPERIMENT_ID:
         raise _BlockedInput("采集清单 experiment_id 与本入口不匹配")
     if capture.get("signal_date") != signal_day.isoformat():
@@ -448,6 +449,7 @@ def _validate_capture_manifest(
 def _validate_bar_provenance(
     bars: pd.DataFrame, *, signal_day: date, mode: str, now: datetime,
 ) -> None:
+    """验证规范行情的来源一致性及本机抓取时间范围。参数：bars 为规范行情，signal_day/mode/now 定义检查边界。返回：通过时 None。异常：混源、缺来源/抓取时间或前瞻数据不在当日收盘后时抛 _BlockedInput；本地时间不等于供应商发布时间。"""
     if bars.empty:
         return
     if "data_source" not in bars or bars["data_source"].isna().any() or bars["data_source"].astype(str).str.strip().eq("").any():
@@ -468,6 +470,7 @@ def _validate_bar_provenance(
 
 
 def _normalize_universe(frame: pd.DataFrame, required_dates: list[str]) -> pd.DataFrame:
+    """规范点时成员日期、证券代码和逐日状态，并裁切到所需窗口。参数：frame 为成员表，required_dates 为 21 日日期列表。返回：窗口内唯一证券日表。异常：状态字段不完整、含未来状态或重复证券日时阻断；缺少成员行后续按未知处理。"""
     required = {"trade_date", "symbol", "pool_status"}
     if not required.issubset(frame.columns):
         raise _BlockedInput("点时成员文件缺少 trade_date、symbol、pool_status")
@@ -493,6 +496,7 @@ def _normalize_universe(frame: pd.DataFrame, required_dates: list[str]) -> pd.Da
 
 
 def _identity_events_in_window(frame: pd.DataFrame, symbols: set[str], dates: list[str]) -> list[dict[str, str]]:
+    """筛选影响固定池且生效日在观察窗口内的证券身份事件。参数：frame 为规范事件表，symbols 为研究代码集合，dates 为窗口日期。返回：事件 ID、旧新代码和生效日期列表。空表仅说明未提供记录，不证明没有身份变更。"""
     if frame.empty:
         return []
     start, end = dates[0], dates[-1]
@@ -515,6 +519,7 @@ def _audit_common_candidates(
     bars: pd.DataFrame, universe: pd.DataFrame, required_sessions: list[date], signal_day: date,
     *, identity_events: list[dict[str, str]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    """对固定池每只证券逐日检查共同资格、行情完整性、状态、价格和身份事件。参数：bars/universe 为冻结行情与点时成员，required_sessions 为窗口，signal_day 为信号日，identity_events 为相关事件。返回：逐证券审计记录和共同可排名代码。异常：重复成员键等结构错误时阻断；未知不静默当作合格。"""
     required_text = [item.isoformat() for item in required_sessions]
     universe_idx = universe.set_index(["symbol", "trade_date"], drop=False) if not universe.empty else None
     if universe_idx is not None and universe_idx.index.duplicated().any():
@@ -704,6 +709,7 @@ def _audit_common_candidates(
 
 
 def _rank(bars: pd.DataFrame, signal_day: date, config: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按给定策略配置在信号日计算并排序动量。参数：bars 为窗口行情，signal_day 为信号日，config 为候选配置。返回：规范排名 DataFrame。价格口径由配置及已验证来源适配器决定；输入不足时由策略函数拒绝。"""
     feature = add_momentum(
         bars.drop(columns=[name for name in ("available_at_utc", "retrieved_at_utc_parsed") if name in bars]),
         int(config["strategy"]["lookback_sessions"]), normalized=True,
@@ -730,6 +736,7 @@ def _rank(bars: pd.DataFrame, signal_day: date, config: dict[str, Any]) -> tuple
 
 
 def _build_rank_difference(baseline: pd.DataFrame, candidate: pd.DataFrame) -> list[dict[str, Any]]:
+    """将基线与候选排名按证券对齐并计算名次差异。参数：baseline/candidate 为两组排名表。返回：逐证券差异行；缺席代码保留为无名次状态。"""
     left = baseline.rename(columns={
         "momentum": "momentum_20d", "rank": "rank_20d",
         "in_candidate_list": "candidate_eligible_20d", "in_top5": "in_top5_20d",
@@ -756,8 +763,10 @@ def _build_rank_difference(baseline: pd.DataFrame, candidate: pd.DataFrame) -> l
 
 
 def _config_diff(left: dict[str, Any], right: dict[str, Any]) -> list[dict[str, Any]]:
+    """递归比较两份配置并生成变化路径。参数：left/right 为基线及候选配置。返回：路径和值三元组列表；供单变量断言使用。"""
     differences: list[dict[str, Any]] = []
     def visit(a: Any, b: Any, prefix: str = "") -> None:
+        """递归比较嵌套配置对象。参数：a/b 为左右值，prefix 为当前配置路径。副作用：向闭包中的差异列表追加结果；列表/字典路径按键递归。"""
         if isinstance(a, dict) and isinstance(b, dict):
             for key in sorted(set(a) | set(b)):
                 visit(a.get(key), b.get(key), f"{prefix}.{key}" if prefix else key)
@@ -768,6 +777,7 @@ def _config_diff(left: dict[str, Any], right: dict[str, Any]) -> list[dict[str, 
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    """从文件读取 JSON 对象。参数：path 为文件路径。返回：解析结果。异常：文件不可读或 JSON 无效时由底层异常抛出。"""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -778,6 +788,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _validate_inputs_unchanged(paths: dict[str, Path], initial: dict[str, str | None]) -> None:
+    """确认计算期间输入文件摘要没有变化。参数：paths 为输入路径映射，initial 为开始时记录的哈希。返回：通过时 None。异常：缺失或文件被改写时抛 _BlockedInput。"""
     current = {key: _sha(path) if path.is_file() else None for key, path in paths.items()}
     changed = [key for key in paths if current[key] != initial[key]]
     if changed:
@@ -785,14 +796,17 @@ def _validate_inputs_unchanged(paths: dict[str, Path], initial: dict[str, str | 
 
 
 def _write_csv(rows: list[dict[str, Any]], columns: list[str], path: Path) -> None:
+    """把记录按指定列顺序写成 CSV。参数：rows 为数据记录，columns 固定输出字段顺序，path 为目标文件。副作用：创建/覆盖运行目录文件。"""
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False, lineterminator="\n")
 
 
 def _write_json(value: object, path: Path) -> None:
+    """将对象写入可读 JSON。参数：value 为可序列化对象，path 为目标文件。副作用：写入运行目录文件。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def _sha(path: Path) -> str:
+    """流式计算文件 SHA-256。参数：path 为待校验文件。返回：小写十六进制摘要。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -801,10 +815,12 @@ def _sha(path: Path) -> str:
 
 
 def _valid_sha256(value: str) -> bool:
+    """检查字符串是否为 64 位十六进制 SHA-256。参数：value 为摘要文本。返回：格式正确与否；不验证该摘要对应的文件内容。"""
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
 def _parse_aware(value: Any, field: str) -> datetime:
+    """解析带时区时间文本。参数：value 为时间值，field 用于错误定位。返回：带时区 datetime。异常：缺失或无时区时抛 ValueError。"""
     if value is None or not str(value).strip():
         raise _BlockedInput(f"采集清单缺少 {field}")
     try:
@@ -817,16 +833,19 @@ def _parse_aware(value: Any, field: str) -> datetime:
 
 
 def _as_utc(value: datetime) -> datetime:
+    """要求 datetime 带时区并转换为 UTC。参数：value 为输入时间。返回：UTC datetime；无时区时拒绝。"""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("now_utc 必须带时区")
     return value.astimezone(timezone.utc)
 
 
 def _iso_utc(value: datetime) -> str:
+    """序列化时区时间为 Z 后缀 UTC 字符串。参数：value 为 datetime。返回：ISO 时间文本。"""
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _git_revision() -> str | None:
+    """读取当前 Git HEAD 提交号。返回：提交哈希；命令失败时返回 None。副作用：只读 Git 查询。"""
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
@@ -834,6 +853,7 @@ def _git_revision() -> str | None:
 
 
 def _git_dirty() -> bool | None:
+    """读取工作区是否有未提交变化。返回：布尔值或未知 None。副作用：只读 Git 查询。"""
     try:
         return bool(subprocess.check_output(["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True).strip())
     except Exception:
@@ -841,6 +861,7 @@ def _git_dirty() -> bool | None:
 
 
 def _code_sha256() -> dict[str, str]:
+    """为本实验登记的代码文件计算摘要。返回：按路径组织的 SHA-256 清单；文件无法读取时按实现返回/抛出失败。"""
     repo = Path(__file__).resolve().parents[3]
     sources = (
         "src/cehuan/research/lookback_pair.py",

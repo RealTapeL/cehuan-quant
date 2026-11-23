@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, read-only one-symbol AKShare minute probe; artifacts stay under data/private."""
+"""对单个标的执行有界、只读的 AKShare 分钟数据探测；原始响应和结果只写入私有数据目录。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
+    """执行一次有界分钟行情探测并保存请求与响应摘要；不将探测结果并入正式行情快照。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", required=True, help="规范代码，例如 SH600000")
     parser.add_argument("--trade-date", required=True, help="单个交易日 YYYY-MM-DD")

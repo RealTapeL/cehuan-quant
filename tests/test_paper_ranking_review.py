@@ -1,3 +1,5 @@
+"""策环测试模块：验证纸面排名模型复盘的事实重建、解释校验和边界约束。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -20,10 +22,12 @@ from cehuan.research.paper_ranking_review import (
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write(path: Path, value: object) -> None:
+    """私有测试辅助函数，用于写入。 参数：`path`：路径场景输入；`value`：值场景输入。 返回：None，供调用处构造夹具或断言复用。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(value, pd.DataFrame):
         value.to_csv(path, index=False)
@@ -34,6 +38,7 @@ def _write(path: Path, value: object) -> None:
 
 
 def _sealed_fixture(root: Path, *, h1_changed: bool = False) -> tuple[Path, Path]:
+    """私有测试辅助函数，用于已封存夹具。 参数：`root`：代码标识“root”（含义待核实）场景输入；`h1_changed`：H1变更场景输入。 返回：tuple[Path, Path]，供调用处构造夹具或断言复用。"""
     run_dir = root / "rankings" / "paper-fixture"
     inputs = root / "inputs"
     pool_dir = inputs / "pool"
@@ -155,6 +160,7 @@ def _sealed_fixture(root: Path, *, h1_changed: bool = False) -> tuple[Path, Path
 
 
 def _valid_review(facts: dict) -> dict:
+    """私有测试辅助函数，用于有效复核。 参数：`facts`：事实场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     symbols = [row["symbol"] for row in facts["ranking"]["original_top5"]]
     return {
         "schema": "cehuan.paper_ranking_review.v1",
@@ -187,6 +193,7 @@ def _valid_review(facts: dict) -> dict:
 
 
 def test_build_facts_verifies_sealed_rankings_and_distinguishes_window_and_top_n(tmp_path: Path) -> None:
+    """验证构建事实核验已封存排名与区分窗口与前列数量。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
 
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
@@ -198,6 +205,7 @@ def test_build_facts_verifies_sealed_rankings_and_distinguishes_window_and_top_n
 
 
 def test_build_facts_and_review_support_h1_exclusion_and_top_n_replacement(tmp_path: Path) -> None:
+    """验证构建事实与复核支持H1排除与前列数量替代。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path, h1_changed=True)
 
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
@@ -219,6 +227,7 @@ def test_build_facts_and_review_support_h1_exclusion_and_top_n_replacement(tmp_p
 
 
 def test_build_facts_rejects_changed_ranking_bytes(tmp_path: Path) -> None:
+    """验证构建事实拒绝变更排名字节。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     with (run_dir / "h1-ranking.csv").open("a", encoding="utf-8") as handle:
         handle.write(" ")
@@ -228,6 +237,7 @@ def test_build_facts_rejects_changed_ranking_bytes(tmp_path: Path) -> None:
 
 
 def test_review_response_accepts_consistent_synthetic_response(tmp_path: Path) -> None:
+    """验证复核响应接受一致合成响应。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
 
@@ -237,6 +247,7 @@ def test_review_response_accepts_consistent_synthetic_response(tmp_path: Path) -
 
 
 def test_review_response_accepts_equivalent_no_suspension_explanation(tmp_path: Path) -> None:
+    """验证复核响应接受等价没有停牌解释。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -253,6 +264,7 @@ def test_review_response_accepts_equivalent_no_suspension_explanation(tmp_path: 
 
 
 def test_review_response_accepts_equivalent_exclusion_wording(tmp_path: Path) -> None:
+    """验证复核响应接受等价排除措辞。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -268,6 +280,7 @@ def test_review_response_accepts_equivalent_exclusion_wording(tmp_path: Path) ->
 
 
 def test_review_response_error_identifies_missing_direct_reason(tmp_path: Path) -> None:
+    """验证复核响应错误指出缺失直接原因。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -282,6 +295,7 @@ def test_review_response_error_identifies_missing_direct_reason(tmp_path: Path) 
 
 
 def test_review_response_rejects_unchanged_claim_without_direct_reason(tmp_path: Path) -> None:
+    """验证复核响应拒绝未变化声明缺少直接原因。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -296,6 +310,7 @@ def test_review_response_rejects_unchanged_claim_without_direct_reason(tmp_path:
 
 
 def test_rejected_model_report_states_that_request_was_sent(tmp_path: Path) -> None:
+    """验证拒绝模型报告状态该请求发送。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     audit = {
@@ -323,6 +338,7 @@ def test_rejected_model_report_states_that_request_was_sent(tmp_path: Path) -> N
     ("evidence_fact_ids", ["RANKING_ORIGINAL"], "UNKNOWN_OR_MISSING_EVIDENCE_ID"),
 ])
 def test_review_response_rejects_fact_or_boundary_conflict(tmp_path: Path, field: str, value: object, code: str) -> None:
+    """验证复核响应拒绝事实或边界冲突。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`field`：字段场景输入；`value`：值场景输入；`code`：代码场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -334,6 +350,7 @@ def test_review_response_rejects_fact_or_boundary_conflict(tmp_path: Path, field
 
 
 def test_review_response_rejects_unknown_security_and_actionable_trade_language(tmp_path: Path) -> None:
+    """验证复核响应拒绝未知证券与可执行交易语言。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -345,6 +362,7 @@ def test_review_response_rejects_unknown_security_and_actionable_trade_language(
 
 
 def test_review_response_rejects_positive_performance_claim(tmp_path: Path) -> None:
+    """验证复核响应拒绝正向表现声明。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -356,6 +374,7 @@ def test_review_response_rejects_positive_performance_claim(tmp_path: Path) -> N
 
 
 def test_review_response_rejects_prompt_placeholder_copy(tmp_path: Path) -> None:
+    """验证复核响应拒绝提示词占位符照搬。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     payload = _valid_review(facts)
@@ -367,6 +386,7 @@ def test_review_response_rejects_prompt_placeholder_copy(tmp_path: Path) -> None
 
 
 def test_llm_mode_without_environment_does_not_fallback_or_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证LLM模式缺少环境不回退或调用。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     for name in ("CEHUAN_LLM_MODEL", "CEHUAN_LLM_BASE_URL", "CEHUAN_LLM_API_KEY"):
         monkeypatch.delenv(name, raising=False)
@@ -388,6 +408,7 @@ def test_llm_mode_without_environment_does_not_fallback_or_call(tmp_path: Path, 
 
 
 def test_review_prompt_requires_explicit_no_exclusion_reason_only_when_true(tmp_path: Path) -> None:
+    """验证复核提示词要求明确没有排除原因仅当真实。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, capture_path = _sealed_fixture(tmp_path)
     facts = build_paper_ranking_facts(ranking_dir=run_dir, capture_manifest_path=capture_path)
     prompt = build_review_prompt(facts)

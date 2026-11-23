@@ -1,8 +1,4 @@
-"""Build a small, hash-bound research summary from existing local A-share audits.
-
-Only whitelisted aggregate facts and a few reconstructed ranking observations are
-returned. Raw market bars and broker/account data are never put in the LLM input.
-"""
+"""真实行情研究摘要生成器。模块从现有本地快照及审计产物提取脱敏聚合事实，记录来源文件哈希并生成供研究 Agent 使用的白名单；不向模型发送原始行情行或账户文件。"""
 
 from __future__ import annotations
 
@@ -51,6 +47,7 @@ MARKET_RULE_COLUMNS = (
 
 
 def sha256_file(path: Path) -> str:
+    """流式计算本地文件 SHA-256。参数：path 为输入文件。返回：小写摘要；文件不可读时抛出文件系统异常。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -59,11 +56,13 @@ def sha256_file(path: Path) -> str:
 
 
 def _resolve(path: str | Path) -> Path:
+    """将相对路径相对于仓库根目录解析。参数：path 为用户/配置路径。返回：绝对 Path。"""
     candidate = Path(path).expanduser()
     return (candidate if candidate.is_absolute() else REPO_ROOT / candidate).resolve()
 
 
 def _relative(path: Path) -> str:
+    """将来源路径转为仓库内相对路径。参数：path 为绝对 Path。返回：POSIX 相对路径。异常：路径不在项目内时拒绝，避免摘要引用仓库外私有路径。"""
     try:
         return path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
@@ -71,6 +70,7 @@ def _relative(path: Path) -> str:
 
 
 def _json(path: Path) -> dict[str, Any]:
+    """读取顶层为对象的 UTF-8 JSON。参数：path 为来源文件。返回：字典。异常：JSON 顶层不是对象时抛 ValueError。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"研究来源 JSON 顶层必须是对象：{_relative(path)}")
@@ -78,6 +78,7 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 def _record_source(sources: list[dict[str, Any]], source_id: str, path: Path, role: str, status: str) -> str:
+    """验证来源文件存在并将角色、路径、状态和哈希加入来源清单。参数：sources 为累积列表，source_id/role/status 描述用途，path 为输入。返回：SHA-256。异常：文件缺失时抛 FileNotFoundError。"""
     if not path.is_file():
         raise FileNotFoundError(f"真实研究所需输入不存在：{_relative(path)}")
     digest = sha256_file(path)
@@ -92,6 +93,7 @@ def _record_source(sources: list[dict[str, Any]], source_id: str, path: Path, ro
 
 
 def _scan_bars(path: Path) -> dict[str, Any]:
+    """分块扫描规范行情并计算覆盖、重复、状态、价格及规则缺失摘要。参数：path 为行情 CSV。返回：聚合统计和有限候选窗口重建事实；不把缺少公司行动记录解释成无事件，也不把适配器时间解释为供应商发布时间。异常：必需字段缺失或文件为空时阻断。"""
     columns = list(REQUIRED_BAR_COLUMNS)
     symbol_dates: set[tuple[str, str]] = set()
     dates: set[str] = set()
@@ -193,6 +195,7 @@ def _scan_bars(path: Path) -> dict[str, Any]:
 
 
 def _rank_summary(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """读取事后重建的候选排名并提取逐信号日 Top 3。参数：path 为排名 CSV。返回：排名覆盖摘要和观察列表；明确标记 POST_HOC_RECONSTRUCTED。"""
     ranks = pd.read_csv(path, low_memory=False)
     missing = REQUIRED_RANK_COLUMNS - set(ranks.columns)
     if missing:
@@ -239,7 +242,7 @@ def build_real_market_summary(
     candidate_ranks_path: str | Path = DEFAULT_RANKS,
     summary_id: str,
 ) -> dict[str, Any]:
-    """Create a real-data fact pack without rerunning a backtest or sending raw rows."""
+    """从指定快照、审计和回测摘要文件构建真实市场事实包。参数：各路径指向已有行情、质量、股票池、配置、交易审计和候选排名，summary_id 标识本次摘要。返回：脱敏结构化摘要及来源哈希。副作用：只读输入；不运行排名/回测、不发送模型请求。异常：必需列、文件或审计结构不匹配时阻断。"""
     paths = {
         "bars": _resolve(bars_path),
         "snapshot_manifest": _resolve(snapshot_manifest_path),
@@ -469,6 +472,7 @@ def build_real_market_summary(
 
 
 def write_real_market_summary(summary: dict[str, Any], output_dir: str | Path) -> tuple[Path, Path]:
+    """将结构化摘要写入 outputs/ 下新建目录，并生成 JSON 与中文 Markdown。参数：summary 为摘要对象，output_dir 为目标目录。返回：两个产物路径。副作用：创建目录且拒绝覆盖；非 Git 忽略 outputs 路径时拒绝写入。"""
     output = _resolve(output_dir)
     ignored_root = (REPO_ROOT / "outputs").resolve()
     try:

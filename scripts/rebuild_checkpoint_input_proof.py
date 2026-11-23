@@ -1,3 +1,5 @@
+"""使用项目适配器重建 checkpoint 输入证明并输出审计产物；不会修改 checkpoint 或启动续跑。"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _path(value: str | None) -> Path | None:
+    """规范化命令行给出的输入路径；空值或路径问题由入口校验处理。"""
     if value is None:
         return None
     path = Path(value).expanduser()
@@ -22,6 +25,7 @@ def _path(value: str | None) -> Path | None:
 
 
 def _atomic_json(path: Path, value: dict) -> bytes:
+    """以临时文件加原子替换方式写入 JSON 审计产物，避免覆盖出半成品。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -41,6 +45,7 @@ def _atomic_json(path: Path, value: dict) -> bytes:
 
 
 def main() -> int:
+    """调用共享输入证明重建器核验 checkpoint 与实际输入；只写新报告，不续跑回测。"""
     parser = argparse.ArgumentParser(
         description="使用策环现有适配器重建 checkpoint 输入证明；只读，不运行回测或改写 checkpoint",
     )

@@ -1,3 +1,5 @@
+"""策环测试模块：验证 checkpoint 增量输入预检对历史更正、未来追加和来源时点的分类。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -18,6 +20,7 @@ SHA = "a" * 64
 
 
 def _seal(row: dict, content: dict) -> dict:
+    """私有测试辅助函数，用于封存。 参数：`row`：行场景输入；`content`：内容场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     row["canonical_content"] = content
     encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     row["content_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -25,10 +28,12 @@ def _seal(row: dict, content: dict) -> dict:
 
 
 def _audit(baseline: dict, candidate: dict) -> dict:
+    """私有测试辅助函数，用于审计。 参数：`baseline`：基线场景输入；`candidate`：候选场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     return audit_incremental_inputs(baseline, candidate)
 
 
 def _proof() -> dict:
+    """私有测试辅助函数，用于证明。 返回：dict，供调用处构造夹具或断言复用。"""
     known_event = _seal({
         "event_id": "known-event",
         "first_impact_date": "2025-01-10",
@@ -107,6 +112,7 @@ def _proof() -> dict:
 
 
 def _add_event(proof: dict, *, impact: str = "2025-01-15", known_at: str = "2025-01-13T08:01:00Z") -> None:
+    """私有测试辅助函数，用于新增事件。 参数：`proof`：证明场景输入；`impact`：代码标识“impact”（含义待核实）场景输入；`known_at`：已知于场景输入。 返回：None，供调用处构造夹具或断言复用。"""
     row = {
         "event_id": "new-event",
         "first_impact_date": impact,
@@ -123,10 +129,12 @@ def _add_event(proof: dict, *, impact: str = "2025-01-15", known_at: str = "2025
 
 
 def _blocker_codes(report: dict) -> set[str]:
+    """私有测试辅助函数，用于阻断项代码。 参数：`report`：报告场景输入。 返回：set[str]，供调用处构造夹具或断言复用。"""
     return {row["code"] for row in report["blockers"]}
 
 
 def test_future_event_first_available_after_cutoff_is_candidate_only_not_engine_resume():
+    """验证未来事件首次可用之后截止候选仅不引擎续跑。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     _add_event(candidate)
@@ -143,6 +151,7 @@ def test_future_event_first_available_after_cutoff_is_candidate_only_not_engine_
 
 
 def test_missing_checkpoint_input_hashes_are_reported_unverified_not_treated_as_match():
+    """验证缺失检查点输入哈希报告未不视为为匹配。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     del baseline["checkpoint"]["input_hashes"]
 
@@ -155,6 +164,7 @@ def test_missing_checkpoint_input_hashes_are_reported_unverified_not_treated_as_
 
 
 def test_new_event_discovered_after_cutoff_but_affecting_history_requires_recompute():
+    """验证新事件发现之后截止但影响历史要求重新计算。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     _add_event(candidate, impact="2025-01-12")
@@ -167,6 +177,7 @@ def test_new_event_discovered_after_cutoff_but_affecting_history_requires_recomp
 
 
 def test_correction_to_already_used_event_requires_recompute():
+    """验证更正到已经使用事件要求重新计算。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"]["events"][0]["content_sha256"] = "d" * 64
@@ -187,6 +198,7 @@ def test_correction_to_already_used_event_requires_recompute():
     ],
 )
 def test_event_metadata_changes_cannot_hide_behind_old_content_hash(field: str, value: str):
+    """验证事件元数据变化不能隐藏隐藏在旧内容哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`field`：字段场景输入；`value`：值场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"]["events"][0][field] = value
@@ -199,6 +211,7 @@ def test_event_metadata_changes_cannot_hide_behind_old_content_hash(field: str, 
 
 
 def test_event_canonical_content_edit_with_stale_hash_is_rejected():
+    """验证事件规范化内容修改带有过期哈希拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"]["events"][0]["canonical_content"]["gross_per_share_cny"] = "0.2"
@@ -210,6 +223,7 @@ def test_event_canonical_content_edit_with_stale_hash_is_rejected():
 
 
 def test_missing_canonical_payload_is_explicitly_unverified():
+    """验证缺失规范化载荷明确地未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     del candidate["inputs"]["events"][0]["canonical_content"]
@@ -230,6 +244,7 @@ def test_missing_canonical_payload_is_explicitly_unverified():
     ],
 )
 def test_semantic_row_field_cannot_change_outside_canonical_content(family, field, value):
+    """验证语义行字段不能变更范围外规范化内容。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`family`：类型场景输入；`field`：字段场景输入；`value`：值场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"][family][0][field] = value
@@ -250,6 +265,7 @@ def test_semantic_row_field_cannot_change_outside_canonical_content(family, fiel
     ],
 )
 def test_intraday_event_order_uses_explicit_utc_cutoff(known_at: str, is_compatible: bool):
+    """验证盘中事件订单使用明确UTC截止。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`known_at`：已知于场景输入；`is_compatible`：兼容场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     _add_event(candidate, known_at=known_at)
@@ -261,6 +277,7 @@ def test_intraday_event_order_uses_explicit_utc_cutoff(known_at: str, is_compati
 
 
 def test_date_only_event_availability_is_unproven_and_rejected():
+    """验证日期仅事件可用性未经证明与拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     _add_event(candidate, known_at="2025-01-13")
@@ -274,6 +291,7 @@ def test_date_only_event_availability_is_unproven_and_rejected():
 
 
 def test_baseline_event_without_known_at_provenance_cannot_be_used_for_incremental_claim():
+    """验证基线事件缺少已知于来源链不能使用针对增量声明。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     del baseline["inputs"]["events"][0]["known_at_utc"]
 
@@ -285,6 +303,7 @@ def test_baseline_event_without_known_at_provenance_cannot_be_used_for_increment
 
 
 def test_calendar_candidate_next_session_is_recomputed_and_order_independent():
+    """验证日历候选下一条交易日重新计算与订单独立。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     baseline["checkpoint"]["as_of_date"] = "2025-01-10"
     baseline["checkpoint"]["next_expected_session"] = "2025-01-13"
@@ -329,6 +348,7 @@ def test_calendar_candidate_next_session_is_recomputed_and_order_independent():
 
 
 def test_future_calendar_append_and_historical_status_change_are_distinguished():
+    """验证未来日历追加与历史状态变更区分。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     appended = deepcopy(baseline)
     appended["inputs"]["calendar"].append({"date": "2025-01-15", "is_open": True})
@@ -343,6 +363,7 @@ def test_future_calendar_append_and_historical_status_change_are_distinguished()
 
 @pytest.mark.parametrize("family", ["rules", "fees"])
 def test_schedule_effective_date_change_cannot_hide_behind_old_hash(family: str):
+    """验证调度生效日期变更不能隐藏隐藏在旧哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`family`：类型场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"][family][0]["valid_from"] = "2025-01-02"
@@ -364,6 +385,7 @@ def test_schedule_effective_date_change_cannot_hide_behind_old_hash(family: str)
     ],
 )
 def test_schedule_source_and_availability_changes_cannot_hide_behind_old_hash(family, field, value):
+    """验证调度来源与可用性变化不能隐藏隐藏在旧哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`family`：类型场景输入；`field`：字段场景输入；`value`：值场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"][family][0][field] = value
@@ -376,6 +398,7 @@ def test_schedule_source_and_availability_changes_cannot_hide_behind_old_hash(fa
 
 
 def test_future_rule_append_requires_known_at_and_source_evidence():
+    """验证未来规则追加要求已知于与来源证据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"]["rules"].append(_seal({
@@ -406,6 +429,7 @@ def test_future_rule_append_requires_known_at_and_source_evidence():
 
 
 def test_historical_fee_edit_is_rejected():
+    """验证历史费用修改拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     candidate = deepcopy(baseline)
     candidate["inputs"]["fees"][0]["content_sha256"] = "f" * 64
@@ -417,6 +441,7 @@ def test_historical_fee_edit_is_rejected():
 
 
 def test_repeated_increment_id_is_reported_and_invalid_proofs_are_rejected():
+    """验证重复增量编号报告与无效证明拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = _proof()
     baseline["checkpoint"]["applied_increment_ids"] = [baseline["increment_id"]]
     report = _audit(baseline, deepcopy(baseline))
@@ -441,6 +466,7 @@ def test_repeated_increment_id_is_reported_and_invalid_proofs_are_rejected():
 
 
 def test_incremental_audit_cli_binds_the_proof_to_a_verified_checkpoint(tmp_path, monkeypatch):
+    """验证增量审计CLI绑定证明到已检查点。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "audit_checkpoint_incremental_inputs.py"
     spec = importlib.util.spec_from_file_location("incremental_audit_cli_test", script_path)
     assert spec is not None and spec.loader is not None
@@ -512,6 +538,7 @@ def test_incremental_audit_cli_binds_the_proof_to_a_verified_checkpoint(tmp_path
 
 
 def test_actual_source_artifact_hashes_are_recomputed_but_semantic_link_stays_unverified(tmp_path):
+    """验证实际来源产物哈希重新计算但语义关联保持未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "audit_checkpoint_incremental_inputs.py"
     spec = importlib.util.spec_from_file_location("incremental_artifact_audit_test", script_path)
     assert spec is not None and spec.loader is not None
@@ -520,6 +547,7 @@ def test_actual_source_artifact_hashes_are_recomputed_but_semantic_link_stays_un
     proof = _proof()
 
     def write_artifact(name: str, payload: bytes) -> dict[str, str]:
+        """实现测试替身test_actual_source_artifact_hashes_are_recomputed_but_semantic_link_stays_unverified的写入产物行为；用于控制被测代码与断言，不访问真实服务。 参数：`name`：名称场景输入；`payload`：载荷场景输入。 返回：dict[str, str]，供调用处构造夹具或断言复用。"""
         path = tmp_path / name
         path.write_bytes(payload)
         return {"path": str(path), "sha256": hashlib.sha256(payload).hexdigest()}

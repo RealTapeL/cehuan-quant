@@ -1,3 +1,5 @@
+"""策环测试模块：验证信号、候选计划、回测约束、数据时间边界与研究安全门控。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -28,6 +30,7 @@ from cehuan.signals.strategy import add_momentum
 
 
 def bars(days: int = 16, locked_buy_day: int | None = None, st_unknown: bool = False) -> pd.DataFrame:
+    """测试辅助函数，用于行情。 参数：`days`：日期场景输入；`locked_buy_day`：锁定买入日场景输入；`st_unknown`：ST状态未知场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     rows = []
     start = date(2025, 1, 1)
     for symbol, drift, initial in [("SIM001", 0.25, 10.0), ("SIM002", -0.05, 30.0)]:
@@ -71,6 +74,7 @@ def bars(days: int = 16, locked_buy_day: int | None = None, st_unknown: bool = F
 
 
 def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
+    """验证收盘信号最早只能在下一交易日开盘执行。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     result = run_backtest(bars(), 100_000, config)
@@ -91,6 +95,7 @@ def test_signal_is_executed_no_earlier_than_next_session_open() -> None:
 
 
 def test_h1_filter_changes_only_candidate_selection_and_does_not_lock_held_position_sells() -> None:
+    """验证 H1 只改变新候选筛选；已有持仓卖出仍独立检查，不会被 H1 锁住。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars(18)
@@ -166,6 +171,7 @@ def test_h1_excluded_existing_target_uses_independent_sell_status_gate(
     sell_status: object,
     expected_reason: str,
 ) -> None:
+    """验证H1排除已有目标使用独立卖出状态门控。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`sell_status`：卖出状态场景输入；`expected_reason`：预期原因场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars(18)
@@ -210,6 +216,7 @@ def test_h1_excluded_existing_target_uses_independent_sell_status_gate(
 
 
 def test_h1_filter_excludes_unknown_suspension_without_treating_it_as_normal() -> None:
+    """验证 H1 将停牌状态未知的证券排除在新买候选之外，不把未知当作未停牌。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.research.hypothesis_prototypes import filter_h1_candidate_pool
 
     data = bars(12)
@@ -236,6 +243,7 @@ def test_h1_filter_excludes_unknown_suspension_without_treating_it_as_normal() -
 
 
 def test_h1_filter_does_not_treat_missing_or_duplicate_bars_as_unsuspended() -> None:
+    """验证行情缺失或重复时，H1 不把证券当作已确认未停牌。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.research.hypothesis_prototypes import filter_h1_candidate_pool
 
     data = bars(12)
@@ -269,6 +277,7 @@ def test_h1_filter_does_not_treat_missing_or_duplicate_bars_as_unsuspended() -> 
 
 
 def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events():
+    """验证没有公司行动时，影子账本的现金、股数和逐日净值与旧账务路径一致。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars()
@@ -291,6 +300,7 @@ def test_ledger_shadow_matches_legacy_cash_shares_and_daily_nav_without_events()
 
 
 def test_ledger_shadow_rejects_events_and_formal_mode():
+    """验证账本影子拒绝事件与正式模式。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     events = read_security_identity_events()
@@ -313,6 +323,7 @@ def test_ledger_shadow_rejects_events_and_formal_mode():
 
 
 def test_ledger_v2_uses_accounting_ledger_as_state_source_for_research_fills():
+    """验证账本v2使用账务账本为状态来源针对研究成交。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars()
@@ -343,6 +354,7 @@ def test_ledger_v2_uses_accounting_ledger_as_state_source_for_research_fills():
 
 
 def test_ledger_v2_stops_on_missing_held_price_unless_stale_age_is_configured():
+    """验证账本v2停止在缺失已持有价格除非过期时长已配置。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars()
@@ -364,6 +376,7 @@ def test_ledger_v2_stops_on_missing_held_price_unless_stale_age_is_configured():
 
 
 def test_backtest_reports_ordered_development_validation_test_periods() -> None:
+    """验证回测报告有序开发校验区间。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     result = run_backtest(bars(40), 100_000, config)
@@ -376,6 +389,7 @@ def test_backtest_reports_ordered_development_validation_test_periods() -> None:
 
 
 def test_backtest_uses_independent_configured_index_benchmark():
+    """验证回测使用独立已配置索引基准。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["benchmark"]["symbol"] = "SH000300"
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
@@ -408,6 +422,7 @@ def test_backtest_uses_independent_configured_index_benchmark():
 
 @pytest.mark.parametrize("drop_position", [5, -1], ids=["middle-session", "last-session"])
 def test_backtest_rejects_missing_configured_benchmark_session(drop_position):
+    """验证回测拒绝缺失已配置基准交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`drop_position`：代码标识“drop”（含义待核实）持仓场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["benchmark"]["symbol"] = "SH000300"
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
@@ -427,6 +442,7 @@ def test_backtest_rejects_missing_configured_benchmark_session(drop_position):
 
 
 def test_existing_st_position_can_be_exited_but_is_not_a_new_buy_candidate():
+    """验证已有ST状态持仓可以退出但不新买入候选。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars(16)
@@ -448,6 +464,7 @@ def test_existing_st_position_can_be_exited_but_is_not_a_new_buy_candidate():
 
 
 def test_backtest_sells_existing_holding_after_it_becomes_st():
+    """验证回测卖出已有持仓之后其变为ST状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     data = bars(16)
@@ -464,6 +481,7 @@ def test_backtest_sells_existing_holding_after_it_becomes_st():
 
 
 def _code_change_bars(days: int = 20, event_index: int = 6) -> pd.DataFrame:
+    """私有测试辅助函数，用于代码变更行情。 参数：`days`：日期场景输入；`event_index`：事件索引场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     data = bars(days)
     rows = data.loc[data["symbol"] == "SIM001"].copy().sort_values("trade_date")
     dates = rows["trade_date"].tolist()
@@ -484,6 +502,7 @@ def _code_change_bars(days: int = 20, event_index: int = 6) -> pd.DataFrame:
 
 
 def test_backtest_migrates_holding_without_trade_or_fee_and_sells_successor_after_fresh_signal():
+    """验证回测迁移持仓缺少交易或费用与卖出承继代码之后新鲜信号。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({
         "lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1,
@@ -525,6 +544,7 @@ def test_backtest_migrates_holding_without_trade_or_fee_and_sells_successor_afte
 
 
 def test_backtest_records_no_position_for_registered_event_without_fake_order():
+    """验证回测记录没有持仓针对已登记事件缺少模拟订单。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 20, "max_positions": 1})
     events = pd.DataFrame([{
@@ -547,6 +567,7 @@ def test_backtest_records_no_position_for_registered_event_without_fake_order():
 
 
 def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
+    """验证回测报告固定规则滚动窗口诊断。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 3, "max_positions": 1})
     config["backtest"].update({"rolling_window_sessions": 10, "rolling_step_sessions": 5})
@@ -561,6 +582,7 @@ def test_backtest_reports_fixed_rule_rolling_window_diagnostics() -> None:
 
 
 def test_locked_limit_up_open_blocks_buy() -> None:
+    """验证锁定涨跌停上涨开盘阻断买入。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "rebalance_sessions": 20, "max_positions": 1})
     result = run_backtest(bars(locked_buy_day=4), 100_000, config)
@@ -570,6 +592,7 @@ def test_locked_limit_up_open_blocks_buy() -> None:
 
 
 def test_unknown_st_status_requires_manual_verification() -> None:
+    """验证未知ST状态状态要求人工核验。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     plan = generate_plan(bars(st_unknown=True), 100_000, config, purpose="SYNTHETIC_DIAGNOSTIC")
@@ -579,6 +602,7 @@ def test_unknown_st_status_requires_manual_verification() -> None:
 
 
 def test_unknown_market_order_rules_require_manual_verification() -> None:
+    """验证未知市场订单规则要求人工核验。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
@@ -591,6 +615,7 @@ def test_unknown_market_order_rules_require_manual_verification() -> None:
 
 
 def test_plan_cannot_disable_point_in_time_rule_checks() -> None:
+    """验证计划不能禁用时点在时间规则检查。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     config["market"]["require_point_in_time_status"] = False
@@ -603,6 +628,7 @@ def test_plan_cannot_disable_point_in_time_rule_checks() -> None:
 
 
 def test_plan_respects_board_specific_minimum_and_increment() -> None:
+    """验证计划遵守板块特定最小与增量。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
@@ -618,6 +644,7 @@ def test_plan_respects_board_specific_minimum_and_increment() -> None:
 
 
 def test_qlib_momentum_feature_uses_instrument_history_and_date_rank() -> None:
+    """验证Qlib动量特征使用证券历史与日期排序。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     dates = pd.date_range("2025-01-01", periods=3)
     index = pd.MultiIndex.from_product(
         [dates, ["SH600001", "SZ000001"]], names=["datetime", "instrument"]
@@ -630,6 +657,7 @@ def test_qlib_momentum_feature_uses_instrument_history_and_date_rank() -> None:
 
 
 def test_qlib_momentum_rejects_price_basis_mixing_inside_lookback_window() -> None:
+    """验证Qlib动量拒绝价格口径混用范围内回看窗口窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     dates = pd.date_range("2025-01-01", periods=4)
     index = pd.MultiIndex.from_product([dates, ["SH600001"]], names=["datetime", "instrument"])
     loaded = pd.DataFrame({
@@ -642,6 +670,7 @@ def test_qlib_momentum_rejects_price_basis_mixing_inside_lookback_window() -> No
 
 
 def test_fill_reconciliation_reports_unfilled_and_vwap_gap() -> None:
+    """验证成交对账报告未成交与成交均价缺口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     plan = pd.DataFrame([{
         "symbol": "SIM001", "action": "BUY", "planned_shares": 200, "reference_price": 10.0,
     }])
@@ -657,6 +686,7 @@ def test_fill_reconciliation_reports_unfilled_and_vwap_gap() -> None:
 
 
 def test_akshare_volume_units_and_unknown_history_flags_are_preserved() -> None:
+    """验证AKShare成交量单位与未知历史标记保留。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([{
         "日期": "2026-09-01", "股票代码": "600519", "开盘": 1295.0,
         "收盘": 1299.56, "最高": 1305.0, "最低": 1290.0,
@@ -676,6 +706,7 @@ def test_akshare_volume_units_and_unknown_history_flags_are_preserved() -> None:
 
 
 def test_tencent_history_normalizes_share_volume_and_distinct_column_names() -> None:
+    """验证腾讯历史规范化股份成交量与不同列名称。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     raw = pd.DataFrame([{
         "date": "2026-10-23", "open": 1311.84, "high": 1343.88,
         "low": 1310.0, "close": 1335.0, "volume": 5_768_600,
@@ -694,6 +725,7 @@ def test_tencent_history_normalizes_share_volume_and_distinct_column_names() -> 
 
 
 def test_partial_adjusted_prices_do_not_mix_with_raw_prices_for_signals() -> None:
+    """验证部分复权价格不混用带有原始价格针对信号。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     data = bars(16)
     data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-08"), "adjusted_close"] = pd.NA
     selected, modes = select_signal_prices(data)
@@ -709,6 +741,7 @@ def test_partial_adjusted_prices_do_not_mix_with_raw_prices_for_signals() -> Non
 
 
 def test_nonempty_malformed_adjusted_price_is_not_treated_as_missing() -> None:
+    """验证非空格式错误复权价格不视为为缺失。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     data = bars(4)
     target = data.index[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-03")][0]
     data["adjusted_close"] = data["adjusted_close"].astype("object")
@@ -719,6 +752,7 @@ def test_nonempty_malformed_adjusted_price_is_not_treated_as_missing() -> None:
 
 
 def test_future_adjustment_missing_row_does_not_change_prior_momentum() -> None:
+    """验证未来复权缺失行不变更之前动量。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     original = bars(16)
     with_momentum = add_momentum(original, 3)
     future = original.iloc[[-2, -1]].copy()
@@ -736,6 +770,7 @@ def test_future_adjustment_missing_row_does_not_change_prior_momentum() -> None:
 
 
 def test_data_quality_rejects_mixed_price_sources_for_one_security() -> None:
+    """验证数据质量拒绝混用价格来源针对一项证券。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     data = bars(4)
     data.loc[data["symbol"] == "SIM001", "data_source"] = "synthetic_source_a"
     data.loc[(data["symbol"] == "SIM001") & (data["trade_date"] == "2025-01-04"), "data_source"] = "synthetic_source_b"
@@ -747,6 +782,7 @@ def test_data_quality_rejects_mixed_price_sources_for_one_security() -> None:
 
 
 def test_calendar_validates_bar_dates_and_resolves_next_open_session() -> None:
+    """验证日历校验行情行日期与解析下一条开盘交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     data = bars(3)
     calendar = pd.DataFrame({
         "cal_date": [20250101, 20250102, 20250103, 20250104, 20250106],
@@ -761,6 +797,7 @@ def test_calendar_validates_bar_dates_and_resolves_next_open_session() -> None:
 
 
 def test_plan_records_next_open_day_and_calendar_source() -> None:
+    """验证计划记录下一条开盘日与日历来源。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars(16)
@@ -777,6 +814,7 @@ def test_plan_records_next_open_day_and_calendar_source() -> None:
 
 
 def test_default_plan_is_research_only_and_has_no_executable_quantity() -> None:
+    """验证默认计划研究仅与有没有可执行数量。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     plan = generate_plan(bars(), 100_000, config)
@@ -789,6 +827,7 @@ def test_default_plan_is_research_only_and_has_no_executable_quantity() -> None:
 
 
 def test_synthetic_diagnostic_plan_rejects_non_synthetic_data() -> None:
+    """验证合成诊断计划拒绝非合成数据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
@@ -798,6 +837,7 @@ def test_synthetic_diagnostic_plan_rejects_non_synthetic_data() -> None:
 
 
 def test_manual_review_blocks_when_formal_readiness_is_missing() -> None:
+    """验证人工复核阻断当正式就绪门控缺失。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     with pytest.raises(PlanReadinessError, match="缺少正式基线 readiness"):
@@ -805,6 +845,7 @@ def test_manual_review_blocks_when_formal_readiness_is_missing() -> None:
 
 
 def test_manual_review_rejects_self_consistent_forged_ready_report_without_real_audit_inputs() -> None:
+    """验证人工复核拒绝自身一致伪造就绪报告缺少真实审计输入。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import hashlib
     import json
 
@@ -858,6 +899,7 @@ def test_manual_review_rejects_self_consistent_forged_ready_report_without_real_
 
 
 def test_plan_rejects_snapshot_fetched_before_close_even_if_plan_runs_after_close() -> None:
+    """验证计划拒绝快照已抓取之前收盘即使若计划运行之后收盘。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
@@ -873,6 +915,7 @@ def test_plan_rejects_snapshot_fetched_before_close_even_if_plan_runs_after_clos
 
 
 def test_a_share_code_forms_are_normalized() -> None:
+    """验证股份代码构成规范化。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     assert canonical_symbol("600519") == "SH600519"
     assert canonical_symbol("000001.SZ") == "SZ000001"
     assert canonical_symbol("830799.BJ") == "BJ830799"
@@ -882,6 +925,7 @@ def test_a_share_code_forms_are_normalized() -> None:
 
 
 def test_huatai_column_alias_mapping_reads_fill_and_position_templates(tmp_path) -> None:
+    """验证华泰列别名映射读取成交与持仓模板。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     fills_path = tmp_path / "fills.csv"
     fills_path.write_text(
         "成交日期,成交编号,证券代码,买卖方向,成交数量,成交价格,手续费,成本价\n"
@@ -905,6 +949,7 @@ def test_huatai_column_alias_mapping_reads_fill_and_position_templates(tmp_path)
 
 
 def test_position_snapshot_reconciles_target_and_open_pnl() -> None:
+    """验证持仓快照对账目标与开盘盈亏。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     plan = pd.DataFrame([{
         "symbol": "SH600519", "action": "BUY", "target_shares": 200,
     }])
@@ -919,8 +964,11 @@ def test_position_snapshot_reconciles_target_and_open_pnl() -> None:
 
 
 def test_pool_fetch_does_not_return_partial_data() -> None:
+    """验证股票池获取不收益部分数据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     class Provider:
+        """测试辅助类“Provider”，用于承载供应商相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def fetch_daily(self, symbol, start, end, name=None):
+            """实现测试替身Provider的获取每日行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入；`name`：名称场景输入。 返回值供调用处构造夹具或断言复用。"""
             if symbol == "000001":
                 raise RuntimeError("source unavailable")
             return pd.DataFrame([{"trade_date": "2025-01-02", "symbol": f"SH{symbol}"}])
@@ -936,6 +984,7 @@ def test_pool_fetch_does_not_return_partial_data() -> None:
 
 
 def test_plan_does_not_sell_more_than_t_plus_one_available_quantity() -> None:
+    """验证计划不卖出更多而非T加上一项可用数量。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     positions = pd.DataFrame([{
@@ -949,6 +998,7 @@ def test_plan_does_not_sell_more_than_t_plus_one_available_quantity() -> None:
 
 
 def test_plan_refuses_daily_bar_before_its_available_time() -> None:
+    """验证计划拒绝每日行情行之前其可用时间。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 3, "max_positions": 1})
     data = bars()
@@ -963,6 +1013,7 @@ def test_plan_refuses_daily_bar_before_its_available_time() -> None:
 
 
 def test_compact_prevalidated_backtest_matches_standard_run(tmp_path) -> None:
+    """验证紧凑预回测匹配标准运行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     frame = bars(days=50)
     path = tmp_path / "bars.csv"
     frame.to_csv(path, index=False)
@@ -987,12 +1038,14 @@ def test_compact_prevalidated_backtest_matches_standard_run(tmp_path) -> None:
 
 
 def test_direct_formal_backtest_requires_the_same_readiness_gate():
+    """验证直接正式回测要求相同就绪门控门控。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     with pytest.raises(ValueError, match="formal=True 必须提供就绪报告、全部审计输入路径"):
         run_backtest(bars(30), 100_000, config, formal=True)
 
 
 def test_unresolved_absorption_merger_blocks_return_when_old_security_remains_held():
+    """验证未解决吸收合并阻断收益当旧证券仍为已持有。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     config["strategy"].update({"lookback_sessions": 2, "rebalance_sessions": 1, "max_positions": 1})
     dates = pd.bdate_range("2025-07-28", "2025-08-14")
@@ -1013,6 +1066,7 @@ def test_unresolved_absorption_merger_blocks_return_when_old_security_remains_he
 
 
 def test_baseline_diagnostics_function_requires_explicit_diagnostic_opt_in(tmp_path):
+    """验证基线诊断函数要求明确诊断选项在。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     with pytest.raises(ValueError, match="必须显式设置 diagnostic=True"):
         run_baseline_sensitivity(

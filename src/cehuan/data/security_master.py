@@ -1,3 +1,9 @@
+"""将有效日期证券主数据并入规范行情。
+
+证券状态和交易规则按 ``valid_from``/``valid_to`` 区间匹配到证券日；本模块
+不使用未来记录回填历史，也不为无匹配日期造出状态或交易规则。
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -13,7 +19,12 @@ MASTER_REQUIRED = [
 
 
 def apply_security_master(bars: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
-    """Apply effective-dated listing/status data without looking into the future."""
+    """按有效日期把证券状态、板块与交易单位规则连接到行情行。
+
+    ``bars`` 是规范证券日行情，``master`` 至少包含 ``MASTER_REQUIRED``
+    字段且每个证券的有效区间不得重叠。返回补充主数据列的副本；无匹配行
+    保留原值。缺列、无效日期、非法阈值或重叠区间会抛出 ``ValueError``。
+    """
     data = normalize_bar_frame(bars)
     records = master.copy()
     records.columns = [str(column).strip() for column in records.columns]

@@ -1,3 +1,5 @@
+"""策环测试模块：验证按证券检查交易日窗口时不会被其他证券的行情行掩盖缺口。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -6,6 +8,7 @@ from cehuan.data.calendar import audit_security_windows
 
 
 def test_security_window_audit_does_not_hide_one_symbol_gap_with_other_symbol_rows() -> None:
+    """验证证券窗口审计不隐藏一项证券代码缺口带有其他证券代码行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     days = pd.bdate_range("2025-01-06", periods=6).strftime("%Y-%m-%d").tolist()
     calendar = pd.DataFrame({"trade_date": days, "is_open": True, "source": "synthetic-calendar"})
     rows = []

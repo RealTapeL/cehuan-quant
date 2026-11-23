@@ -1,3 +1,5 @@
+"""策环测试模块：验证合成公司行动诊断产物可审计，且人工审核保持未签认。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from pathlib import Path
 import runpy
 
@@ -5,6 +7,7 @@ import pandas as pd
 
 
 def test_synthetic_dividend_and_distribution_diagnostic_writes_auditable_outputs(tmp_path):
+    """验证合成分红与送转诊断写入可审计输出。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     script = Path(__file__).resolve().parents[1] / "scripts" / "run_synthetic_action_diagnostic.py"
     run = runpy.run_path(str(script), run_name="synthetic_action_fixture")["run"]
 
@@ -27,6 +30,7 @@ def test_synthetic_dividend_and_distribution_diagnostic_writes_auditable_outputs
 
 
 def test_announcement_field_review_matrix_is_valid_and_unsigned():
+    """验证公告字段复核矩阵有效与未签认。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     matrix = Path(__file__).resolve().parents[1] / "docs" / "evidence" / "corporate-action-sample-field-review.csv"
     fields = pd.read_csv(matrix, dtype=str, keep_default_na=False)
 

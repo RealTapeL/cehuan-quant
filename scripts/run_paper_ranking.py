@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a sealed ranking-only paper artifact; never creates a broker order."""
+"""运行只生成候选排名的纸面研究流程；结果不含可执行股数或券商委托。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
+    """解析纸面排名运行参数并调用排名入口；只生成研究候选，不输出订单。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/default.toml")

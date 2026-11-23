@@ -1,3 +1,5 @@
+"""检查真实研究 checkpoint、事件时间和持仓区间的时点关系；用于解释既有实验输入，不等同于正式账务审核。"""
+
 from __future__ import annotations
 
 import argparse
@@ -16,6 +18,7 @@ from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 
 
 def _sha256(path: Path) -> str:
+    """计算本地证据文件的 SHA-256，用于报告来源绑定。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -24,6 +27,7 @@ def _sha256(path: Path) -> str:
 
 
 def _git_audit_context() -> dict[str, Any]:
+    """收集审计运行对应的 Git 提交及工作区状态。"""
     repo = Path(__file__).resolve().parents[1]
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
@@ -51,6 +55,7 @@ def _git_audit_context() -> dict[str, Any]:
 
 
 def _json(path: Path) -> dict[str, Any]:
+    """解析 JSON 输入；缺失或结构错误交由上层审计状态处理。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"JSON 顶层必须是对象: {path}")
@@ -63,6 +68,7 @@ def _inventory(
     commit: str,
     external_artifacts: list[tuple[Path, str]] | None = None,
 ) -> list[dict[str, Any]]:
+    """枚举实验目录和外部输入的文件清单及哈希；只读，不把存在等同于已核验。"""
     rows = []
     for path in sorted(experiment_dir.rglob("*")):
         if not path.is_file() or output_dir == path or output_dir in path.parents:
@@ -126,7 +132,11 @@ def _inventory(
 
 
 def _next_open_after(calendar: pd.DataFrame, as_of: date) -> date | None:
-    """Return the first explicitly open session after as_of; fail closed on bad calendar rows."""
+    """返回 ``as_of`` 之后首个明确标记为开市的交易日。
+
+    参数：``calendar`` 为规范化日历，``as_of`` 为基准日期。返回：下一开市日；
+    日历行缺失、重复或状态异常时按失败关闭处理，不猜测交易日。
+    """
     required = {"trade_date", "is_open"}
     missing = required - set(calendar.columns)
     if missing:
@@ -147,6 +157,7 @@ def _next_open_after(calendar: pd.DataFrame, as_of: date) -> date | None:
 
 
 def _load_event_registry(path_value: str | None, expected_sha: str | None) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """读取事件登记并核验登记文件哈希；哈希不符时不得使用旧登记作为当前证据。"""
     if not path_value:
         return pd.DataFrame(), {"status": "UNVERIFIED", "reason": "manifest 未登记源事件表"}
     path = Path(path_value).expanduser().resolve()
@@ -169,6 +180,7 @@ def _load_event_registry(path_value: str | None, expected_sha: str | None) -> tu
 
 
 def _phase_dates(row: dict[str, Any]) -> list[date]:
+    """提取单条事件记录中各阶段日期，并保留无法解析或缺失的阶段。"""
     output = []
     for key in (
         "effective_date", "record_date", "old_last_trade_date", "old_delisting_date",
@@ -185,6 +197,7 @@ def _phase_dates(row: dict[str, Any]) -> list[date]:
 def _event_hits(
     symbol: str, start_eod: date, end_eod: date, identity: pd.DataFrame, actions: pd.DataFrame,
 ) -> list[dict[str, str]]:
+    """查找指定证券和持仓区间内可能生效的身份或公司行动事件；返回命中证据供人工解释。"""
     hits: list[dict[str, str]] = []
     for family, frame in (("security_identity", identity), ("corporate_action", actions)):
         for row in frame.to_dict(orient="records"):
@@ -203,6 +216,7 @@ def _event_hits(
 
 
 def _event_symbols(row: dict[str, Any]) -> set[str]:
+    """收集一条事件记录明确关联的证券代码；不自行推断代码映射。"""
     return {
         str(row.get(key, "")).strip().upper()
         for key in ("symbol", "old_symbol", "new_symbol")
@@ -211,6 +225,7 @@ def _event_symbols(row: dict[str, Any]) -> set[str]:
 
 
 def _position_intervals(trades: pd.DataFrame, sessions: list[date], window_end: date) -> list[dict[str, Any]]:
+    """根据模拟交易与交易日历构造持仓时间区间；缺失成交或日历时不能据此证明无持仓。"""
     session_before = {day: sessions[index - 1] for index, day in enumerate(sessions) if index > 0}
     quantities: dict[str, int] = {}
     starts: dict[str, date] = {}
@@ -256,6 +271,7 @@ def _position_intervals(trades: pd.DataFrame, sessions: list[date], window_end: 
 
 
 def build_audit(experiment_dir: Path, output_dir: Path, proof_report_path: Path, preflight_path: Path) -> dict[str, Any]:
+    """汇总 checkpoint、事件、行情和持仓时间证据，生成可追溯的审计结构；不计算策略绩效。"""
     if output_dir.exists():
         raise FileExistsError(f"拒绝覆盖已有审计目录: {output_dir}")
     output_dir.mkdir(parents=True)
@@ -391,6 +407,7 @@ def build_audit(experiment_dir: Path, output_dir: Path, proof_report_path: Path,
     trade_audit.drop(columns=["_row_order"]).to_csv(output_dir / "trade-fallback-detail.csv", index=False)
 
     def missing_count(column: str) -> int:
+        """统计指定列中缺失值数量；输入为 DataFrame 列视图。"""
         return int(bars[column].isna().sum()) if column in bars else len(bars)
 
     source_manifest_path = Path(manifest["source"]["raw_snapshot_path"]).resolve() / "manifest.json"
@@ -688,6 +705,7 @@ def build_audit(experiment_dir: Path, output_dir: Path, proof_report_path: Path,
 
 
 def main() -> int:
+    """解析本地实验输入并写出时点审计报告；不重新采集市场数据。"""
     parser = argparse.ArgumentParser(description="审计真实 checkpoint 的历史决策时点、输入层次和规则/费用回退；只读生成私有产物")
     parser.add_argument("--experiment-dir", required=True, help="已冻结真实实验目录")
     parser.add_argument("--proof-report", required=True, help="本轮重新生成的 input-proof-rebuild-report.json")

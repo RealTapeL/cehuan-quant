@@ -1,3 +1,10 @@
+"""BaoStock 会话、请求记录和原始字段规范化。
+
+本模块把供应商响应转换为策环行情/日历字段，并集中管理串行会话、限速、
+请求预算、分页、传输错误重试和快照文件哈希。导入时不联网；历史状态和
+供应商发布时间仍以实际响应及独立证据为准。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -40,11 +47,11 @@ def _safe_baostock_send_msg(
     message_split: str,
     compressed_message_types: set[str] | tuple[str, ...],
 ) -> str | None:
-    """Read one BaoStock protocol response and treat EOF as a transport error.
+    """读取一条 BaoStock 协议响应，并将提前 EOF 视为传输错误。
 
-    BaoStock 0.9.4 loops forever when ``recv`` returns ``b""`` before its
-    terminator arrives. A socket timeout cannot stop that EOF loop, so the
-    adapter installs this small protocol-compatible guard for its session.
+    BaoStock 0.9.4 在终止符到达前收到 ``b""`` 时可能持续循环；socket 超时不能
+    结束该 EOF 循环，因此会话用此协议兼容保护处理连接关闭。返回完整响应文本；
+    响应头、压缩内容或传输结构无效时抛出异常。
     """
     if default_socket is None:
         return None
@@ -75,6 +82,7 @@ def _safe_baostock_send_msg(
 
 
 def _vendor_code(symbol: object) -> str:
+    """将策环沪深代码映射为 BaoStock 的 ``sh.600000`` 形式。"""
     canonical = canonical_symbol(symbol)
     if len(canonical) != 8 or canonical[:2] not in {"SH", "SZ"}:
         raise ValueError(f"BaoStock 当前适配范围仅验证了沪深代码：{symbol}")
@@ -82,7 +90,7 @@ def _vendor_code(symbol: object) -> str:
 
 
 def _canonical_vendor_symbol(value: object) -> str:
-    """BaoStock uses `sh.600519`; project data uses `SH600519`."""
+    """将 BaoStock 的 ``sh.600519`` 形式规范为项目的 ``SH600519`` 代码。"""
     raw = str(value).strip().upper()
     if "." in raw:
         left, right = raw.rsplit(".", 1)
@@ -95,7 +103,11 @@ def _canonical_vendor_symbol(value: object) -> str:
 
 
 class BaoStockError(RuntimeError):
-    """A BaoStock failure with a stable stage and retry classification."""
+    """携带稳定错误阶段和重试分类的 BaoStock 异常。
+
+    ``category``、``endpoint`` 与可选供应商错误码保存在实例上，供采集清单
+    记录；分类结果不代表供应商已经说明了故障根因。
+    """
 
     def __init__(
         self,
@@ -106,6 +118,7 @@ class BaoStockError(RuntimeError):
         error_code: str | None = None,
         error_msg: str | None = None,
     ) -> None:
+        """创建带请求上下文的异常；不触发新的网络请求。"""
         super().__init__(message)
         self.category = category
         self.endpoint = endpoint
@@ -114,6 +127,7 @@ class BaoStockError(RuntimeError):
 
 
 def _error_category(error_code: object | None, error_msg: object | None = None) -> str:
+    """把供应商错误码或客户端异常归类为会话、传输或 API 错误。"""
     code = str(error_code or "")
     if isinstance(error_msg, (ConnectionError, TimeoutError, EOFError)):
         return "transport"
@@ -132,6 +146,7 @@ def _error_category(error_code: object | None, error_msg: object | None = None) 
 
 
 def _raise_for_response(response: Any, endpoint: str) -> None:
+    """将非零供应商响应码转换为带分类的 BaoStockError。"""
     code = str(getattr(response, "error_code", "unknown"))
     message = str(getattr(response, "error_msg", "missing response status"))
     if code != "0":
@@ -146,6 +161,11 @@ def _raise_for_response(response: Any, endpoint: str) -> None:
 
 
 def _query_frame(response: Any, endpoint: str, before_page: Any | None = None) -> tuple[pd.DataFrame, int]:
+    """完整读取响应分页并返回字段表与成功页数。
+
+    ``before_page`` 在请求后续页前运行，用于限速和预算记账。错误码会阻断；
+    已满页后 SDK 静默停止被视为传输失败，避免把可能截断的列表当完整结果。
+    """
     _raise_for_response(response, endpoint)
     fields = list(response.fields)
     rows: list[list[str]] = []
@@ -181,7 +201,11 @@ def _query_frame(response: Any, endpoint: str, before_page: Any | None = None) -
 
 
 class BaoStockSession:
-    """Small, explicit BaoStock session. No requests are sent at import time."""
+    """显式、串行且带请求审计的 BaoStock 会话。
+
+    上下文进入时安装超时与 EOF 保护、取得进程锁并登录；退出时登出、恢复
+    socket 全局设置并释放锁。类内的重试仅针对传输/过期会话分类。
+    """
 
     _session_lock = threading.Lock()
 
@@ -195,6 +219,11 @@ class BaoStockSession:
         daily_request_budget: int = 49_000,
         lock_path: str | Path | None = None,
     ) -> None:
+        """保存限速、超时、重试、安全请求预算和本地锁路径。
+
+        ``daily_request_budget`` 不得超过 49,000；本方法仅初始化状态，实际
+        登录发生在进入上下文时。非法参数抛出 ``ValueError``。
+        """
         if (
             socket_timeout_seconds <= 0 or minimum_interval_seconds < 0 or max_retries < 0
             or retry_base_seconds < 0 or not 1 <= daily_request_budget <= 49_000
@@ -224,6 +253,11 @@ class BaoStockSession:
         self._original_send_msg: Any | None = None
 
     def __enter__(self) -> "BaoStockSession":
+        """取得本进程与跨进程锁、安装网络保护并登录供应商。
+
+        成功返回已登录会话；并发占用、依赖缺失或登录失败时释放已取得的
+        全局资源后抛出异常。socket 默认超时只在会话期间临时覆盖。
+        """
         if not self._session_lock.acquire(blocking=False):
             raise BaoStockError(
                 "当前进程已有 BaoStock 会话；拒绝启动并发请求",
@@ -264,6 +298,7 @@ class BaoStockSession:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """登出并恢复 socket、协议函数与进程锁等全局状态。"""
         try:
             if self.bs is not None:
                 try:
@@ -282,6 +317,7 @@ class BaoStockSession:
             self._restore_session_globals()
 
     def _restore_session_globals(self) -> None:
+        """恢复 BaoStock socket 函数、默认超时并释放会话锁。"""
         try:
             if self._socketutil_module is not None and self._original_send_msg is not None:
                 self._socketutil_module.send_msg = self._original_send_msg
@@ -298,6 +334,7 @@ class BaoStockSession:
                 self._session_lock.release()
 
     def _install_receive_eof_guard(self) -> None:
+        """临时替换 SDK 收包函数，使提前 EOF 作为传输错误退出。"""
         import baostock.common.context as context
         import baostock.common.contants as constants
         import baostock.util.socketutil as socketutil
@@ -306,6 +343,7 @@ class BaoStockSession:
         self._original_send_msg = socketutil.send_msg
 
         def guarded_send_msg(message: str) -> str | None:
+            """调用协议兼容收包器并使用 SDK 当前会话 socket。"""
             return _safe_baostock_send_msg(
                 message,
                 getattr(context, "default_socket", None),
@@ -317,6 +355,7 @@ class BaoStockSession:
         socketutil.send_msg = guarded_send_msg
 
     def _acquire_process_lock(self) -> None:
+        """以非阻塞文件锁阻止其他进程同时调用 BaoStock。"""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.lock_path.open("a+", encoding="utf-8")
         try:
@@ -346,6 +385,7 @@ class BaoStockSession:
             raise
 
     def _release_process_lock(self) -> None:
+        """释放并关闭当前会话持有的文件锁句柄。"""
         handle = self._process_lock_handle
         self._process_lock_handle = None
         if handle is not None:
@@ -355,6 +395,7 @@ class BaoStockSession:
                 handle.close()
 
     def _close_default_socket(self) -> None:
+        """关闭 BaoStock 全局默认 socket，并清除 SDK 中的引用。"""
         try:
             import baostock.common.context as context
             sock = getattr(context, "default_socket", None)
@@ -367,6 +408,7 @@ class BaoStockSession:
             pass
 
     def _wait_for_request_slot(self) -> None:
+        """按请求最小间隔睡眠，更新单会话的最近请求起始时刻。"""
         now = time.monotonic()
         if self._last_request_started is not None:
             wait_seconds = self.minimum_interval_seconds - (now - self._last_request_started)
@@ -375,6 +417,7 @@ class BaoStockSession:
         self._last_request_started = time.monotonic()
 
     def _reserve_request(self, endpoint: str) -> None:
+        """为当前上海自然日的请求计数；达到安全预算时停止。"""
         day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         if day != self._request_day:
             self._request_day = day
@@ -390,9 +433,11 @@ class BaoStockSession:
         self._requests_today += 1
 
     def _record_attempt(self, record: dict[str, Any]) -> None:
+        """把一次登录或查询尝试追加到内存审计日志。"""
         self.request_log.append(record)
 
     def _login_once(self) -> Any:
+        """执行一次登录并记录耗时、错误码和请求次数。"""
         started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         timer = time.perf_counter()
         self._wait_for_request_slot()
@@ -455,6 +500,7 @@ class BaoStockSession:
         return login
 
     def _login_with_retry(self) -> None:
+        """按配置次数重试传输型登录失败，其他类别直接抛出。"""
         for attempt in range(self.max_retries + 1):
             try:
                 self._login_once()
@@ -466,6 +512,12 @@ class BaoStockSession:
                 time.sleep(min(self.retry_base_seconds * (2**attempt), 30.0))
 
     def _query(self, endpoint: str, call: Any) -> pd.DataFrame:
+        """统一执行带分页、限速、预算、错误分类和受限重试的查询。
+
+        ``endpoint`` 用于审计，``call`` 是一次 SDK 请求。返回完整 DataFrame；
+        未登录、非传输类 API 错误、操作中断或重试耗尽时抛出异常。分页数也
+        纳入请求预算，不能把不完整分页当作成功结果。
+        """
         if self.bs is None:
             raise RuntimeError("BaoStockSession 尚未登录")
         for attempt in range(self.max_retries + 1):
@@ -474,6 +526,7 @@ class BaoStockSession:
             page_attempts = 1
 
             def wait_for_page() -> None:
+                """为即将请求的下一分页计数并等待限速间隔。"""
                 nonlocal page_attempts
                 self._reserve_request(endpoint)
                 page_attempts += 1
@@ -538,19 +591,29 @@ class BaoStockSession:
                 self._login_once()
 
     def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """请求指定起止日内 BaoStock 交易日历。"""
         return self._query(
             "query_trade_dates",
             lambda: self.bs.query_trade_dates(start_date=start_date, end_date=end_date),
         )
 
     def stock_basic(self, symbol: object | None = None) -> pd.DataFrame:
-        """Return security basics, optionally restricted to one BaoStock equity code."""
+        """读取证券基础资料，可按单个沪深证券代码筛选。
+
+        ``symbol=None`` 时请求供应商完整基础资料；指定证券时按 BaoStock 代码
+        查询。返回供应商字段 DataFrame，未自行增加点时历史状态；失败由统一
+        请求包装器记录并按错误类别处理。
+        """
         code = _vendor_code(symbol) if symbol is not None else ""
         endpoint = f"query_stock_basic({code})" if code else "query_stock_basic"
         return self._query(endpoint, lambda: self.bs.query_stock_basic(code=code))
 
     def all_stocks(self, day: str) -> pd.DataFrame:
-        """Return BaoStock's date-specific securities list for one market day."""
+        """请求 BaoStock 指定交易日期的证券成员列表。
+
+        ``day`` 先规范为 ISO 日期；返回原始成员与供应商状态字段。分页未完成、
+        响应错误或日期无效时阻断，不把响应中缺失的代码直接认定为非成员。
+        """
         parsed_day = _parse_date(day)
         return self._query(
             f"query_all_stock({parsed_day})",
@@ -565,6 +628,11 @@ class BaoStockSession:
         adjustflag: str,
         fields: str = HISTORY_FIELDS,
     ) -> pd.DataFrame:
+        """请求单证券日线原始响应。
+
+        ``adjustflag`` 原样传给供应商；字段集默认包含复权标记和状态字段。
+        返回仍为 BaoStock 原始列，需由规范化函数分别处理原始价与后复权价。
+        """
         code = _vendor_code(symbol)
         return self._query(
             f"query_history_k_data_plus({code},adjustflag={adjustflag})",
@@ -579,6 +647,7 @@ class BaoStockSession:
         )
 
     def adjust_factors(self, symbol: object, start_date: str, end_date: str) -> pd.DataFrame:
+        """请求单证券指定区间的复权因子原始表。"""
         code = _vendor_code(symbol)
         return self._query(
             f"query_adjust_factor({code})",
@@ -592,12 +661,13 @@ def normalize_baostock_history(
     security: pd.Series,
     retrieved_at_utc: str,
 ) -> tuple[pd.DataFrame, int]:
-    """Map BaoStock raw fields and point-in-time flags to canonical daily bars.
+    """将原始与后复权 BaoStock 日线合并为规范证券日行情。
 
-    `adjustflag=1` (BaoStock backward-adjusted / 后复权) is retained as the
-    feature price series; raw OHLC remains the execution-price series. Suspended
-    rows keep their carried prices and a zero volume/amount when the vendor
-    returns blanks for those fields.
+    ``raw`` 提供未复权 OHLC 与状态，``back_adjusted`` 提供 adjustflag=1 的
+    后复权收盘价，``security`` 提供代码/名称，``retrieved_at_utc`` 是本机抓取
+    时点。返回规范行情和因无效原始 OHLC 跳过的行数；保留原价用于执行价格、
+    后复权价用于信号。坏字段或日期口径冲突会阻断；收盘可用时点按系统日线
+    假设写入，不代表供应商发布时间证据。
     """
     required = {"date", "code", "open", "high", "low", "close", "volume", "amount", "tradestatus", "isST"}
     missing = required.difference(raw.columns)
@@ -651,6 +721,11 @@ def normalize_baostock_history(
 
 
 def normalize_baostock_calendar(raw: pd.DataFrame, retrieved_at_utc: str) -> pd.DataFrame:
+    """规范 BaoStock 日历字段并补充上一开市日、来源和本机抓取时点。
+
+    ``raw`` 必须含 ``calendar_date`` 与 ``is_trading_day``；返回统一日历表。
+    本机抓取时点不会被解释为供应商发布时间。
+    """
     required = {"calendar_date", "is_trading_day"}
     missing = required.difference(raw.columns)
     if missing:
@@ -677,6 +752,11 @@ def normalize_baostock_index(
     security: pd.Series,
     retrieved_at_utc: str,
 ) -> pd.DataFrame:
+    """规范指数日线以供基准对照，并显式标为不可交易证券。
+
+    ``security`` 提供指数代码和名称，``retrieved_at_utc`` 记录本机抓取时间；
+    返回仍由统一行情规范器约束的指数表。
+    """
     required = {"date", "code", "open", "high", "low", "close", "volume", "amount"}
     missing = required.difference(raw.columns)
     if missing:
@@ -705,11 +785,13 @@ def normalize_baostock_index(
 
 
 def _write_source_csv(frame: pd.DataFrame, path: Path) -> None:
+    """创建父目录并写入 UTF-8 来源响应 CSV。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False, encoding="utf-8")
 
 
 def _sha256(path: Path) -> str:
+    """分块计算文件 SHA-256，用于原始响应和快照文件绑定。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -718,6 +800,7 @@ def _sha256(path: Path) -> str:
 
 
 def _write_json_atomic(value: dict[str, Any], path: Path) -> None:
+    """在同目录写临时 JSON 并以原子替换方式发布清单。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -732,7 +815,12 @@ def _verify_snapshot_chunk(
     expected_start: str,
     expected_end: str,
 ) -> dict[str, Any]:
-    """Validate every committed chunk artifact before it is trusted on resume."""
+    """续跑前逐项验证已提交行情批次及其文件哈希。
+
+    传入批次目录和预期快照 ID、证券清单、日期边界；全部输出文件须与 manifest
+    一一对应且质量检查通过。发现缺文件、额外文件、哈希不符或输入不匹配时
+    抛出 ``ValueError``，不会覆盖已有批次。
+    """
     manifest_path = chunk_path / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError(f"已存在的行情批次缺少 manifest.json，保留现场并停止：{chunk_path}")
@@ -775,6 +863,7 @@ def _verify_snapshot_chunk(
 
 
 def _capture_policy(session: Any) -> dict[str, Any]:
+    """读取会话实际限速、超时、重试及每日预算配置用于快照记录。"""
     return {
         "socket_timeout_seconds": float(getattr(session, "socket_timeout_seconds", 20.0)),
         "minimum_interval_seconds": float(getattr(session, "minimum_interval_seconds", 1.0)),
@@ -785,7 +874,12 @@ def _capture_policy(session: Any) -> dict[str, Any]:
 
 
 def _merge_sorted_bar_chunks(chunk_files: list[Path], output_path: Path) -> dict[str, Any]:
-    """Merge date/symbol-sorted CSV chunks without loading the full history in memory."""
+    """按日期和证券代码归并已排序 CSV 分块，避免载入完整历史。
+
+    每个输入分块必须有同一表头且按 ``trade_date,symbol`` 排序；发现重复键、
+    顺序异常或无有效行情时抛出 ``ValueError``。输出到 ``output_path`` 并返回
+    行数、证券集合和日期范围摘要。
+    """
     if not chunk_files:
         raise ValueError("没有可合并的日线分块")
     handles = []
@@ -846,6 +940,7 @@ def _merge_sorted_bar_chunks(chunk_files: list[Path], output_path: Path) -> dict
 
 
 def _parse_date(value: str) -> str:
+    """解析日期文本并输出 YYYY-MM-DD；无效日期抛出解析异常。"""
     parsed = pd.to_datetime(value, format="%Y%m%d" if value.isdigit() and len(value) == 8 else None, errors="raise")
     return parsed.strftime("%Y-%m-%d")
 
@@ -862,7 +957,12 @@ def _create_baostock_snapshot_chunk(
     shared_basics: pd.DataFrame | None = None,
     metadata_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Fetch an immutable, provenance-rich snapshot into a private local folder."""
+    """按证券批次获取带溯源信息的不可变快照。
+
+    ``symbols``、日期区间及输出根目录定义请求范围；可复用共享日历、基础资料和
+    元数据请求记录以减少重复调用。返回快照路径与 manifest；代码数超限、日期无效、
+    请求失败或输出冲突时拒绝完成，失败临时目录按实现清理。
+    """
     start = _parse_date(start_date)
     end = _parse_date(end_date)
     if start > end:
@@ -1076,7 +1176,11 @@ def create_baostock_snapshot(
     max_batches: int | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
-    """Create a fixed-symbol snapshot, splitting large requests into resumable chunks."""
+    """为固定证券集合创建快照，并将大请求拆成可续跑的批次。
+
+    ``batch_size`` 限制单批证券数，``max_batches`` 可限制本次处理批数，``resume``
+    仅续跑匹配的未完成快照。返回聚合快照清单；完整历史覆盖不能由固定代码列表本身证明。
+    """
     start, end = _parse_date(start_date), _parse_date(end_date)
     if start > end:
         raise ValueError("start_date 必须不晚于 end_date")

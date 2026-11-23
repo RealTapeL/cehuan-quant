@@ -1,3 +1,10 @@
+"""定义公司行动事件及其点时来源约束。
+
+本模块为分红、送转、代码变更、配股、换股和退市事件提供不可变类型；账本和事件
+调度器消费这些类型。日期、比例和来源在构造时校验，公告的真实含义仍须由外部人工
+核读，``known_at_utc`` 只记录输入声明的可得时间并受各事件截止点约束。
+"""
+
 from __future__ import annotations
 
 import re
@@ -11,6 +18,7 @@ from cehuan.accounting.models import calendar_date, decimal_value, security_symb
 
 
 def _aware_instant(value: datetime | str, field: str) -> datetime:
+    """解析带时区的时间并统一转为 UTC；无时区或格式错误时阻断。"""
     if isinstance(value, datetime):
         instant = value
     elif isinstance(value, str):
@@ -26,6 +34,7 @@ def _aware_instant(value: datetime | str, field: str) -> datetime:
 
 
 def _require_known_by(known_at_utc: datetime, day: date, local_time: time, field: str) -> None:
+    """要求事件信息不晚于上海本地指定日期和时刻可得，否则拒绝点时入账。"""
     shanghai = timezone(timedelta(hours=8))
     cutoff = datetime.combine(day, local_time, tzinfo=shanghai).astimezone(timezone.utc)
     if known_at_utc > cutoff:
@@ -34,6 +43,7 @@ def _require_known_by(known_at_utc: datetime, day: date, local_time: time, field
 
 @dataclass(frozen=True)
 class ActionSource:
+    """公司行动原件的审核登记；哈希绑定字节，不证明公告解读正确。"""
     source_id: str
     url: str
     sha256: str
@@ -43,6 +53,7 @@ class ActionSource:
     reviewed_at: date | str
 
     def __post_init__(self) -> None:
+        """规范来源字段、校验 HTTPS 与 SHA-256，并统一审核日期。"""
         for field in ("source_id", "title", "page_reference", "reviewed_by"):
             value = str(getattr(self, field)).strip()
             if not value:
@@ -62,6 +73,7 @@ class ActionSource:
 
 @dataclass(frozen=True)
 class CashDividendEvent:
+    """现金分红事件，按登记日权益、除息日和发放日分别建模。"""
     event_id: str
     symbol: str
     record_date: date | str
@@ -72,6 +84,7 @@ class CashDividendEvent:
     source: ActionSource
 
     def __post_init__(self) -> None:
+        """校验分红日期、每股税前金额、点时可得时刻及来源类型。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("分红 event_id 不能为空")
@@ -97,6 +110,7 @@ class CashDividendEvent:
 
 @dataclass(frozen=True)
 class ShareDistributionEvent:
+    """送股或转增事件，区分权益登记、生效、登记和新股可流通日期。"""
     event_id: str
     symbol: str
     record_date: date | str
@@ -109,6 +123,7 @@ class ShareDistributionEvent:
     fractional_share_method: str = "ACCOUNT_RESULT_REQUIRED"
 
     def __post_init__(self) -> None:
+        """校验日期顺序、比例和零股处理；未确认整数股结果时拒绝猜测。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("送转 event_id 不能为空")
@@ -145,6 +160,7 @@ class ShareDistributionEvent:
 
 @dataclass(frozen=True)
 class CodeChangeEvent:
+    """同一证券身份的 1:1 代码迁移；不表示吸收合并换股。"""
     event_id: str
     old_symbol: str
     new_symbol: str
@@ -156,6 +172,7 @@ class CodeChangeEvent:
     event_type: Literal["CODE_CHANGE_1_TO_1"] = "CODE_CHANGE_1_TO_1"
 
     def __post_init__(self) -> None:
+        """校验旧新代码、身份、1:1 比例、生效日期、可得时间和公告来源。"""
         event_id = str(self.event_id).strip()
         identity = str(self.security_identity).strip()
         if not event_id or not identity:
@@ -185,6 +202,7 @@ class CodeChangeEvent:
 
 @dataclass(frozen=True)
 class RightsOfferingEvent:
+    """配股事件，描述登记、认购窗口、认购价格及新股可流通信息。"""
     event_id: str
     symbol: str
     record_date: date | str
@@ -198,6 +216,7 @@ class RightsOfferingEvent:
     registration_date: date | str | None = None
 
     def __post_init__(self) -> None:
+        """规范日期和金额，并校验配股比例、认购价、点时可得性及来源。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("配股 event_id 不能为空")
@@ -235,7 +254,7 @@ class RightsOfferingEvent:
 
 @dataclass(frozen=True)
 class RightsOfferingDecision:
-    """Frozen research-account disposition for one rights-offering event."""
+    """为单个配股事件冻结研究组合的认购、放弃或人工处理决定。"""
 
     event_id: str
     disposition: Literal["SUBSCRIBE", "DECLINE", "MANUAL_REVIEW"]
@@ -245,6 +264,7 @@ class RightsOfferingDecision:
     allocation_evidence: str | None = None
 
     def __post_init__(self) -> None:
+        """校验决策类型、日期、费用及显式获配股数所需的证据。"""
         event_id = str(self.event_id).strip()
         disposition = str(self.disposition).strip().upper()
         if not event_id:
@@ -279,6 +299,7 @@ class RightsOfferingDecision:
 
 @dataclass(frozen=True)
 class ShareSwapMergerEvent:
+    """吸收合并换股事件，分开记录旧股摘牌、新股登记、可流通及分配结果。"""
     event_id: str
     old_symbol: str
     new_symbol: str
@@ -296,6 +317,7 @@ class ShareSwapMergerEvent:
     allocation_source: ActionSource
 
     def __post_init__(self) -> None:
+        """校验换股日期链、比例、整数股分配规则和三类公告来源。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("換股 event_id 不能为空")
@@ -341,6 +363,7 @@ class ShareSwapMergerEvent:
 
 @dataclass(frozen=True)
 class DelistingEvent:
+    """退市事件及可选现金结算；没有结算证据时只保留未决权益状态。"""
     event_id: str
     symbol: str
     last_trade_date: date | str
@@ -353,6 +376,7 @@ class DelistingEvent:
     settlement_source: ActionSource | None = None
 
     def __post_init__(self) -> None:
+        """校验最后交易日、摘牌日、结算时间及其独立来源证据。"""
         event_id = str(self.event_id).strip()
         if not event_id:
             raise ValueError("退市 event_id 不能为空")

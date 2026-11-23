@@ -1,4 +1,4 @@
-"""A fully synthetic plan-to-review cycle; never connects to a broker."""
+"""合成交易闭环样例。提供小型合成配置、行情和计划/成交复盘场景，用于流程验证；生成结果不代表真实市场或策略收益，且不连接券商。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from cehuan.signals.plan import generate_plan, plan_markdown
 
 
 def synthetic_cycle_config() -> dict[str, Any]:
+    """返回用于闭环演示的固定合成策略配置。返回：独立字典副本；数值仅服务于合成流程验证。"""
     config = load_config()
     config["strategy"].update({
         "lookback_sessions": 5,
@@ -40,6 +41,7 @@ def synthetic_cycle_config() -> dict[str, Any]:
 
 
 def synthetic_cycle_bars(now: datetime | None = None) -> pd.DataFrame:
+    """按给定时刻生成合成证券行情。参数：now 可固定行情末日和时间。返回：合成 DataFrame；不读取供应商数据。"""
     local_now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     end_day = (local_now - timedelta(days=1)).date()
     dates = pd.bdate_range(end=end_day, periods=35)
@@ -93,7 +95,7 @@ def run_synthetic_cycle(
     cycle_run_id: str | None = None,
     before_plan_callback: Callable[[Path, pd.DataFrame, dict[str, Any], dict[str, Any]], dict[str, str]] | None = None,
 ) -> Path:
-    """Write one isolated synthetic plan/review scenario; never calls a broker."""
+    """写入一次独立的合成计划与复盘场景。参数：output_root 为运行根目录，now 固定时间，scenario 选择合成成交过程，cycle_run_id 可固定 ID，before_plan_callback 为可选计划前钩子。返回：运行目录及产物状态。副作用：只创建合成产物，不访问券商；输出不能解释为真实收益。"""
     allowed_scenarios = {
         "partial_fill", "no_fill", "duplicate_import", "partial_fill_cancelled",
         "modified_plan", "missing_positions",

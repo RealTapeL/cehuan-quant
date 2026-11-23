@@ -1,4 +1,4 @@
-"""Review one real-data hypothesis against the existing H1 window diagnostic."""
+"""H1 模型复盘入口。模块从已保存的程序排名差异构造事实，调用一次可选模型并校验其解释；不重跑行情、不计算收益，质量校验失败时保留程序事实和安全错误类别。"""
 
 from __future__ import annotations
 
@@ -29,21 +29,24 @@ H1_SOURCE_MODULE = REPO_ROOT / "src/cehuan/research/hypothesis_input_coverage.py
 
 
 def _write_json(value: Any, path: Path) -> None:
+    """写入带排序键的 UTF-8 JSON。参数：value 为可序列化对象，path 为运行目录内文件。副作用：创建或覆盖目标文件。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def _repo_path(path: str | Path) -> Path:
+    """将路径解析为仓库内绝对路径或保留绝对路径。参数：path 为输入路径。返回：解析后的 Path。"""
     item = Path(path).expanduser()
     return (item if item.is_absolute() else REPO_ROOT / item).resolve()
 
 
 def _verify_hash(path: Path, expected: str, label: str) -> None:
+    """核对输入文件存在且 SHA-256 与登记值一致。参数：path 为文件，expected 为预期摘要，label 用于错误定位。返回：匹配时 None。异常：缺失或摘要不符时抛出 ValueError。"""
     if not path.is_file() or sha256_file(path) != expected:
         raise ValueError(f"{label} 文件缺失或 SHA-256 不匹配")
 
 
 def evaluate_min_momentum_effect(momentum: float, proposed_threshold: float) -> dict[str, Any]:
-    """Check only whether the proposed minimum threshold excludes this candidate."""
+    """确定候选动量是否满足提议的最低动量阈值。参数：momentum 为已记录候选动量，proposed_threshold 为建议阈值。返回：仅针对该候选的确定性比较结果；无效数值返回未验证状态。限制：不评价参数整体效果，也不能识别所有模型推理错误。"""
     values = (momentum, proposed_threshold)
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in values):
         return {
@@ -69,13 +72,15 @@ def evaluate_min_momentum_effect(momentum: float, proposed_threshold: float) -> 
 
 
 def _fact_id(signal_date: str) -> str:
+    """为信号日生成稳定的证据事实 ID。参数：signal_date 为日期字符串。返回：带 H1_RANK_EFFECT 前缀的标识。"""
     return "H1_RANK_EFFECT_" + signal_date.replace("-", "")
 
 
 class ReviewResponseFailure(ValueError):
-    """A safe, structured parse/validation failure with no model text attached."""
+    """安全的解析/内容校验失败。只保存阶段、错误码、字段和可选 JSON 位置，不携带模型正文。"""
 
     def __init__(self, *, stage: str, code: str, field: str, location: dict[str, int] | None = None) -> None:
+        """构造安全的复盘响应异常。参数：stage 为失败阶段，code 为错误类别，field 为字段路径，location 可记录 JSON 行列。副作用：保存定位元数据并构造不含正文的消息。"""
         self.stage = stage
         self.code = code
         self.field = field
@@ -84,10 +89,12 @@ class ReviewResponseFailure(ValueError):
 
 
 def _reject(code: str, field: str) -> None:
+    """以统一异常格式拒绝不合规复盘内容。参数：code 为错误类别，field 为字段路径。返回：无；始终抛 ReviewResponseFailure。"""
     raise ReviewResponseFailure(stage="CONTENT_VALIDATION", code=code, field=field)
 
 
 def _format_top(rows: list[dict[str, Any]]) -> str:
+    """将 Top 列表格式化为供提示词使用的短文本。参数：rows 为含 rank/symbol/momentum 的程序记录。返回：逐名次拼接的字符串；数值显示不是收益指标。"""
     return ", ".join(
         "{}. {} ({:.4f})".format(row["rank"], row["symbol"], row["momentum"])
         for row in rows
@@ -95,6 +102,7 @@ def _format_top(rows: list[dict[str, Any]]) -> str:
 
 
 def _summary_by_signal(frame: pd.DataFrame, max_positions: int) -> list[dict[str, Any]]:
+    """把逐证券窗口差异汇总为逐信号日程序事实。参数：frame 为 H1 差异表，max_positions 为 Top N 数量。返回：包含候选数、排除原因、原/H1 Top N 及差异的字典列表；不读取模型内容。"""
     original = frame.loc[frame.scope.eq("ORIGINAL_CANDIDATE_POOL")].copy()
     output: list[dict[str, Any]] = []
     issue_map = {
@@ -167,7 +175,7 @@ def _summary_by_signal(frame: pd.DataFrame, max_positions: int) -> list[dict[str
 
 
 def _review_explanation_quality_issues(text: str, program_fact: dict[str, Any]) -> list[str]:
-    """Check that an explanation is concrete and cites only this date's ranking facts."""
+    """以确定性规则检查解释是否引用本日排名事实且未越界。参数：text 为模型解释，program_fact 为该日程序事实。返回：问题代码列表。限制：是启发式质量筛查，不是通用推理正确性证明。"""
     issues: list[str] = []
     normalized = " ".join(text.split())
     if any(template in normalized for template in {
@@ -216,7 +224,7 @@ def _review_explanation_quality_issues(text: str, program_fact: dict[str, Any]) 
 
 
 def audit_saved_review_quality(model_review: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
-    """Post-hoc quality classification; does not change program facts or call a model."""
+    """对已保存模型复盘做事后质量分类。参数：model_review 为模型输出，facts 为程序事实。返回：逐日质量问题及状态；不调用模型、不改变程序事实。"""
     rows = {row.get("signal_date"): row for row in model_review.get("ranking_effects", []) if isinstance(row, dict)}
     findings: list[dict[str, Any]] = []
     for fact in facts["signal_days"]:
@@ -246,6 +254,7 @@ def audit_saved_review_quality(model_review: dict[str, Any], facts: dict[str, An
 
 
 def _validate_review_output(payload: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
+    """校验模型复盘的 schema、事实字段、证据 ID、阈值计算及边界声明。参数：payload 为解析后的对象，facts 为程序重建事实。返回：通过的原对象。异常：字段、证券/日期引用、事实值、解释质量或限制声明不匹配时通过 _reject 明确拒绝。"""
     if not isinstance(payload, dict):
         _reject("ROOT_MUST_BE_OBJECT", "$")
     required = {
@@ -347,6 +356,7 @@ def _validate_review_output(payload: dict[str, Any], facts: dict[str, Any]) -> d
 
 
 def _parse_and_validate_review(content: str, facts: dict[str, Any]) -> dict[str, Any]:
+    """解析模型 JSON 并执行复盘内容校验。参数：content 为模型正文，facts 为程序事实。返回：通过验证的结构化复盘。异常：JSON 错误记录安全行列；内容错误记录错误码/字段，不保留正文。"""
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -367,7 +377,7 @@ def _parse_and_validate_review(content: str, facts: dict[str, Any]) -> dict[str,
 
 
 def _request_failure_audit(exc: Exception) -> dict[str, Any]:
-    """Return only safe failure metadata; never include exception text or response content."""
+    """把请求异常压缩为安全元数据。参数：exc 为异常对象。返回：不含 API Key 或响应正文的失败审计字典。"""
     return {
         "failure_stage": "MODEL_REQUEST",
         "failure_code": "MODEL_ADAPTER_EXCEPTION",
@@ -377,6 +387,7 @@ def _request_failure_audit(exc: Exception) -> dict[str, Any]:
 
 
 def _build_review_prompt(facts: dict[str, Any]) -> str:
+    """根据程序事实生成 H1 复盘提示。参数：facts 为逐日排名和阈值检查。返回：要求模型引用事实、说明限制且不得下单的提示文本。"""
     ranking_example = [
         {
             "signal_date": row["signal_date"],
@@ -427,6 +438,7 @@ def _build_review_prompt(facts: dict[str, Any]) -> str:
 def _report_markdown(facts: dict[str, Any], model_review: dict[str, Any] | None, model_status: str,
                      model_audit: dict[str, Any], result_hashes: dict[str, str],
                      model_quality: dict[str, Any] | None = None) -> str:
+    """生成 H1 模型复盘中文报告。参数：facts 为程序事实，model_review 为可选通过校验的模型输出，model_status/model_audit 记录调用结果，result_hashes 绑定产物，model_quality 为可选解释质量分类。返回：Markdown 文本；模型解释与程序计算结果分节呈现。"""
     lines = [
         "# H1 停牌窗口候选诊断与 AI 复盘",
         "",
@@ -553,6 +565,7 @@ def run_h1_model_review(*, research_run_dir: str | Path = DEFAULT_RESEARCH_RUN,
                         agent_config_path: str | Path | None = None,
                         model_mode: str = "llm",
                         prior_model_review_path: str | Path | None = None) -> Path:
+    """读取已保存 H1 审计产物，重建事实并可选调用模型复盘。参数：research_run_dir/h1_audit_dir 指向冻结输入，output_root 为独立输出根，agent_config_path 为模型设置，model_mode 显式选择，prior_model_review_path 可用于历史审阅比较。返回：唯一运行目录。副作用：可能发出一次模型请求并写审计/报告；不运行排名或收益回测。异常：来源哈希和输入不匹配时阻断。"""
     if model_mode not in {"llm", "audit-only"}:
         raise ValueError("model-mode 只接受 llm 或 audit-only；不允许 stub")
     research_dir = _repo_path(research_run_dir)
@@ -919,6 +932,7 @@ def run_h1_model_review(*, research_run_dir: str | Path = DEFAULT_RESEARCH_RUN,
 
 
 def main() -> int:
+    """解析命令行参数并运行 H1 模型复盘。参数：无显式参数，输入来自 CLI。返回：None；打印新运行目录或安全错误。副作用：委托给 run_h1_model_review。"""
     import argparse
 
     parser = argparse.ArgumentParser(description="复用冻结 H1 停牌窗口诊断并生成真实行情 AI 复盘")

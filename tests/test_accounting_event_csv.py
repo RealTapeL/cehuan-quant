@@ -1,3 +1,5 @@
+"""策环测试模块：验证公司行动 CSV 的字段解析、来源哈希、审核状态和事件日期约束。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -11,6 +13,7 @@ from cehuan.data.accounting_event_csv import ACCOUNTING_EVENT_CSV_COLUMNS, read_
 
 
 def _event_row(archive: Path) -> dict[str, str]:
+    """私有测试辅助函数，用于事件行。 参数：`archive`：归档场景输入。 返回：dict[str, str]，供调用处构造夹具或断言复用。"""
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     return {
         "event_id": "div-001", "event_type": "CASH_DIVIDEND", "known_at_utc": "2025-01-02T07:00:00+00:00",
@@ -26,6 +29,7 @@ def _event_row(archive: Path) -> dict[str, str]:
 
 
 def test_accounting_event_csv_binds_each_event_to_archived_source_bytes(tmp_path):
+    """验证账务事件CSV绑定每项事件到已归档来源字节。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "notice.pdf"
     archive.write_bytes(b"synthetic source bytes")
     event_csv = tmp_path / "events.csv"
@@ -44,6 +48,7 @@ def test_accounting_event_csv_binds_each_event_to_archived_source_bytes(tmp_path
 
 
 def test_accounting_event_csv_rejects_source_hash_mismatch(tmp_path):
+    """验证账务事件CSV拒绝来源哈希不符。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "notice.pdf"
     archive.write_bytes(b"original")
     row = _event_row(archive)
@@ -56,6 +61,7 @@ def test_accounting_event_csv_rejects_source_hash_mismatch(tmp_path):
 
 
 def test_accounting_event_csv_rejects_unreviewed_source(tmp_path):
+    """验证账务事件CSV拒绝未复核来源。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "notice.pdf"
     archive.write_bytes(b"source")
     row = _event_row(archive)
@@ -68,6 +74,7 @@ def test_accounting_event_csv_rejects_unreviewed_source(tmp_path):
 
 
 def test_accounting_event_csv_reads_share_distribution_and_requires_all_event_dates(tmp_path):
+    """验证账务事件CSV读取股份送转与要求全部事件日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "distribution-notice.pdf"
     archive.write_bytes(b"synthetic distribution source bytes")
     row = _event_row(archive)
@@ -107,6 +114,7 @@ def test_accounting_event_csv_reads_share_distribution_and_requires_all_event_da
 
 
 def test_accounting_event_csv_reads_deferred_dividend_payment_withholding_policy(tmp_path):
+    """验证账务事件CSV读取递延分红发放预扣政策。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "notice.pdf"
     archive.write_bytes(b"synthetic source")
     row = _event_row(archive)
@@ -131,6 +139,7 @@ def test_accounting_event_csv_reads_deferred_dividend_payment_withholding_policy
 
 
 def test_accounting_event_csv_reads_rights_offering_and_frozen_disposition(tmp_path):
+    """验证账务事件CSV读取配股权利配股与冻结处理方式。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     archive = tmp_path / "rights-notice.pdf"
     archive.write_bytes(b"synthetic rights notice")
     row = _event_row(archive)

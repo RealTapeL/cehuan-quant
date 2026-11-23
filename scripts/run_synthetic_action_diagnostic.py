@@ -1,3 +1,5 @@
+"""用合成分红与送转事件检查账本调度和产物留痕；不代表真实证券事件覆盖。"""
+
 from __future__ import annotations
 
 import argparse
@@ -17,10 +19,12 @@ from cehuan.config import load_config
 
 
 def _write_json(payload: object, path: Path) -> None:
+    """将合成公司行动诊断结果写入指定 JSON 路径。"""
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def run(output_root: Path) -> Path:
+    """运行合成分红与送转账务案例并保存逐日诊断产物；不代表真实事件核验。"""
     output_root.mkdir(parents=True, exist_ok=True)
     run_dir = output_root / f"synthetic-action-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(exist_ok=False)
@@ -158,6 +162,7 @@ def run(output_root: Path) -> Path:
 
 
 def main() -> int:
+    """解析输出目录并启动合成公司行动诊断；不访问外部数据。"""
     parser = argparse.ArgumentParser(
         description="Run a synthetic same-day dividend/share-distribution ledger diagnostic; no broker calls"
     )

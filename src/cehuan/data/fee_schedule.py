@@ -1,3 +1,9 @@
+"""按有效日期校验费率并计算研究用交易费用。
+
+费率必须绑定来源哈希与人工复核字段；用户个人佣金和历史市场制度需分别建表，
+这里不会把统一假设费用标成账户实际费用。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -17,11 +23,16 @@ FEE_RATE_COLUMNS = (
 
 
 def _clean_text(values: pd.Series) -> pd.Series:
+    """将一列缺值规整为空字符串并去除非空值首尾空格。"""
     return values.map(lambda value: "" if pd.isna(value) else str(value).strip())
 
 
 def normalize_fee_schedule(frame: pd.DataFrame) -> pd.DataFrame:
-    """Validate a reviewed, effective-dated A-share fee assumption table."""
+    """校验含生效区间和人工来源证据的 A 股费率表。
+
+    ``frame`` 每行描述一段费率有效期，返回按起始日排序的副本。费率要求
+    有限非负数且区间不重叠；来源哈希、复核人、日期或状态缺失时阻断。
+    """
     missing = sorted(set(FEE_SCHEDULE_COLUMNS).difference(frame.columns))
     if missing:
         raise ValueError("历史费率缺少字段：" + ", ".join(missing))
@@ -66,7 +77,11 @@ def map_fee_schedule_to_sessions(
     schedule: pd.DataFrame,
     session_dates: list[Any] | pd.Series,
 ) -> dict[str, dict[str, Any]]:
-    """Require one reviewed fee row for every requested session date."""
+    """为每个请求交易日匹配唯一有效且已复核的费率行。
+
+    ``schedule`` 为规范费率表，``session_dates`` 为交易日期；返回以 ISO 日期
+    为键的费率字典。无效日期、未覆盖日期或有效区间不唯一时抛出异常。
+    """
     fees = normalize_fee_schedule(schedule)
     starts = fees["valid_from"].to_numpy(dtype="datetime64[ns]")
     ends = fees["valid_to"].to_numpy(dtype="datetime64[ns]")
@@ -86,6 +101,7 @@ def map_fee_schedule_to_sessions(
 
 
 def scheduled_fee_components(notional_cny: float, side: str, fee_row: dict[str, Any]) -> dict[str, float]:
+    """按指定费率行计算佣金、卖出印花税和过户费分项，单位为人民币元。"""
     if notional_cny < 0:
         raise ValueError("成交金额不能为负数")
     normalized_side = side.upper()
@@ -105,4 +121,5 @@ def scheduled_fee_components(notional_cny: float, side: str, fee_row: dict[str, 
 
 
 def calculate_scheduled_fees(notional_cny: float, side: str, fee_row: dict[str, Any]) -> float:
+    """返回指定成交金额和方向对应的费率分项合计（人民币元）。"""
     return sum(scheduled_fee_components(notional_cny, side, fee_row).values())

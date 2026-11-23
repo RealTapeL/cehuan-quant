@@ -1,3 +1,5 @@
+"""策环测试模块：验证合成计划、虚构成交、复盘和下一轮假设的完整闭环。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +13,7 @@ from cehuan.research.synthetic_cycle import run_synthetic_cycle
 
 
 def test_synthetic_cycle_writes_plan_fictitious_fill_review_and_hypothesis(tmp_path: Path):
+    """验证合成周期写入计划虚构成交复核与假设。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir = run_synthetic_cycle(
         tmp_path,
         now=datetime(2026, 11, 3, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),

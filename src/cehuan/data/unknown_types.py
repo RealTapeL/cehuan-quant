@@ -1,3 +1,9 @@
+"""审计点时股票池中类型未知的证券代码。
+
+输出按代码汇总的人工分类登记，不从交易所前缀、名称或存在 OHLC 行推断股票
+身份；只有独立来源、文件哈希和人工复核记录齐全时才接受已分类结论。
+"""
+
 from __future__ import annotations
 
 import json
@@ -18,6 +24,7 @@ ALLOWED_CLASSIFICATIONS = {"UNRESOLVED", "EXPLAINED_NON_STOCK", "ADDED_AS_STOCK"
 
 
 def _valid_sha256(value: str) -> bool:
+    """判断文本是否为 64 位十六进制 SHA-256 表示。"""
     return len(value) == 64 and all(char in "0123456789abcdefABCDEF" for char in value)
 
 
@@ -26,11 +33,10 @@ def audit_unknown_security_types(
     bars_path: str | Path,
     output_csv: str | Path,
 ) -> dict[str, Any]:
-    """Create a per-code review register for rows excluded as UNKNOWN_TYPE.
+    """为被排除为 UNKNOWN_TYPE 的名单记录生成逐代码待复核登记表。
 
-    Existing classifications in output_csv are retained only when backed by a
-    source URL, source-file digest, reviewer, and review date. No stock type is
-    inferred from an exchange prefix or the presence of OHLC data.
+    仅保留带来源 URL、来源文件哈希、审核人和审核日期的既有分类；不会根据交易所前缀
+    或 OHLC 行情推断证券类型。返回待复核汇总和登记表路径。
     """
     universe_root = Path(universe).expanduser().resolve()
     membership_path = universe_root / "securities_by_date.csv" if universe_root.is_dir() else universe_root

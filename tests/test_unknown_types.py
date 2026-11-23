@@ -1,3 +1,5 @@
+"""策环测试模块：验证未知证券类型审计完整分区记录，且分类必须绑定来源证据。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +12,7 @@ from cehuan.data.unknown_types import audit_unknown_security_types
 
 
 def test_unknown_type_audit_partitions_rows_without_inference_and_preserves_review(tmp_path):
+    """验证未知类型审计划分行缺少推断与保留复核。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     universe = tmp_path / "universe"
     universe.mkdir()
     pd.DataFrame([
@@ -51,6 +54,7 @@ def test_unknown_type_audit_partitions_rows_without_inference_and_preserves_revi
 
 
 def test_unknown_type_review_rejects_classification_without_source_hash(tmp_path):
+    """验证未知类型复核拒绝分类缺少来源哈希。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     universe = tmp_path / "universe"
     universe.mkdir()
     pd.DataFrame([{

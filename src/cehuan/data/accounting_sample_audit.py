@@ -1,7 +1,7 @@
-"""Verify archived corporate-action sample files against a field-audit manifest.
+"""核验公司行动样本原件哈希与机器提取文本字段。
 
-The verifier proves only byte-hash and extraction-token matches. It cannot
-attest that a human interpreted an announcement correctly.
+工具为人工审核准备文件证据，不替代逐页解读公告或账户结算核对；自动 PASS
+只表示原件字节与清单哈希一致且指定文本词项存在。
 """
 
 from __future__ import annotations
@@ -26,10 +26,17 @@ MANIFEST_COLUMNS = {
 
 
 def _normalized_text(value: str) -> str:
+    """移除空白字符，供公告文本词项存在性检查使用。"""
     return re.sub(r"\s+", "", value)
 
 
 def verify_accounting_sample_manifest(manifest_path: str | Path) -> dict[str, Any]:
+    """逐样本比对登记原件的 SHA-256 和提取文本中的必需词项。
+
+    ``manifest_path`` 指向字段审计 CSV；返回每个样本的机器核验结果及待人工
+    签认数量。文件缺失、字段不全、ID 重复或来源 URL/哈希格式无效时拒绝
+    继续；此结果不能证明证券事件事实或个人账户分配。
+    """
     path = Path(manifest_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"公司行动样本清单不存在：{path}")
@@ -124,6 +131,7 @@ _FIELD_TERMS = {
 
 
 def _referenced_pages(reference: str, page_count: int) -> list[int]:
+    """从“第 N 页”或页码范围文本中提取有效的一基页码。"""
     requested: set[int] = set()
     for match in re.finditer(r"第\s*(\d+)\s*(?:[-–]\s*(\d+)\s*)?页", reference):
         start = int(match.group(1))
@@ -139,6 +147,11 @@ def _candidate_page_excerpts(
     page_reference: str,
     extracted_text: str,
 ) -> tuple[str, str]:
+    """按字段术语和机器值定位提取文本中的候选页码与上下文。
+
+    返回页码及定位状态/摘录，供人工查阅；找不到匹配时要求人工逐页检查，
+    不把无摘录视为公告没有该事实，也不更改审核状态。
+    """
     pages = extracted_text.split("\f")
     page_numbers = _referenced_pages(page_reference, len(pages))
     if not page_numbers:
@@ -172,7 +185,12 @@ def build_accounting_sample_review_pack(
     field_review_path: str | Path,
     output_dir: str | Path,
 ) -> dict[str, Any]:
-    """Build a private, copyable human review packet without changing signoff state."""
+    """生成可复制的公告人工审阅包，并保持原签认状态不变。
+
+    参数分别为样本索引、逐字段审核表和全新输出目录。函数复制本地原件与
+    提取文本、添加候选页码定位并写审阅清单；目标目录已存在、来源哈希不符、
+    审核字段不完整或引用未登记样本时阻断。不会替人签认。
+    """
     sample_path = Path(sample_manifest_path).expanduser().resolve()
     fields_path = Path(field_review_path).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
@@ -318,6 +336,7 @@ def build_accounting_sample_review_pack(
 
 
 def main() -> int:
+    """提供样本清单 CLI；输出 JSON 并按自动核验状态返回退出码。"""
     parser = argparse.ArgumentParser(description="核验公司行动公告小样的私有原件散列与文本字段")
     parser.add_argument("--manifest", required=True, help="样本字段对照 CSV")
     parser.add_argument("--output", help="可选 JSON 输出路径；不提供时打印到标准输出")

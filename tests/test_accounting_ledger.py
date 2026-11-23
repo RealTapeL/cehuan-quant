@@ -1,3 +1,5 @@
+"""策环测试模块：验证账本成交入账、现金和成本核算、T+1、幂等性及净值估值阻断。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -17,6 +19,7 @@ from cehuan.accounting import (
 
 
 def _lot(lot_id: str, quantity: int, basis: str, acquired: str, *, sellable: int | None = None) -> PositionLot:
+    """私有测试辅助函数，用于批次。 参数：`lot_id`：批次编号场景输入；`quantity`：数量场景输入；`basis`：口径场景输入；`acquired`：代码标识“acquired”（含义待核实）场景输入；`sellable`：代码标识“sellable”（含义待核实）场景输入。 返回：PositionLot，供调用处构造夹具或断言复用。"""
     return PositionLot(
         lot_id=lot_id,
         symbol="SH600000",
@@ -29,6 +32,7 @@ def _lot(lot_id: str, quantity: int, basis: str, acquired: str, *, sellable: int
 
 
 def _mark(price: str, day: str, *, age: int = 0) -> PriceMark:
+    """私有测试辅助函数，用于估值标记。 参数：`price`：价格场景输入；`day`：日场景输入；`age`：时长场景输入。 返回：PriceMark，供调用处构造夹具或断言复用。"""
     return PriceMark(
         price_cny=Decimal(price),
         price_date=date.fromisoformat(day),
@@ -38,6 +42,7 @@ def _mark(price: str, day: str, *, age: int = 0) -> PriceMark:
 
 
 def test_buy_then_next_session_sell_accounts_for_fees_and_cost_basis():
+    """验证买入随后下一条交易日卖出账户针对费用与费用口径。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("2000"))
     buy = TradeFill(
         fill_id="buy-1",
@@ -78,6 +83,7 @@ def test_buy_then_next_session_sell_accounts_for_fees_and_cost_basis():
 
 
 def test_insufficient_cash_failure_is_atomic():
+    """验证不足现金失败原子。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("100"))
     fill = TradeFill(
         fill_id="too-large",
@@ -98,6 +104,7 @@ def test_insufficient_cash_failure_is_atomic():
 
 
 def test_same_fill_is_idempotent_but_changed_payload_is_rejected():
+    """验证相同成交幂等但变更载荷拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("2000"))
     fill = TradeFill(
         fill_id="same-id",
@@ -131,6 +138,7 @@ def test_same_fill_is_idempotent_but_changed_payload_is_rejected():
 
 
 def test_t1_blocks_sale_of_shares_bought_today():
+    """验证T+1阻断卖出的股份买入当日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("2000"))
     ledger.apply_fill(TradeFill(
         fill_id="buy-today",
@@ -156,6 +164,7 @@ def test_t1_blocks_sale_of_shares_bought_today():
 
 
 def test_sell_allocates_cost_fifo_without_merging_lots():
+    """验证卖出分配费用先进先出缺少合并批次。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("0"), positions=(
         _lot("old", 50, "500", "2026-01-01"),
         _lot("new", 50, "600", "2026-02-01"),
@@ -179,6 +188,7 @@ def test_sell_allocates_cost_fifo_without_merging_lots():
 
 @pytest.mark.parametrize("quantity", [1.5, Decimal("1.5"), "1.5"])
 def test_fractional_share_input_is_rejected_before_integer_conversion(quantity):
+    """验证小数股份输入拒绝之前整数转换。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`quantity`：数量场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="整数股数|float"):
         TradeFill(
             fill_id="fractional",
@@ -192,11 +202,13 @@ def test_fractional_share_input_is_rejected_before_integer_conversion(quantity):
 
 
 def test_money_rejects_float_inputs_to_avoid_preconverted_binary_values():
+    """验证金额拒绝浮点数输入到避免预先转换二进制数值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="不能传 float"):
         FeeItem("commission", 0.1)
 
 
 def test_ledger_invariants_reconcile_cash_and_position_state_to_journal():
+    """验证账本恒等约束对账现金与持仓状态到流水。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("2000"))
     ledger.apply_fill(TradeFill(
         fill_id="invariant-buy",
@@ -220,6 +232,7 @@ def test_ledger_invariants_reconcile_cash_and_position_state_to_journal():
 
 
 def test_missing_or_stale_price_returns_unvalued_instead_of_zero_or_old_mark():
+    """验证缺失或过期价格返回未估值而非的零或旧估值标记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot("held", 100, "1000", "2026-10-01"),))
 
     missing = ledger.mark_to_market("2026-11-02", {})
@@ -234,6 +247,7 @@ def test_missing_or_stale_price_returns_unvalued_instead_of_zero_or_old_mark():
 
 
 def test_unknown_receivable_tax_or_unvalued_claim_blocks_nav():
+    """验证未知应收款税款或未估值声明阻断净值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     receivable_ledger = PortfolioLedger(Decimal("500"), receivables=(
         CashReceivable("dividend-1", "event-1", Decimal("50"), None, "2026-10-30", "2026-11-10"),
     ))
@@ -254,6 +268,7 @@ def test_unknown_receivable_tax_or_unvalued_claim_blocks_nav():
 
 
 def test_claim_with_value_must_have_source_and_nav_includes_it_once():
+    """验证声明带有值必须有来源与净值包含其一次。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     claim = NoncashClaim(
         "claim-1", "event-1", "SH600000", "SH600000", Decimal("10"), 10,
         "2026-11-05", Decimal("95"), "synthetic valuation", "PENDING_TRADABLE",

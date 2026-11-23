@@ -1,3 +1,9 @@
+"""登记并校验有证据支持的证券代码身份事件。
+
+当前仅允许确认的 1:1 代码变更进入身份迁移口径；吸收合并等比例换股属于
+公司行动，不由此表处理。HTTPS 链接和文件哈希校验不等于运行时核验公告内容。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -48,7 +54,12 @@ OUT_DATE_EVIDENCE_COLUMNS = [
 
 
 def normalize_security_identity_events(frame: pd.DataFrame | None) -> pd.DataFrame:
-    """Validate the explicit, evidence-backed point-in-time identity event table."""
+    """校验显式登记且带来源的点时证券身份事件表。
+
+    ``frame`` 仅接受已确认的 1:1 代码变更；返回按生效日排序的规范事件表。缺字段、
+    非法比例、重复映射或非 HTTPS 来源会阻断。此处校验登记内容和链接格式，不会在
+    运行时打开公告并判断其叙述是否正确。
+    """
     if frame is None or frame.empty:
         return pd.DataFrame(columns=IDENTITY_EVENT_COLUMNS)
     missing = set(IDENTITY_EVENT_COLUMNS).difference(frame.columns)
@@ -89,6 +100,11 @@ def normalize_security_identity_events(frame: pd.DataFrame | None) -> pd.DataFra
 
 
 def read_security_identity_events(path: str | Path = DEFAULT_SECURITY_IDENTITY_EVENTS) -> pd.DataFrame:
+    """从 CSV 读取并规范证券身份事件。
+
+    ``path`` 默认指向项目登记文件；文件不存在时抛出 ``FileNotFoundError``，
+    字段或事件规则不合法时由规范化器抛出 ``ValueError``。
+    """
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"证券身份事件表不存在：{source}")
@@ -97,6 +113,7 @@ def read_security_identity_events(path: str | Path = DEFAULT_SECURITY_IDENTITY_E
 
 
 def sha256_file(path: str | Path) -> str:
+    """分块计算文件 SHA-256；不读取或输出文件内容。"""
     digest = hashlib.sha256()
     with Path(path).expanduser().resolve().open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -105,6 +122,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 def summarize_security_identity_events(frame: pd.DataFrame | None) -> list[dict[str, Any]]:
+    """将通过校验的身份事件转换为可序列化字典列表。"""
     events = normalize_security_identity_events(frame)
     return events.to_dict(orient="records")
 
@@ -113,10 +131,10 @@ def audit_out_date_boundary_evidence(
     reconciliation_path: str | Path,
     evidence_path: str | Path | None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Check row-by-row primary-source evidence for basic outDate/list boundary rows.
+    """逐行核对基础资料退市日期与按日名单差异的来源登记。
 
-    This validates a reviewed evidence register against the immutable snapshot's
-    reconciliation rows. It does not fetch the linked notices at runtime.
+    将证据登记表与不可变快照中的 reconciliation 行匹配，返回审计摘要和差异明细。
+    本函数不在线抓取或验证公告正文；登记匹配不能替代人工核读原件。
     """
     reconciliation_file = Path(reconciliation_path).expanduser().resolve()
     if not reconciliation_file.is_file():

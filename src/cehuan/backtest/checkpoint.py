@@ -1,4 +1,9 @@
-"""Versioned checkpoints for deterministic rule-based backtest continuation."""
+"""封存并恢复确定性回测续跑所需的版本化状态。
+
+checkpoint 关联账本快照、信号历史、待执行目标、交易日历及输入哈希；回测引擎在窗口
+边界读写它。外部文件必须带有效状态 SHA-256，旧 schema 保留既有序列化口径；哈希仅
+证明状态字节绑定，不证明行情、规则或事件来源内容正确。
+"""
 
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ from cehuan.accounting.snapshot_io import ledger_snapshot_from_dict
 
 @dataclass(frozen=True)
 class SignalHistoryBar:
+    """checkpoint 中保留的单证券历史信号价格及其价格口径标签。"""
     symbol: str
     trade_date: date
     close_cny: Decimal
@@ -24,6 +30,7 @@ class SignalHistoryBar:
     signal_price_source: str = "legacy_unknown"
 
     def __post_init__(self) -> None:
+        """规范证券日与价格，并拒绝非正价格或未知口径标签。"""
         if not str(self.symbol).strip():
             raise ValueError("checkpoint signal history symbol 不能为空")
         object.__setattr__(self, "symbol", str(self.symbol).strip().upper())
@@ -47,6 +54,7 @@ class SignalHistoryBar:
 
 @dataclass(frozen=True)
 class CheckpointPrice:
+    """续跑估值使用的最近价格、日期、全局交易日序号和来源。"""
     symbol: str
     price_cny: Decimal
     price_date: date
@@ -54,6 +62,7 @@ class CheckpointPrice:
     source: str
 
     def __post_init__(self) -> None:
+        """校验价格、来源、日期和全局交易日索引。"""
         if not str(self.symbol).strip() or not str(self.source).strip():
             raise ValueError("checkpoint price 必须包含 symbol/source")
         price = Decimal(str(self.price_cny))
@@ -69,6 +78,7 @@ class CheckpointPrice:
 
 @dataclass(frozen=True)
 class BacktestCheckpoint:
+    """回测窗口间的完整状态快照，包含信号、账本和所有输入版本绑定。"""
     schema_version: int
     strategy_id: str
     as_of_date: date
@@ -100,6 +110,7 @@ class BacktestCheckpoint:
     state_sha256: str = ""
 
     def __post_init__(self) -> None:
+        """验证 schema、窗口边界、状态字段、账本日期及输入/状态哈希。"""
         if self.schema_version not in {1, 2, 3}:
             raise ValueError(f"不支持的 backtest checkpoint schema_version={self.schema_version}")
         if self.schema_version == 1 and self.pending_targets_active is not None:
@@ -189,6 +200,7 @@ class BacktestCheckpoint:
                 raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
 
     def _payload(self) -> dict[str, Any]:
+        """构造参与状态哈希的规范 payload，并按旧 schema 保留兼容字段范围。"""
         payload = asdict(self)
         payload.pop("state_sha256", None)
         # Preserve legacy checkpoint hashes. V2 added an explicit active bit;
@@ -201,20 +213,23 @@ class BacktestCheckpoint:
         return payload
 
     def calculate_state_sha256(self) -> str:
+        """对规范化状态 payload 计算 SHA-256，不包含 state_sha256 自身。"""
         data = json.dumps(self._payload(), ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     def require_sealed(self) -> None:
-        """Reject in-memory checkpoints that have not crossed a verified seal boundary."""
+        """拒绝未封存或状态哈希不匹配的内存 checkpoint。"""
         if not isinstance(self.state_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.state_sha256):
             raise ValueError("backtest checkpoint 未封存：state_sha256 必须是 64 位十六进制 SHA-256")
         if self.state_sha256 != self.calculate_state_sha256():
             raise ValueError("backtest checkpoint 状态哈希不匹配；文件可能被改写")
 
     def sealed(self) -> "BacktestCheckpoint":
+        """返回带当前状态哈希的新 checkpoint，不原地修改现有对象。"""
         return replace(self, state_sha256=self.calculate_state_sha256())
 
     def to_dict(self) -> dict[str, Any]:
+        """校验封存后输出 JSON 兼容字典，并序列化金额和日期。"""
         self.require_sealed()
         sealed = self
         payload = asdict(sealed)
@@ -240,6 +255,11 @@ class BacktestCheckpoint:
 
 
 def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoint:
+    """从外部映射校验哈希并恢复强类型 checkpoint。
+
+    ``value`` 必须包含对应 schema 的全部状态字段和非空 64 位哈希；返回对象会再次
+    执行字段及状态校验。缺字段、内容被改写或账本状态无效时抛出 ``ValueError``。
+    """
     if not isinstance(value, Mapping):
         raise ValueError("backtest checkpoint JSON 顶层必须是对象")
     required = {
@@ -315,6 +335,11 @@ def backtest_checkpoint_from_dict(value: Mapping[str, Any]) -> BacktestCheckpoin
 
 
 def read_backtest_checkpoint(path: str | Path) -> BacktestCheckpoint:
+    """读取并验证封存文件及其绑定的上一窗口行情文件。
+
+    ``path`` 是 checkpoint JSON 路径；返回已封存状态。JSON、状态哈希、行情路径或
+    上一窗口文件哈希不匹配时拒绝续跑。
+    """
     checkpoint_path = Path(path).expanduser().resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"backtest checkpoint 不存在：{checkpoint_path}")

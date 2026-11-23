@@ -1,3 +1,5 @@
+"""策环测试模块：验证 H1 模型复盘对事实、证据、模板回声和交易边界的校验。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +16,7 @@ from cehuan.research.h1_model_review import (
 
 
 def test_min_momentum_guard_shows_point_28_survives_threshold_05() -> None:
+    """验证最小动量保护显示时点28仍保留阈值05。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = evaluate_min_momentum_effect(2.8, 0.5)
 
     assert result["status"] == "DOES_NOT_EXCLUDE_FOCAL_CANDIDATE"
@@ -23,6 +26,7 @@ def test_min_momentum_guard_shows_point_28_survives_threshold_05() -> None:
 
 
 def test_h1_summary_keeps_unknown_suspension_separate_from_non_suspension() -> None:
+    """验证H1摘要保持未知停牌分开从非停牌。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import pandas as pd
 
     frame = pd.DataFrame([
@@ -67,6 +71,7 @@ def test_h1_summary_keeps_unknown_suspension_separate_from_non_suspension() -> N
 
 
 def _review_facts() -> dict:
+    """私有测试辅助函数，用于复核事实。 返回：dict，供调用处构造夹具或断言复用。"""
     return {
         "signal_days": [
             {
@@ -101,6 +106,7 @@ def _review_facts() -> dict:
 
 
 def _valid_review_payload() -> dict:
+    """私有测试辅助函数，用于有效复核载荷。 返回：dict，供调用处构造夹具或断言复用。"""
     facts = _review_facts()
     interpretations = {
         "2024-11-05": "2024-11-05，SH603268 因 21 日窗口含停牌记录被移出；SZ300489 也被移出，SZ002094 和 SZ002583 补入。",
@@ -130,6 +136,7 @@ def _valid_review_payload() -> dict:
 
 
 def test_synthetic_model_review_response_passes_existing_strict_contract() -> None:
+    """验证合成模型复核响应通过已有严格契约。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _parse_and_validate_review(json.dumps(_valid_review_payload()), _review_facts())
 
     assert payload["review_status"] == "NEEDS_DATA"
@@ -138,6 +145,7 @@ def test_synthetic_model_review_response_passes_existing_strict_contract() -> No
 
 
 def test_synthetic_missing_field_has_safe_location() -> None:
+    """验证合成缺失字段有安全位置。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     del payload["known_limitations"]
     try:
@@ -151,6 +159,7 @@ def test_synthetic_missing_field_has_safe_location() -> None:
 
 
 def test_synthetic_unknown_evidence_id_is_rejected_at_field_path() -> None:
+    """验证合成未知证据编号拒绝于字段路径。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][1]["fact_ids"] = ["MADE_UP_FACT"]
     try:
@@ -164,6 +173,7 @@ def test_synthetic_unknown_evidence_id_is_rejected_at_field_path() -> None:
 
 
 def test_synthetic_fact_conflict_is_rejected_at_conflicting_field() -> None:
+    """验证合成事实冲突拒绝于冲突字段。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][0]["top5_changed"] = False
     try:
@@ -177,6 +187,7 @@ def test_synthetic_fact_conflict_is_rejected_at_conflicting_field() -> None:
 
 
 def test_synthetic_removed_added_fact_conflict_is_rejected() -> None:
+    """验证合成移除补入事实冲突拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][0]["removed_symbols"] = ["SH600001"]
     try:
@@ -189,6 +200,7 @@ def test_synthetic_removed_added_fact_conflict_is_rejected() -> None:
 
 
 def test_synthetic_prompt_template_echo_is_rejected_without_relaxing_contract() -> None:
+    """验证合成提示词模板照搬拒绝缺少放宽契约。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][0]["interpretation"] = "根据所引程序事实解释变化或未变化，不声称收益改善。"
     try:
@@ -201,6 +213,7 @@ def test_synthetic_prompt_template_echo_is_rejected_without_relaxing_contract() 
 
 
 def test_synthetic_unsupported_security_and_date_references_are_rejected() -> None:
+    """验证合成不支持证券与日期引用拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][0]["interpretation"] = (
         "2024-11-05，SH999999 被移出，SH603268 因停牌移出；SZ300489 被移出，SZ002094 和 SZ002583 补入。"
@@ -214,6 +227,7 @@ def test_synthetic_unsupported_security_and_date_references_are_rejected() -> No
 
 
 def test_synthetic_claim_that_h1_proves_returns_is_rejected() -> None:
+    """验证合成声明该H1证明返回拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     payload = _valid_review_payload()
     payload["ranking_effects"][0]["interpretation"] = (
         "2024-11-05，SH603268 因 21 日窗口含停牌记录被移出；SZ300489 被移出，"
@@ -228,6 +242,7 @@ def test_synthetic_claim_that_h1_proves_returns_is_rejected() -> None:
 
 
 def test_synthetic_invalid_json_is_separate_from_content_validation() -> None:
+    """验证合成无效JSON分开从内容校验。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     try:
         _parse_and_validate_review('{"schema":', _review_facts())
     except ReviewResponseFailure as exc:
@@ -240,6 +255,7 @@ def test_synthetic_invalid_json_is_separate_from_content_validation() -> None:
 
 
 def test_prompt_example_matches_all_dates_values_and_sorted_fact_ids() -> None:
+    """验证提示词示例匹配全部日期数值与排序事实编号。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     facts = _review_facts()
     prompt = _build_review_prompt(facts)
     example_line = next(line for line in prompt.splitlines() if '"ranking_effects"' in line and '"schema"' in line)
@@ -264,6 +280,7 @@ def test_prompt_example_matches_all_dates_values_and_sorted_fact_ids() -> None:
 
 
 def test_request_failure_metadata_never_includes_exception_message() -> None:
+    """验证请求失败元数据不会包含异常消息。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     safe = _request_failure_audit(RuntimeError("sensitive response text must not be stored"))
 
     assert safe == {
@@ -276,6 +293,7 @@ def test_request_failure_metadata_never_includes_exception_message() -> None:
 
 
 def test_saved_previous_review_is_classified_insufficient_when_it_echoes_template() -> None:
+    """验证保存之前复核归类不足当其照搬模板。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     previous = _valid_review_payload()
     for row in previous["ranking_effects"]:
         row.pop("removed_symbols")

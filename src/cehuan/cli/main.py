@@ -1,3 +1,4 @@
+"""策环命令行入口。模块解析本地数据、研究、回测和人工复盘命令，并将业务交给各自模块；正式基线仍受统一 readiness 门控，命令本身不代表券商自动执行。"""
 from __future__ import annotations
 
 import argparse
@@ -68,12 +69,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _write_json(value: object, path: Path) -> None:
+    """创建父目录并写 UTF-8 JSON。参数：value 为 JSON 兼容对象，path 为目标文件。副作用：写入或覆盖路径；调用方须先保证目录策略安全。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def _console_metrics_summary(metrics: dict[str, object]) -> dict[str, object]:
-    """Keep the saved experiment complete without dumping hundreds of rolling windows."""
+    """为终端显示压缩滚动诊断窗口列表，同时保留完整保存指标。参数：metrics 为回测指标。返回：副本字典；不修改传入指标。"""
     summary = dict(metrics)
     evaluation = summary.get("chronological_evaluation")
     if isinstance(evaluation, dict):
@@ -89,11 +91,13 @@ def _console_metrics_summary(metrics: dict[str, object]) -> dict[str, object]:
 
 
 def _provider_for(config: dict[str, object], source: str | None):
+    """按显式来源或配置选择 AKShare 数据提供器。参数：config 为项目配置，source 可覆盖默认来源。返回：相应 provider 对象；配置值不等于数据覆盖已验证。"""
     configured = str(config.get("data", {}).get("provider", "eastmoney"))
     return make_akshare_provider(source or configured)
 
 
 def _configured_path(config: dict[str, object], key: str, argument: str | None) -> Path | None:
+    """从命令行参数或配置中解析可选路径。参数：config 为配置字典，key 为数据路径键，argument 为可选显式参数。返回：绝对/仓库相对 Path；未提供时返回 None。"""
     value = argument or config.get("data", {}).get(key)
     if not value:
         return None
@@ -102,6 +106,7 @@ def _configured_path(config: dict[str, object], key: str, argument: str | None) 
 
 
 def _parser() -> argparse.ArgumentParser:
+    """构建策环 argparse 命令与参数树。返回：包含采集、审计、研究、排名、回测与复盘子命令的 ArgumentParser；只定义接口，不执行命令。"""
     parser = argparse.ArgumentParser(prog="cehuan", description="策环：本地量化研究与人工审核工具")
     subs = parser.add_subparsers(dest="command", required=True)
 
@@ -395,6 +400,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析命令行并分发到数据、研究、回测或人工复盘入口。参数：argv 可注入命令参数，None 时读取进程参数。返回：进程退出码。副作用：按子命令读写文件或请求所配置的数据源；正式回测经过门控，review 只处理本地导入记录，不下单。异常：操作错误转换为非零退出码或由分支明确抛出。"""
     args = _parser().parse_args(argv)
     try:
         if args.command == "fetch":
@@ -516,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             def report_universe_progress(item: dict[str, object]) -> None:
+                """输出节流后的股票池快照进度事件。参数：item 为已处理日期、总日期数等程序状态。返回：None；首日、每 25 日及末日向 stdout 写 JSON，不改变采集状态。"""
                 completed_dates = int(item["completed_dates"])
                 total_dates = int(item["total_dates"])
                 if completed_dates == 1 or completed_dates % 25 == 0 or completed_dates == total_dates:
@@ -628,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "baseline-readiness":
             def repo_path(value: str) -> Path:
+                """将 CLI 路径解析为绝对路径或仓库根目录下的路径。参数：value 为参数文本。返回：Path；相对路径保留既定仓库语义。"""
                 path = Path(value).expanduser()
                 return path if path.is_absolute() else REPO_ROOT / path
 
@@ -864,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not identity_path:
                     raise ValueError("正式基线必须提供证券身份事件表")
                 def formal_path(value: str) -> Path:
+                    """解析正式基线审计输入路径。参数：value 为命令行路径。返回：绝对路径或仓库相对路径；该解析不代表文件门控通过。"""
                     path = Path(value).expanduser()
                     return path if path.is_absolute() else REPO_ROOT / path
                 quality_for_hash = formal_path(quality_for_hash_value)
@@ -1384,6 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "daily-paper-run":
             def daily_repo_path(value: str) -> Path:
+                """解析每日纸面流程的相对/绝对路径。参数：value 为 CLI 路径。返回：规范化绝对 Path；输出根随后仍须检查位于 Git 忽略目录。"""
                 path = Path(value).expanduser()
                 return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
@@ -1429,6 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "lookback-pair-rank":
             def repo_path(value: str) -> Path:
+                """将 CLI 路径解析为绝对路径或仓库根目录下的路径。参数：value 为参数文本。返回：Path；相对路径保留既定仓库语义。"""
                 path = Path(value).expanduser()
                 return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
@@ -1473,6 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "lookback-pair-capture":
             def capture_repo_path(value: str) -> Path:
+                """解析 lookback 采集命令的输入输出路径。参数：value 为 CLI 路径。返回：规范化绝对 Path；调用方再校验私有输出边界。"""
                 path = Path(value).expanduser()
                 return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
@@ -1517,6 +1529,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "review":
             def input_path(value: str) -> Path:
+                """将复盘或成交去重输入路径解析到仓库根目录。参数：value 为 CLI 参数。返回：绝对 Path；不读取或改写文件。"""
                 path = Path(value).expanduser()
                 return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
@@ -1677,6 +1690,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "fills-dedup":
             def input_path(value: str) -> Path:
+                """将复盘或成交去重输入路径解析到仓库根目录。参数：value 为 CLI 参数。返回：绝对 Path；不读取或改写文件。"""
                 path = Path(value).expanduser()
                 return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 

@@ -1,3 +1,5 @@
+"""策环测试模块：验证前瞻纸面排名与 H1 对照的输入绑定、资格过滤和未知状态处理。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -11,6 +13,7 @@ from cehuan.research.forward_ranking import _build_h1_ranking_comparison, create
 
 
 def _bars_csv(path: Path) -> tuple[Path, str]:
+    """私有测试辅助函数，用于行情CSV。 参数：`path`：路径场景输入。 返回：tuple[Path, str]，供调用处构造夹具或断言复用。"""
     dates = pd.bdate_range(end="2026-11-05", periods=21).strftime("%Y-%m-%d")
     rows = []
     for symbol, slope in (("SH600001", 0.20), ("SZ000001", 0.10)):
@@ -29,10 +32,12 @@ def _bars_csv(path: Path) -> tuple[Path, str]:
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _calendar_and_universe(tmp_path: Path, bars_path: Path, signal_date: str) -> tuple[Path, Path]:
+    """私有测试辅助函数，用于日历与股票池。 参数：`tmp_path`：pytest 提供的临时目录；`bars_path`：行情路径场景输入；`signal_date`：信号日期场景输入。 返回：tuple[Path, Path]，供调用处构造夹具或断言复用。"""
     bars = pd.read_csv(bars_path, dtype=str)
     dates = sorted(bars["trade_date"].unique())
     calendar = tmp_path / "calendar.csv"
@@ -47,6 +52,7 @@ def _calendar_and_universe(tmp_path: Path, bars_path: Path, signal_date: str) ->
 
 
 def test_synthetic_paper_ranking_is_generated_and_bound_to_current_inputs(tmp_path: Path) -> None:
+    """验证合成纸面排名生成与绑定到当前输入。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, signal_date = _bars_csv(tmp_path / "bars.csv")
     repo = Path(__file__).resolve().parents[1]
     config = repo / "configs/default.toml"
@@ -67,6 +73,7 @@ def test_synthetic_paper_ranking_is_generated_and_bound_to_current_inputs(tmp_pa
 
 
 def test_forward_ranking_without_capture_manifest_creates_needs_data_record(tmp_path: Path) -> None:
+    """验证前瞻排名缺少采集清单创建需要数据登记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, signal_date = _bars_csv(tmp_path / "bars.csv")
     repo = Path(__file__).resolve().parents[1]
     now = datetime(2026, 11, 5, 4, 0, tzinfo=timezone.utc)  # 12:00 Asia/Shanghai
@@ -87,6 +94,7 @@ def test_forward_ranking_without_capture_manifest_creates_needs_data_record(tmp_
 
 
 def test_forward_ranking_requires_bound_same_day_capture_and_marks_unsigned_time(tmp_path: Path) -> None:
+    """验证前瞻排名要求绑定相同日采集与标记未签认时间。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, signal_date = _bars_csv(tmp_path / "bars.csv")
     repo = Path(__file__).resolve().parents[1]
     capture = tmp_path / "capture.json"
@@ -117,6 +125,7 @@ def test_forward_ranking_requires_bound_same_day_capture_and_marks_unsigned_time
 
 
 def test_h1_forward_comparison_excludes_suspension_and_reranks_same_pool() -> None:
+    """验证H1前瞻比较排除停牌与重新排名相同股票池。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     baseline = pd.DataFrame([
         {"signal_date": "2026-11-05", "symbol": "SH600001", "momentum": 0.2, "rank": 1, "selected_target": True},
         {"signal_date": "2026-11-05", "symbol": "SZ000001", "momentum": 0.1, "rank": 2, "selected_target": False},
@@ -141,6 +150,7 @@ def test_h1_forward_comparison_excludes_suspension_and_reranks_same_pool() -> No
 
 
 def test_forward_capture_writes_baseline_h1_and_difference_artifacts(tmp_path: Path) -> None:
+    """验证前瞻采集写入基线H1与差异产物。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
     bars = pd.read_csv(bars_path)
     suspension_date = sorted(bars["trade_date"].unique())[-2]
@@ -184,6 +194,7 @@ def test_forward_capture_writes_baseline_h1_and_difference_artifacts(tmp_path: P
 
 
 def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证前瞻排名拒绝采集清单变更期间运行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     import cehuan.research.forward_ranking as module
 
     bars, signal_date = _bars_csv(tmp_path / "bars.csv")
@@ -199,6 +210,7 @@ def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: P
     original_rank = module.rank_precomputed_day
 
     def mutate_capture(*args: object, **kwargs: object) -> pd.DataFrame:
+        """实现测试替身test_forward_ranking_rejects_capture_manifest_changed_during_run的修改采集行为；用于控制被测代码与断言，不访问真实服务。 参数：`*args`：参数场景输入；`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         capture.write_text(capture.read_text(encoding="utf-8") + " ", encoding="utf-8")
         return original_rank(*args, **kwargs)
 
@@ -217,6 +229,7 @@ def test_forward_ranking_rejects_capture_manifest_changed_during_run(tmp_path: P
 
 
 def test_forward_ranking_blocks_instead_of_silently_shrinking_pool_on_missing_session(tmp_path: Path) -> None:
+    """验证前瞻排名阻断而非的静默地缩小股票池在缺失交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
     bars = pd.read_csv(bars_path)
     missing_date = sorted(bars["trade_date"].unique())[-2]
@@ -250,6 +263,7 @@ def test_forward_ranking_blocks_instead_of_silently_shrinking_pool_on_missing_se
 
 
 def test_forward_ranking_reports_unknown_status_as_needs_data_for_each_symbol(tmp_path: Path) -> None:
+    """验证前瞻排名报告未知状态为需要数据针对每项证券代码。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
     bars = pd.read_csv(bars_path)
     bars["is_suspended"] = pd.NA
@@ -280,6 +294,7 @@ def test_forward_ranking_reports_unknown_status_as_needs_data_for_each_symbol(tm
 
 
 def test_forward_ranking_rejects_bars_on_calendar_closed_date(tmp_path: Path) -> None:
+    """验证前瞻排名拒绝行情在日历休市日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars_path, signal_date = _bars_csv(tmp_path / "bars.csv")
     repo = Path(__file__).resolve().parents[1]
     capture = tmp_path / "capture.json"

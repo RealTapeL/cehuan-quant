@@ -1,3 +1,4 @@
+"""Qlib 静态数据桥接。模块把策环规范行情转换为 Qlib StaticDataLoader 可读的 Parquet 特征，并计算点时动量排名；不会训练模型或生成券商订单。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,12 +15,7 @@ from cehuan.data.canonical import normalize_bar_frame
 
 
 def export_qlib_frame(frame: pd.DataFrame, target: str | Path) -> Path:
-    """Write a Qlib StaticDataLoader-compatible Parquet snapshot.
-
-    The MultiIndex follows Qlib's documented (datetime, instrument) layout.
-    ``factor`` is the ratio of post-adjusted to raw close; execution fields stay
-    available in canonical data and are not used as live order prices.
-    """
+    """导出 Qlib StaticDataLoader 可读取的 Parquet 快照。参数：frame 为规范行情，target 为输出路径。返回：写入后的 Path。副作用：创建父目录并写 Parquet；signal price 按项目复权适配器选择，执行字段不作为订单价格。"""
     data = normalize_bar_frame(frame)
     signal_prices, _ = select_signal_prices(data)
     sources = signal_price_sources(data)
@@ -46,6 +42,7 @@ def export_qlib_frame(frame: pd.DataFrame, target: str | Path) -> Path:
 
 
 def qlib_static_loader_check(frame: pd.DataFrame, output_path: str | Path) -> dict[str, object]:
+    """通过 Qlib StaticDataLoader 读取刚导出的快照并检查索引。参数：frame 为规范行情，output_path 为 Parquet 路径。返回：Qlib 版本、区间、行列和校验状态。异常：依赖未安装或索引不符合 datetime/instrument 时抛 RuntimeError。不会训练模型。"""
     try:
         import qlib
         from qlib.data.dataset.loader import StaticDataLoader
@@ -68,7 +65,7 @@ def qlib_static_loader_check(frame: pd.DataFrame, output_path: str | Path) -> di
 
 
 def calculate_qlib_momentum(loaded: pd.DataFrame, lookback_sessions: int) -> pd.DataFrame:
-    """Calculate per-instrument momentum and per-date ranking on Qlib's MultiIndex data."""
+    """在 Qlib 的 datetime/instrument 多级索引上计算动量及逐日排名。参数：loaded 为包含 close 的 Qlib 表，lookback_sessions 为回看开市日数。返回：保留输入列并附 momentum/rank 的 DataFrame；复权来源码不一致或窗口不足时动量为空。异常：索引、特征或窗口参数不合约定时抛 ValueError。"""
     if lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须大于 0")
     if not isinstance(loaded.index, pd.MultiIndex) or list(loaded.index.names) != ["datetime", "instrument"]:
@@ -79,6 +76,7 @@ def calculate_qlib_momentum(loaded: pd.DataFrame, lookback_sessions: int) -> pd.
     result = loaded[columns].sort_index().copy()
 
     def calculate(group: pd.DataFrame) -> pd.Series:
+        """对单只 instrument 的时间序列计算连续价格口径的窗口动量。参数：group 为该证券按日期排序的数据。返回：与索引对齐的动量 Series；混合来源码或不完整窗口被掩为缺失。"""
         close = pd.to_numeric(group["close"], errors="coerce")
         source = (
             pd.to_numeric(group["price_source_code"], errors="coerce").fillna(0)
@@ -110,7 +108,7 @@ def qlib_momentum_signals(
     output_path: str | Path,
     lookback_sessions: int,
 ) -> dict[str, object]:
-    """Load the project snapshot through Qlib and calculate a point-in-time rank feature."""
+    """导出行情、调用 Qlib 加载并生成动量特征 CSV。参数：frame 为规范行情，data_path 为 Qlib 快照路径，output_path 为信号文件，lookback_sessions 为回看开市日数。返回：版本、文件、覆盖行数和可用时间说明。副作用：写 Parquet 与 CSV；特征在收盘后可得，最早执行日为下一开市日，不是订单。异常：依赖缺失或特征输入失败时阻断。"""
     if lookback_sessions < 1:
         raise ValueError("lookback_sessions 必须大于 0")
     try:

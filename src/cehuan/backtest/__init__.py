@@ -1,1 +1,1 @@
-"""Constraint-aware baseline backtest."""
+"""约束感知的基线回测、输入证明和实验续跑组件。"""

@@ -1,3 +1,4 @@
+"""人工成交与持仓复盘。模块按映射配置读取用户导出的 CSV，比较计划、成交、委托状态和持仓快照；缺少状态/快照时保留未知，不自动推断撤单或空仓。"""
 from __future__ import annotations
 
 import hashlib
@@ -24,11 +25,13 @@ DEFAULT_MAPPING = Path(__file__).resolve().parents[3] / "configs" / "huatai_colu
 
 
 def _read_mapping(path: str | Path | None) -> dict[str, object]:
+    """读取华泰列映射 TOML。参数：path 为可选映射文件，None 时使用项目模板。返回：映射字典；文件/格式错误时阻断。"""
     with (Path(path) if path else DEFAULT_MAPPING).open("rb") as handle:
         return tomllib.load(handle)
 
 
 def _rename_aliases(frame: pd.DataFrame, aliases: dict[str, list[str]]) -> pd.DataFrame:
+    """按映射配置把供应商列名映射为规范字段。参数：frame 为原始 CSV 表，aliases 为规范字段到别名列表。返回：重命名后的副本，不修改原表。"""
     data = frame.copy()
     rename: dict[str, str] = {}
     for canonical, choices in aliases.items():
@@ -41,6 +44,7 @@ def _rename_aliases(frame: pd.DataFrame, aliases: dict[str, list[str]]) -> pd.Da
 
 
 def read_fills(path: str | Path, mapping_path: str | Path | None = None) -> pd.DataFrame:
+    """读取并规范成交 CSV。参数：path 为成交文件，mapping_path 为可选列/方向映射。返回：包含日期、代码、方向、股数、价格、费用和成本字段的规范 DataFrame。异常：必需字段、方向、数量或价格无效时阻断；缺费用按当前实现记 0，须与真实账单区分。"""
     mapping = _read_mapping(mapping_path)
     fills = _rename_aliases(pd.read_csv(path), mapping.get("fills", {}))
     if "direction" in fills.columns and "side" not in fills.columns:
@@ -68,6 +72,7 @@ def read_fills(path: str | Path, mapping_path: str | Path | None = None) -> pd.D
 
 
 def read_positions(path: str | Path, mapping_path: str | Path | None = None) -> pd.DataFrame:
+    """读取并规范持仓快照 CSV。参数：path 为快照，mapping_path 为列映射。返回：证券、持有/可卖股数、成本、现价和名称字段。异常：证券/数量缺失或持仓数为负时阻断；未提供快照不表示空仓。"""
     mapping = _read_mapping(mapping_path)
     positions = _rename_aliases(pd.read_csv(path), mapping.get("positions", {}))
     required = ["symbol", "shares"]
@@ -86,6 +91,7 @@ def read_positions(path: str | Path, mapping_path: str | Path | None = None) -> 
 
 
 def read_order_statuses(path: str | Path) -> pd.DataFrame:
+    """读取带原件哈希绑定的委托状态证据 CSV。参数：path 为状态文件。返回：规范状态 DataFrame，并解析状态时点和原件路径。副作用：读取并哈希证据文件。异常：状态字段、状态枚举、时间、唯一性或原件摘要不匹配时拒绝。"""
     raw_bytes = Path(path).expanduser().read_bytes()
     statuses = pd.read_csv(BytesIO(raw_bytes), dtype=str, keep_default_na=False)
     missing = sorted(set(ORDER_STATUS_COLUMNS).difference(statuses.columns))
@@ -135,7 +141,7 @@ def read_order_statuses(path: str | Path) -> pd.DataFrame:
 
 
 def compare_positions_to_plan(plan: pd.DataFrame, positions: pd.DataFrame) -> pd.DataFrame:
-    """Compare a supplied position snapshot with plan targets and known costs."""
+    """将持仓快照与计划目标股数逐证券对照。参数：plan 为含目标的计划，positions 为本地持仓快照。返回：目标/实际股数差、可卖数、成本估值及状态报告。未列明快照时不调用；市值口径受输入价格和成本字段限制。"""
     if not {"symbol", "target_shares"}.issubset(plan.columns):
         raise ValueError("计划 CSV 缺少 symbol/target_shares 字段")
     expected = plan[[column for column in ("symbol", "action", "target_shares") if column in plan]].copy()
@@ -153,6 +159,7 @@ def compare_positions_to_plan(plan: pd.DataFrame, positions: pd.DataFrame) -> pd
     )
 
     def classify(row: pd.Series) -> str:
+        """为一条计划/持仓合并记录分类目标匹配状态。参数：row 为合并行。返回：UNPLANNED_POSITION、NO_POSITION、TARGET_UNKNOWN、MATCHED_TARGET、ABOVE_TARGET 或 BELOW_TARGET。缺少快照值按当前规则视作零，仅适用于已提供的快照文件。"""
         if pd.isna(row.get("plan_action")):
             return "UNPLANNED_POSITION" if row["actual_shares"] else "NO_POSITION"
         if pd.isna(row.get("planned_target_shares")):
@@ -168,7 +175,7 @@ def compare_positions_to_plan(plan: pd.DataFrame, positions: pd.DataFrame) -> pd
 
 
 def compare_plan_revisions(original: pd.DataFrame, revised: pd.DataFrame) -> pd.DataFrame:
-    """Return an explicit field-level diff between an issued and user-edited plan."""
+    """逐字段比较原始计划和用户修改后计划。参数：original/revised 为计划 DataFrame。返回：发生变化的计划证券行及旧/新值。异常：字段缺失、重复键或前后行集合不一致时阻断。不会把修改自动当成成交。"""
     required = {"plan_id", "symbol", "action", "planned_shares", "target_shares", "reference_price"}
     for name, frame in (("原计划", original), ("修改后计划", revised)):
         missing = sorted(required.difference(frame.columns))
@@ -216,6 +223,7 @@ def compare_plan_and_fills(
     fills: pd.DataFrame,
     order_statuses: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    """按证券和买卖方向对照计划数量、导入成交、委托状态及费用。参数：plan 为交易计划，fills 为规范成交表，order_statuses 为可选且已验证的委托状态证据。返回：逐计划行对账、成交 VWAP、未成交量、价格差和可核算的已实现盈亏。异常：字段或委托状态关联冲突时阻断。没有成交不等于已取消；费用口径由输入文件决定。"""
     required = {"symbol", "action", "planned_shares", "reference_price"}
     if not required.issubset(plan.columns):
         raise ValueError("计划 CSV 缺少 symbol/action/planned_shares/reference_price 字段")
@@ -272,6 +280,7 @@ def compare_plan_and_fills(
     result["unfilled_quantity"] = (result["planned_quantity"] - result["filled_quantity"]).clip(lower=0)
     result["fill_ratio"] = result.apply(lambda row: row["filled_quantity"] / row["planned_quantity"] if row["planned_quantity"] else pd.NA, axis=1)
     def reconcile_status(row: pd.Series) -> str:
+        """结合计划数量、成交数量和明确委托状态分类对账结果。参数：row 为合并行。返回：匹配、部分成交、无成交、撤单或冲突类别；状态未知时按成交量仅作保守分类。"""
         planned = int(row["planned_quantity"])
         filled = int(row["filled_quantity"])
         order_status = str(row["order_status"])
@@ -318,6 +327,7 @@ def compare_plan_and_fills(
 
 
 def review_markdown(report: pd.DataFrame, position_report: pd.DataFrame | None = None) -> str:
+    """把成交对账和可选持仓偏差渲染为中文 Markdown。参数：report 为成交对账表，position_report 为可选持仓表。返回：报告文本；无快照时明确持仓未知，不推断空仓。"""
     fees = float(report["fees_cny"].sum()) if not report.empty else 0.0
     unfilled = int(report["unfilled_quantity"].sum()) if not report.empty else 0
     lines = [
@@ -343,6 +353,7 @@ def review_markdown(report: pd.DataFrame, position_report: pd.DataFrame | None =
             ]
     for _, row in report.iterrows():
         def value(field: str, fmt: str) -> str:
+            """格式化复盘行中的可选数值字段。参数：field 为列名，fmt 为 Python 数值格式。返回：空值时空字符串，否则按格式渲染。"""
             val = row.get(field)
             return "" if pd.isna(val) else format(float(val), fmt)
         evidence_hash = "" if pd.isna(row.get("order_status_evidence_sha256")) else str(row["order_status_evidence_sha256"])
@@ -357,6 +368,7 @@ def review_markdown(report: pd.DataFrame, position_report: pd.DataFrame | None =
         lines += ["", "## 持仓快照与计划目标", "", "| 代码 | 计划动作 | 目标股数 | 快照股数 | 差异 | 可卖股数 | 浮动盈亏（有成本/现价时） | 状态 |", "|---|---|---:|---:|---:|---:|---:|---|"]
         for _, row in position_report.iterrows():
             def position_value(field: str) -> str:
+                """将持仓报告中的可选股数转换为整数文本。参数：field 为列名。返回：缺失时空字符串，否则整数值字符串。"""
                 value = row.get(field)
                 return "" if pd.isna(value) else str(int(value))
             pnl = row.get("unrealized_pnl_cny")

@@ -1,3 +1,5 @@
+"""策环测试模块：验证交易痕迹审计中的持仓权益、目标变化、窗口质量和事实边界。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import runpy
@@ -23,6 +25,7 @@ _session_window_audit = runpy.run_path(
 
 
 def _holding(*, start: str, through: str, exit_day: str | None = None, closure: str = "OPEN_AT_WINDOW_END") -> pd.DataFrame:
+    """私有测试辅助函数，用于持仓。 参数：`start`：代码标识“start”（含义待核实）场景输入；`through`：经过场景输入；`exit_day`：退出日场景输入；`closure`：代码标识“closure”（含义待核实）场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     return pd.DataFrame([{
         "symbol": "SZ000001",
         "holding_start_trade_date_at_open": start,
@@ -33,6 +36,7 @@ def _holding(*, start: str, through: str, exit_day: str | None = None, closure: 
 
 
 def test_action_audit_does_not_keep_record_date_entitlement_after_record_date_sale():
+    """验证行动审计不保持登记日期权益资格之后登记日期卖出。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _match_action_to_holding_windows(
         "2024-12-04",
         ["2024-12-04", "2024-12-05"],
@@ -44,6 +48,7 @@ def test_action_audit_does_not_keep_record_date_entitlement_after_record_date_sa
 
 
 def test_action_audit_grants_record_date_entitlement_for_same_day_purchase():
+    """验证行动审计赋予登记日期权益资格针对相同日买入。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _match_action_to_holding_windows(
         "2024-12-04",
         ["2024-12-04"],
@@ -55,6 +60,7 @@ def test_action_audit_grants_record_date_entitlement_for_same_day_purchase():
 
 
 def test_action_audit_uses_end_of_day_interval_for_partial_sale_and_opening_holding():
+    """验证行动审计使用结束的日区间针对部分卖出与开盘持仓。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _match_action_to_holding_windows(
         "2024-12-04",
         ["2024-12-04", "2024-12-05"],
@@ -65,6 +71,7 @@ def test_action_audit_uses_end_of_day_interval_for_partial_sale_and_opening_hold
 
 
 def test_action_audit_does_not_match_position_fully_sold_before_record_date():
+    """验证行动审计不匹配持仓全部已卖出之前登记日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _match_action_to_holding_windows(
         "2024-12-04",
         ["2024-12-04"],
@@ -74,6 +81,7 @@ def test_action_audit_does_not_match_position_fully_sold_before_record_date():
 
 
 def test_action_audit_supports_multiple_lots_or_fills_around_record_date():
+    """验证行动审计支持多个批次或成交附近登记日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     windows = pd.concat([
         _holding(start="2024-11-06", through="2024-12-04"),
         _holding(start="2024-12-04", through="2024-12-04"),
@@ -84,6 +92,7 @@ def test_action_audit_supports_multiple_lots_or_fills_around_record_date():
 
 
 def test_action_phase_after_record_date_remains_linked_to_eligible_holding():
+    """验证行动阶段之后登记日期仍为关联到合格持仓。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _match_action_to_holding_windows(
         "2024-12-03",
         ["2024-12-03", "2024-12-04", "2024-12-05"],
@@ -94,6 +103,7 @@ def test_action_phase_after_record_date_remains_linked_to_eligible_holding():
 
 
 def test_target_audit_distinguishes_zero_share_noop_from_zero_target_liquidation():
+    """验证目标审计区分零股份无操作从零目标清仓。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars = pd.DataFrame([
         {"trade_date": "2025-01-02", "symbol": "SZ000001", "open": 10.0},
         {"trade_date": "2025-01-03", "symbol": "SZ000001", "open": 10.0},
@@ -125,6 +135,7 @@ def test_target_audit_distinguishes_zero_share_noop_from_zero_target_liquidation
 
 
 def test_suspension_counts_keep_unknown_separate_and_reconcile():
+    """验证停牌计数保持未知分开与对账。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     counts = _suspension_state_counts(pd.Series([True, False, pd.NA, "unknown", "是", "否"]))
     assert counts == {
         "total_rows": 6,
@@ -136,6 +147,7 @@ def test_suspension_counts_keep_unknown_separate_and_reconcile():
 
 
 def test_session_window_audit_detects_missing_duplicate_and_off_calendar_rows():
+    """验证交易日窗口审计检测缺失重复与偏离日历行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     history = pd.DataFrame({
         "trade_date": ["2024-01-01", "2024-01-02", "2024-01-02", "2024-01-04"],
         "data_source": ["BaoStock"] * 4,
@@ -157,6 +169,7 @@ def test_session_window_audit_detects_missing_duplicate_and_off_calendar_rows():
 
 
 def test_suspension_candidate_reports_fills_and_blocked_attempts_without_claiming_order_count():
+    """验证停牌候选报告成交与阻断尝试缺少声称订单计算。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     dates = pd.date_range("2024-01-01", periods=22, freq="D").strftime("%Y-%m-%d").tolist()
     bars = pd.DataFrame([{
         "trade_date": day,
@@ -193,6 +206,7 @@ def test_suspension_candidate_reports_fills_and_blocked_attempts_without_claimin
 
 
 def test_suspension_candidate_with_no_fill_and_blocked_attempt_keeps_order_status_unknown():
+    """验证停牌候选带有没有成交与阻断尝试保持订单状态未知。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     dates = pd.date_range("2024-01-01", periods=22, freq="D").strftime("%Y-%m-%d").tolist()
     bars = pd.DataFrame([{
         "trade_date": day, "symbol": "SH603268", "adjusted_close": 10 + index,
@@ -215,6 +229,7 @@ def test_suspension_candidate_with_no_fill_and_blocked_attempt_keeps_order_statu
 
 
 def test_future_rows_do_not_change_past_momentum_or_ranking():
+    """验证未来行不变更历史动量或排名。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     from cehuan.signals.strategy import add_momentum, rank_precomputed_day
 
     signal_dates = pd.date_range("2024-01-01", periods=21, freq="D").strftime("%Y-%m-%d").tolist()
@@ -246,6 +261,7 @@ def test_future_rows_do_not_change_past_momentum_or_ranking():
     market = {"require_point_in_time_status": True, "exclude_st": True}
 
     def ranked_at_signal(frame: pd.DataFrame) -> pd.DataFrame:
+        """实现测试替身test_future_rows_do_not_change_past_momentum_or_ranking的已排名于信号行为；用于控制被测代码与断言，不访问真实服务。 参数：`frame`：数据表场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         calculated = add_momentum(frame, 20)
         day = calculated.loc[calculated.trade_date.astype(str).eq(signal_dates[-1])]
         return rank_precomputed_day(day, strategy, market, require_order_rules=False)[["symbol", "momentum", "rank"]]

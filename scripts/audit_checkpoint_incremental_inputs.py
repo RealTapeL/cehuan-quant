@@ -1,3 +1,5 @@
+"""只读核验增量续跑证明、checkpoint 绑定和声明产物的完整性；依赖 checkpoint 与审计模块，不修改回测状态。"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,11 +30,13 @@ SCHEMA_V2_ARTIFACT_ROLES = (
 
 
 def _path(value: str) -> Path:
+    """把可选路径字段解析为规范路径；空值保留为空，供后续区分缺失与无效输入。"""
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
 
 
 def _read_json(path: Path) -> Any:
+    """读取 JSON 审计或 checkpoint 文件；文件缺失、编码或格式错误由调用方记录为审计失败。"""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -40,6 +44,7 @@ def _read_json(path: Path) -> Any:
 
 
 def _checkpoint_binding_status(proof_checkpoint: dict[str, Any], checkpoint: Any) -> tuple[str, list[str]]:
+    """比较证明文件登记的 checkpoint 摘要与实际 checkpoint；返回绑定状态及差异说明。"""
     differences: list[str] = []
     for field, actual in (
         ("state_sha256", checkpoint.state_sha256),
@@ -60,6 +65,7 @@ def _checkpoint_binding_status(proof_checkpoint: dict[str, Any], checkpoint: Any
 
 
 def _verify_artifact(path_value: Any, expected_sha: Any, role: str) -> dict[str, str]:
+    """核对一个声明产物是否存在、角色是否匹配且字节哈希一致；不把哈希一致解释为内容正确。"""
     if path_value in (None, ""):
         return {"role": role, "status": "UNVERIFIED", "detail": "未提供实际文件路径"}
     if not isinstance(path_value, str):
@@ -88,6 +94,7 @@ def _verify_artifact(path_value: Any, expected_sha: Any, role: str) -> dict[str,
 
 
 def _audit_declared_artifacts(proofs: list[tuple[str, dict[str, Any]]]) -> tuple[str, list[dict[str, str]]]:
+    """逐项检查证明中声明的来源产物，并汇总缺失、哈希不符和角色不符情况。"""
     rows: list[dict[str, str]] = []
     for side, proof in proofs:
         checkpoint = proof.get("checkpoint", {})
@@ -151,6 +158,7 @@ def _audit_declared_artifacts(proofs: list[tuple[str, dict[str, Any]]]) -> tuple
 
 
 def _blocked_report(proof_schema_status: str, detail: str) -> dict[str, Any]:
+    """在证明结构或前置核验失败时构造阻断报告；保留阻断原因而不尝试续跑。"""
     return {
         "schema_version": 1,
         "report_type": "checkpoint_incremental_input_preflight_only",
@@ -176,6 +184,7 @@ def _blocked_report(proof_schema_status: str, detail: str) -> dict[str, Any]:
 
 
 def main() -> int:
+    """解析命令行输入，执行只读增量输入审计并写出报告；输入或证明不完整时以阻断状态结束。"""
     parser = argparse.ArgumentParser(
         description="生成 checkpoint 增量输入的只读兼容性预检报告；不会放行回测续跑",
     )
@@ -242,10 +251,12 @@ def main() -> int:
         else "UNVERIFIED"
     )
     def is_cutoff_artifact(item: dict[str, str]) -> bool:
+        """判断登记产物是否属于决策截止时点证据；只按声明元数据分类，不验证来源内容。"""
         role = item.get("role", "")
         return "cutoff_evidence" in role or "decision_cutoff_source" in role
 
     def is_source_evidence_artifact(item: dict[str, str]) -> bool:
+        """判断登记产物是否为来源证据文件；不据此认定来源已人工审核。"""
         role = item.get("role", "")
         return "provenance_registry" in role or any(
             f":{family}:" in role or role.endswith(f":{family}")
@@ -260,6 +271,7 @@ def main() -> int:
     ]
 
     def aggregate_audit_status(rows: list[dict[str, str]]) -> str:
+        """根据各项审计结果汇总总状态；任一必要项未验证或失败时保留非通过状态。"""
         if any(item["status"] == "FAILED" for item in rows):
             return "FAILED"
         if not rows or any(item["status"] == "UNVERIFIED" for item in rows):

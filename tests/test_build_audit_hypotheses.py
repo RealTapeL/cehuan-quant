@@ -1,3 +1,5 @@
+"""策环测试模块：验证审计假设构建器绑定实际配置与来源证据，并保持原审计只读。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import csv
@@ -16,14 +18,17 @@ _BUILD = runpy.run_path("scripts/build_audit_hypotheses.py")["build"]
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _json(path: Path, payload: object) -> None:
+    """私有测试辅助函数，用于JSON。 参数：`path`：路径场景输入；`payload`：载荷场景输入。 返回：None，供调用处构造夹具或断言复用。"""
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _source_package(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    """私有测试辅助函数，用于来源包。 参数：`tmp_path`：pytest 提供的临时目录。 返回：tuple[Path, Path, dict[str, str]]，供调用处构造夹具或断言复用。"""
     audit = tmp_path / "source-audit"
     audit.mkdir()
     config = tmp_path / "config.json"
@@ -69,6 +74,7 @@ def _source_package(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
 
 
 def test_build_binds_actual_config_and_keeps_source_audit_immutable(tmp_path: Path) -> None:
+    """验证构建绑定实际配置与保持来源审计不变。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, before = _source_package(tmp_path)
     output = tmp_path / "new-hypotheses"
     result = _BUILD(audit, config, output)
@@ -86,6 +92,7 @@ def test_build_binds_actual_config_and_keeps_source_audit_immutable(tmp_path: Pa
 
 
 def test_different_config_is_rejected_without_creating_output(tmp_path: Path) -> None:
+    """验证不同配置拒绝缺少创建输出。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, before = _source_package(tmp_path)
     other = tmp_path / "different-config.json"
     _json(other, {"strategy": {"lookback": 10, "max_positions": 3}})
@@ -99,6 +106,7 @@ def test_different_config_is_rejected_without_creating_output(tmp_path: Path) ->
 
 
 def test_same_config_bytes_at_another_path_are_accepted(tmp_path: Path) -> None:
+    """验证相同配置字节于另一路径接受。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, _ = _source_package(tmp_path)
     copy = tmp_path / "config-copy.json"
     copy.write_bytes(config.read_bytes())
@@ -107,6 +115,7 @@ def test_same_config_bytes_at_another_path_are_accepted(tmp_path: Path) -> None:
 
 
 def test_missing_registered_config_hash_is_rejected(tmp_path: Path) -> None:
+    """验证缺失已登记配置哈希拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, _ = _source_package(tmp_path)
     summary_path = audit / "trade-audit-summary.json"
     summary = json.loads(summary_path.read_text())
@@ -127,6 +136,7 @@ def test_missing_registered_config_hash_is_rejected(tmp_path: Path) -> None:
 
 
 def test_source_evidence_hash_mismatch_is_rejected(tmp_path: Path) -> None:
+    """验证来源证据哈希不符拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, _ = _source_package(tmp_path)
     with (audit / "zero-target-review.csv").open("a", encoding="utf-8") as handle:
         handle.write("# changed\n")
@@ -135,6 +145,7 @@ def test_source_evidence_hash_mismatch_is_rejected(tmp_path: Path) -> None:
 
 
 def test_existing_or_nested_output_is_rejected(tmp_path: Path) -> None:
+    """验证已有或嵌套输出拒绝。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     audit, config, _ = _source_package(tmp_path)
     existing = tmp_path / "exists"
     existing.mkdir()

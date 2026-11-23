@@ -1,1 +1,1 @@
-"""Qlib and future automated research integrations."""
+"""研究流程包，包含数据摘要、策略假设、受控实验、前瞻排名及结果报告模块；不直接连接券商。"""

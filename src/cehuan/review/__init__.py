@@ -1,1 +1,1 @@
-"""Manual fill import and plan comparison."""
+"""人工交易复盘包，负责本地成交/持仓导入、差异核对和保守的跨文件重复审查；不发送或撤销委托。"""

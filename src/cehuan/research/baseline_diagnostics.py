@@ -1,3 +1,5 @@
+"""基线敏感性诊断入口。它把冻结配置、真实或合成行情及基准交给现有回测引擎，比较预先登记的诊断参数变化并保存实验产物；本模块不解锁正式基线，也不把诊断结果解释为收益保证。"""
+
 from __future__ import annotations
 
 import copy
@@ -24,7 +26,12 @@ def run_baseline_sensitivity(
     *,
     diagnostic: bool = False,
 ) -> dict[str, Any]:
-    """Run the frozen baseline and transparent one-assumption-at-a-time checks."""
+    """按冻结配置运行基线敏感性诊断并保存对照产物。
+
+    参数：bars 为规范化行情，membership 为按日股票池，benchmark 为基准序列，initial_cash_cny 为初始现金（人民币），frozen_config 为只读基线配置，output_dir 为新实验目录，security_identity_events 为可选身份事件，diagnostic 控制是否明确走研究诊断路径。
+    返回：包含实验状态、基线与候选结果及文件路径的字典。
+    副作用：创建实验输出文件；不会改写传入配置。
+    异常：输入范围、配置或回测门控不满足时由校验器/引擎抛出异常。"""
     if not diagnostic:
         raise ValueError("敏感性场景含回退假设；必须显式设置 diagnostic=True，不能作为正式基线")
     point_in_time_bars, universe_coverage, discrepancies = filter_bars_to_point_in_time_universe(

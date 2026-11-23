@@ -1,3 +1,5 @@
+"""假设输入覆盖度预检。模块检查 H1 窗口及 H2 后续决策/执行输入是否齐全，只报告字段和时间覆盖，不计算策略收益或下单结果。"""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -18,6 +20,9 @@ H1_LOOKBACK_SESSIONS = 20
 
 
 def _day(value: object) -> str:
+    """把日期、时间或常见字符串规范为 YYYY-MM-DD。
+    参数：value 为原始日期值。
+    返回：有效日期字符串；无法解析时返回空字符串。"""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -38,6 +43,9 @@ def _day(value: object) -> str:
 
 
 def _flag(value: object) -> bool | None:
+    """把常见布尔编码解析为三态状态。
+    参数：value 为原始单元格。
+    返回：True、False 或 None；未知值不按 False 处理。"""
     if pd.isna(value) or value == "":
         return None
     normalized = str(value).strip().lower()
@@ -49,6 +57,9 @@ def _flag(value: object) -> bool | None:
 
 
 def _number_present(value: object) -> bool:
+    """检查输入能否解析为有限数值。
+    参数：value 为原始数值。
+    返回：有效有限数值时为 True，否则为 False。"""
     if pd.isna(value):
         return False
     try:
@@ -59,12 +70,19 @@ def _number_present(value: object) -> bool:
 
 
 def _positive_price_valid(value: object) -> bool:
+    """检查价格字段是否为有限正数。
+    参数：value 为原始价格。
+    返回：仅严格大于零的有效数值返回 True。"""
     if not _number_present(value):
         return False
     return float(value) > 0
 
 
 def _next_open_sessions(calendar: pd.DataFrame, signal_day: str, count: int = 2) -> list[str]:
+    """从信号日之后取得指定数量的开市日。
+    参数：calendar 为交易日历，signal_day 为信号日，count 为后续开市日数量。
+    返回：按时间顺序的日期字符串列表。
+    异常：信号日不在开市日或日历覆盖不足时阻断。"""
     sessions = normalize_trading_calendar(calendar)
     open_days = [row.isoformat() for row in sessions.loc[sessions.is_open, "trade_date"]]
     try:
@@ -83,6 +101,10 @@ def _next_open_sessions(calendar: pd.DataFrame, signal_day: str, count: int = 2)
 
 
 def _window_dates(calendar: pd.DataFrame, signal_day: str, count: int) -> list[str]:
+    """取得截至信号日的最近若干开市日。
+    参数：calendar 为交易日历，signal_day 为窗口终点，count 为所需交易日数。
+    返回：从早到晚排序的日期列表。
+    异常：信号日非开市日或自然日历覆盖不完整时阻断。"""
     sessions = normalize_trading_calendar(calendar)
     open_days = [row.isoformat() for row in sessions.loc[sessions.is_open, "trade_date"] if row.isoformat() <= signal_day]
     if not open_days or open_days[-1] != signal_day:
@@ -98,6 +120,10 @@ def _window_dates(calendar: pd.DataFrame, signal_day: str, count: int) -> list[s
 
 
 def _availability(raw: object) -> pd.Timestamp | None:
+    """解析来源字段中的可用时间为 UTC 时间戳。
+    参数：raw 为记录值。
+    返回：有效时区时间戳；缺失或无效时返回 None。
+    限制：解析字段不证明供应商实际发布时间。"""
     if pd.isna(raw) or str(raw).strip() == "":
         return None
     parsed = pd.to_datetime(raw, errors="coerce", utc=True)
@@ -113,13 +139,12 @@ def compute_hypothesis_input_coverage(
     config: dict[str, Any] | None = None,
     created_at_utc: str | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    """Summarize H1/H2 input availability without computing strategy returns.
+    """生成 H1/H2 输入覆盖报告及逐证券明细。
 
-    H1 is measured both over each signal-date stock-member universe and over
-    the original ranked candidate rows. H2 checks the original candidate pool
-    against decision/execution session bars and distinguishes recorded adapter
-    timestamps from evidence of historical source availability.
-    """
+    参数：bars 为规范行情，universe_members 为按日成员，trading_calendar 为日历，candidate_pool 为重建候选；config 只提供解释所需配置，created_at_utc 可固定报告生成时间。
+    返回：报告字典、H1 窗口明细和 H2 候选输入明细。
+    副作用：无文件写入。
+    异常：必需列、日期、开市窗口或候选排序无效时抛出 ValueError。"""
     normalized_bars = normalize_bar_frame(bars, compact=False)
     normalized_calendar = normalize_trading_calendar(trading_calendar)
     members = universe_members.copy()

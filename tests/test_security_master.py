@@ -1,3 +1,5 @@
+"""策环测试模块：验证证券主数据只在事件有效日期范围内生效。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -6,6 +8,7 @@ from cehuan.data.security_master import apply_security_master
 
 
 def test_security_master_only_applies_inside_effective_date_window() -> None:
+    """验证证券主数据仅生效范围内生效日期窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars = pd.DataFrame([
         {"trade_date": "2025-01-01", "symbol": "600519", "open": 10, "high": 11, "low": 9, "close": 10, "volume_shares": 100},
         {"trade_date": "2025-01-02", "symbol": "600519", "open": 10, "high": 11, "low": 9, "close": 10, "volume_shares": 100},

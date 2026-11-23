@@ -1,3 +1,5 @@
+"""策环测试模块：验证研究假设输入覆盖审计对候选、窗口和未来交易日的区分。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -6,6 +8,7 @@ from cehuan.research.hypothesis_input_coverage import compute_hypothesis_input_c
 
 
 def _inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """私有测试辅助函数，用于输入。 返回：tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]，供调用处构造夹具或断言复用。"""
     open_dates = pd.bdate_range("2025-01-06", periods=23).strftime("%Y-%m-%d").tolist()
     signal_day = open_dates[20]
     decision_day = open_dates[21]
@@ -48,6 +51,7 @@ def _inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 def test_hypothesis_coverage_separates_full_pool_candidates_and_timing_gaps() -> None:
+    """验证假设覆盖区分完整股票池候选与时点缺口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, universe, calendar, candidates = _inputs()
     report, h1, h2 = compute_hypothesis_input_coverage(
         bars, universe, calendar, candidates,
@@ -87,6 +91,7 @@ def test_hypothesis_coverage_separates_full_pool_candidates_and_timing_gaps() ->
 
 
 def test_hypothesis_coverage_rejects_uncovered_future_open_sessions() -> None:
+    """验证假设覆盖拒绝未覆盖未来开盘交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, universe, calendar, candidates = _inputs()
     calendar = calendar.loc[calendar.trade_date.ne(pd.bdate_range("2025-01-06", periods=23)[-1].strftime("%Y-%m-%d"))]
     try:
@@ -98,6 +103,7 @@ def test_hypothesis_coverage_rejects_uncovered_future_open_sessions() -> None:
 
 
 def test_h1_coverage_marks_invalid_price_rows() -> None:
+    """验证H1覆盖标记无效价格行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, universe, calendar, candidates = _inputs()
     signal_day = candidates.signal_date.iloc[0]
     bars.loc[
@@ -113,6 +119,7 @@ def test_h1_coverage_marks_invalid_price_rows() -> None:
 
 
 def test_h1_candidate_filter_promotes_next_rank_without_performance_claim() -> None:
+    """验证H1候选筛选递补下一条排序缺少表现声明。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, universe, calendar, candidates = _inputs()
     signal_day = candidates.signal_date.iloc[0]
     third_symbol = "SH600002"
@@ -141,6 +148,7 @@ def test_h1_candidate_filter_promotes_next_rank_without_performance_claim() -> N
 
 
 def test_h1_candidate_filter_promotes_next_rank_without_performance_claim() -> None:
+    """验证H1候选筛选递补下一条排序缺少表现声明。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, universe, calendar, candidates = _inputs()
     signal_day = candidates.signal_date.iloc[0]
     third_symbol = "SH600002"

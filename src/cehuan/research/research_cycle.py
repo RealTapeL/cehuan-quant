@@ -1,4 +1,4 @@
-"""Orchestrate a synthetic research-agent → experiment → review cycle."""
+"""研究周期编排器。模块串接结构化假设、受控候选实验、合成成交复盘和下一轮假设，并把程序事实绑定到文件哈希；默认示例使用合成输入，不修改当前有效策略。"""
 
 from __future__ import annotations
 
@@ -33,14 +33,17 @@ RESEARCH_AGENT_INPUT_EXAMPLE = Path(__file__).resolve().parents[3] / "examples" 
 
 
 def _sha256_bytes(value: bytes) -> str:
+    """计算内存字节的 SHA-256。参数：value 为待摘要内容。返回：小写十六进制摘要。"""
     return hashlib.sha256(value).hexdigest()
 
 
 def _canonical_digest(value: object) -> str:
+    """将 JSON 兼容对象按稳定序列化口径生成摘要。参数：value 为待绑定对象。返回：SHA-256 字符串；不可序列化值由 JSON 编码器拒绝。"""
     return _sha256_bytes(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
 
 def _read_settings(path: str | Path | None) -> dict[str, Any]:
+    """读取可选研究 Agent 设置文件。参数：path 为配置路径，None 时使用项目默认设置。返回：设置映射；缺失或 TOML 格式错误时抛出读取/解析异常。"""
     config_path = Path(path).expanduser().resolve() if path else DEFAULT_AGENT_CONFIG
     with config_path.open("rb") as handle:
         settings = tomllib.load(handle)
@@ -60,6 +63,7 @@ def _build_input(
     review_summary: dict[str, Any] | None = None,
     prior_experiments: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    """构造并验证研究 Agent 的单轮输入。参数：research_id/objective 标识研究，bars/config 为合成或受限数据与冻结配置，bars_digest 绑定行情，review_summary/prior_experiments 为可选既有事实。返回：符合输入 schema 的字典。异常：内容未通过输入校验时阻断。"""
     template = json.loads(RESEARCH_AGENT_INPUT_EXAMPLE.read_text(encoding="utf-8"))
     first_day = pd.to_datetime(bars["trade_date"]).min().date().isoformat()
     last_day = pd.to_datetime(bars["trade_date"]).max().date().isoformat()
@@ -107,6 +111,7 @@ def _build_input(
 
 
 def _review_summary(run_dir: Path) -> dict[str, Any]:
+    """从已完成的研究目录汇总程序复盘事实。参数：run_dir 为本轮目录。返回：复盘状态和可供下一轮模型使用的精简摘要；缺失产物保持未知/失败，不伪造数据。"""
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     reconciliation = pd.read_csv(run_dir / "reconciliation.csv")
     facts: list[dict[str, Any]] = []
@@ -144,6 +149,7 @@ def _review_summary(run_dir: Path) -> dict[str, Any]:
 
 
 def _artifact_reference(run_dir: Path, role: str, filename: str) -> dict[str, str]:
+    """生成研究产物的路径和摘要引用。参数：run_dir 为周期目录，role 描述文件用途，filename 为相对文件名。返回：可审计的产物引用；文件缺失时标记不可用。"""
     path = run_dir / filename
     if not path.is_file():
         return {"role": role, "path": filename, "status": "MISSING"}
@@ -156,6 +162,7 @@ def _artifact_reference(run_dir: Path, role: str, filename: str) -> dict[str, st
 
 
 def _finite_metric(metrics: dict[str, Any] | None, key: str) -> float | int | None:
+    """从指标对象取出有限数值。参数：metrics 为可选指标映射，key 为指标名。返回：有限数值或 None，避免把缺失值当作零。"""
     if not metrics or key not in metrics:
         return None
     value = metrics[key]
@@ -170,7 +177,7 @@ def _build_next_round_review_summary(
     reconciliation_facts: dict[str, Any],
     initial_hypothesis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Bind next-round model input to persisted experiment/review facts and source files."""
+    """从已保存实验、复盘和假设构造下一轮绑定输入。参数：run_dir 为本轮产物，reconciliation_facts 为程序对账事实，initial_hypothesis 为初始假设。返回：分开保存程序事实与文字建议的摘要及来源引用；不运行实验。"""
     registration_path = run_dir / "candidate_experiment.json"
     registration = json.loads(registration_path.read_text(encoding="utf-8"))
     baseline_path = run_dir / "baseline_metrics.json"
@@ -268,6 +275,7 @@ def _research_report(
     model_audits: list[dict[str, Any]],
     next_hypothesis_error: str | None,
 ) -> str:
+    """生成周期级中文研究报告。参数：研究 ID/目标、初始及下一轮假设、程序事实、复盘摘要、模型审计和下一轮错误共同构成报告内容。返回：Markdown 文本，明确合成边界和未完成状态。"""
     comparison = program_facts.get("metric_comparison") or {}
     experiment_facts = program_facts.get("experiment", {})
     baseline_metrics = program_facts.get("baseline_metrics") or {}
@@ -357,7 +365,7 @@ def run_research_cycle(
     agent_config_path: str | Path | None = None,
     model_mode: str | None = None,
 ) -> Path:
-    """Run initial hypothesis, paired synthetic experiment, synthetic review, then next hypothesis."""
+    """执行一个隔离研究周期：生成假设、运行配对候选实验、复盘合成成交并提出下一轮假设。参数：output_root 为输出根目录，objective 为研究目标，now 固定运行时间，scenario 选择合成成交情景，agent_config_path/model_mode 控制模型。返回：周期 ID、状态和产物路径。副作用：写入唯一运行目录，真实 LLM 模式可能计费；不连接券商。异常：本地校验或流程门控失败时保存失败状态并返回/抛出对应结果。"""
     objective = objective.strip()
     if not objective or len(objective) > 2000:
         raise ValueError("研究目标必须为 1 到 2000 个字符")
@@ -449,6 +457,7 @@ def run_research_cycle(
     candidate_box: dict[str, Any] = {}
 
     def before_plan(run_dir: Path, actual_bars: pd.DataFrame, base_config: dict[str, Any], base_result: dict[str, Any]) -> dict[str, str]:
+        """在创建合成交易计划前调用的可选研究钩子。参数：run_dir 为周期目录，actual_bars 为本次行情，base_config/base_result 为冻结配置与基线结果。返回：该周期需要记录的文件引用或哈希映射；副作用由调用方约束在隔离目录内。"""
         actual_digest = _sha256_bytes((run_dir / "synthetic_bars.csv").read_bytes())
         if actual_digest != bars_digest:
             raise ValueError("Agent 假设使用的合成行情与回测实际行情不同")

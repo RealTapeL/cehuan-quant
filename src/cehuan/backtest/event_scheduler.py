@@ -1,4 +1,9 @@
-"""Date-indexed scheduling for a deliberately small ledger-v2 event subset."""
+"""把支持的公司行动映射到交易日和账本处理阶段。
+
+调度器供回测引擎每日执行，当前只接入现金分红、1:1 代码变更、送转和配股。事件日期
+落在评价窗口内却不在交易日历、重复编号或未支持类型都会阻断；窗口外阶段不会被伪装成
+已处理，跨窗口状态由账本快照承接。
+"""
 
 from __future__ import annotations
 
@@ -23,10 +28,9 @@ SupportedAccountingEvent = CashDividendEvent | CodeChangeEvent | ShareDistributi
 
 @dataclass(frozen=True)
 class AccountingEventSchedule:
-    """Validate event/session alignment and expose explicit ledger phases.
+    """校验事件与交易日历对齐，并按阶段提供账本事件索引。
 
-    Supported events are cash dividends, 1:1 code changes, and share
-    distributions. Other action types fail closed.
+    当前支持现金分红、1:1 代码变更、送转和配股；其他事件类型失败关闭。
     """
 
     sessions: frozenset[date]
@@ -60,6 +64,12 @@ class AccountingEventSchedule:
         dividend_payment_withholding_per_share_cny: Mapping[str, Decimal | int | str | None] | None = None,
         rights_offering_decisions: Mapping[str, RightsOfferingDecision] | None = None,
     ) -> "AccountingEventSchedule":
+        """按日期构建公司行动处理索引。
+
+        ``events`` 是类型化事件，``session_dates`` 是输入交易日；分红税务及配股决策
+        映射必须引用存在的事件编号。返回不可变阶段调度；日期缺失、决策越界、重复事件
+        或未知税务口径时抛出异常。
+        """
         sessions = frozenset(session_dates)
         code_changes: dict[date, list[CodeChangeEvent]] = defaultdict(list)
         dividend_records: dict[date, list[CashDividendEvent]] = defaultdict(list)
@@ -81,6 +91,7 @@ class AccountingEventSchedule:
         event_rows: list[SupportedAccountingEvent] = []
 
         def schedule_phase(mapping: dict[date, list[object]], day: date, label: str, event: object) -> None:
+            """仅将窗口内且日历存在的阶段登记到日期索引，缺交易日即阻断。"""
             if window_start <= day <= window_end and day not in sessions:
                 event_id = getattr(event, "event_id", "unknown")
                 raise ValueError(f"账务事件 {event_id} 的{label}落在输入区间内但缺少交易日：{day}")
@@ -207,6 +218,7 @@ class AccountingEventSchedule:
                 rights_decisions[decision.decision_date].append((event, decision))
 
         def freeze(mapping: dict[date, list[object]]) -> dict[date, tuple]:
+            """按事件编号排序并冻结各阶段列表，避免后续修改调度状态。"""
             return {day: tuple(sorted(rows, key=lambda event: event.event_id)) for day, rows in mapping.items()}
 
         return cls(

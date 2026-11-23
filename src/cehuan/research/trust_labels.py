@@ -1,3 +1,5 @@
+"""实验可信度标签生成器。依据程序实际执行的检查生成保守标签，并明确输入完整性、历史可得性、规则费用及公司行动覆盖各自能证明的范围。"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -15,12 +17,10 @@ def build_research_trust_labels(
     accounting_event_count: int,
     formal_readiness_gate_passed: bool,
 ) -> dict[str, Any]:
-    """Create conservative, machine-derived trust labels for an experiment.
-
-    These labels summarize what the engine checked. They do not infer that a
-    historical vendor vintage, complete corporate-action universe, source
-    interpretation, or personal brokerage rate has been verified.
-    """
+    """从运行时审计事实构建可信度标签。
+    参数：quality_healthy 表示结构质量结果；input_file_sha256 和 source_file_checked_during_run 描述文件绑定；checkpoint_bound 表示是否使用绑定快照；market_rule_mode/fallback_rows 与 fee_mode 描述规则费用口径；accounting_event_count 为实际消费事件数；formal_readiness_gate_passed 表示正式门控状态。
+    返回：分项可信度状态字典。
+    限制：消费已登记事件不证明事件覆盖完整，适配器时间也不证明历史可得性。"""
     input_status = (
         "VERIFIED_DURING_RUN"
         if source_file_checked_during_run and input_file_sha256

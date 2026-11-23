@@ -1,3 +1,9 @@
+"""选择信号价格并追踪复权口径。
+
+本模块服务于特征和排名流程，只在每行已有的原始收盘价与复权收盘价间
+选择价格来源；它不补造复权因子，也不把混合口径窗口解释为有效收益。
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -11,7 +17,11 @@ MIXED_MODE = "point_in_time_mixed_adjustment"
 
 
 def signal_price_sources(frame: pd.DataFrame) -> pd.Series:
-    """Classify each row without looking at later rows in the same security."""
+    """逐行标记信号价格来源，不读取同一证券后续行来改变历史判断。
+
+    ``frame`` 至少包含证券、原始收盘价和复权收盘价；返回与输入索引对齐的来源标签。
+    无效或非正价格标记为不可用，不据此推定价格口径正确。
+    """
     required = {"symbol", "close", "adjusted_close"}
     if not required.issubset(frame.columns):
         raise ValueError("信号价格选择需要 symbol/close/adjusted_close 字段")
@@ -28,13 +38,11 @@ def signal_price_sources(frame: pd.DataFrame) -> pd.Series:
 
 
 def select_signal_prices(frame: pd.DataFrame) -> tuple[pd.Series, dict[str, str]]:
-    """Select each row's available basis; signal windows enforce a single basis.
+    """逐行选择可用价格，并汇总每只证券的价格口径。
 
-    A later missing adjustment value cannot change an earlier selected price.
-    Missing adjustment is represented by that row's raw close and tagged as
-    ``raw_close_no_adjustment``. Momentum callers must reject windows that mix
-    this tag with adjusted prices. Non-positive, non-null adjusted values are
-    treated as invalid rather than silently replaced with raw close.
+    后续行缺少复权值不会回改早先选择。某行缺少复权价时使用该行原始收盘价并标记
+    ``raw_close_no_adjustment``；动量窗口必须拒绝混用该标签与复权价。非空但非正的
+    复权值标为无效，不会悄悄回退到原始收盘价。返回价格序列和证券到口径标签的映射。
     """
     sources = signal_price_sources(frame)
     adjusted = pd.to_numeric(frame["adjusted_close"], errors="coerce")

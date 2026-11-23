@@ -1,3 +1,4 @@
+"""固定 10 只证券的前瞻采集器。它按登记时间窗口串行请求 BaoStock 日历、成员、证券基础资料及原始/后复权行情，逐次留存 SDK 响应、失败原因和哈希；不采集池外数据，未达门槛时不封为可排名输入。"""
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
@@ -47,7 +48,7 @@ def capture_lookback_pair_inputs(
     clock_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     session_factory: Callable[..., Any] = BaoStockSession,
 ) -> dict[str, Any]:
-    """Capture only the registered 10-symbol input set; network access is injectable for tests."""
+    """按冻结登记采集一次 lookback 配对实验输入。参数：output_dir 为唯一归档目录，freeze/config/pool/identity 路径绑定登记输入，signal_date 固定观察日，resume 控制续跑，now/clock_fn 提供受控时钟，session_factory 注入数据会话。返回：采集状态和 manifest。副作用：发起有限 BaoStock 请求并保存每次响应。异常：日期/时段、目录、锁或冻结哈希不合法时阻断；不调用排名器。"""
     signal_day = date.fromisoformat(signal_date)
     if signal_date != "2026-12-17":
         raise ValueError("本采集器只适用于登记冻结的 2026-12-17")
@@ -95,6 +96,7 @@ def _capture_locked(
     clock_fn: Callable[[], datetime],
     session_factory: Callable[..., Any],
 ) -> dict[str, Any]:
+    """在目录独占锁内执行采集状态机。参数：target、signal_day 和冻结输入路径定义运行，resume/now/clock_fn/session_factory 控制续跑和请求。返回：运行目录与最终进度。副作用：读写进度、原始响应及清单；到截止时间后只封存失败/待数据，不延长时段。"""
     local = now.astimezone(SHANGHAI)
     stage = _scheduled_stage(local)
     if local.time() >= time(15, 45):
@@ -206,6 +208,7 @@ def _capture_locked(
 
 
 def _initial_progress(target: Path, signal_day: date, source_sha: dict[str, str], now: datetime) -> dict[str, Any]:
+    """构造首次采集进度清单。参数：target 为新目录，signal_day 为登记日，source_sha 为冻结输入摘要，now 为开始时点。返回：初始状态字典。副作用：创建 raw/request 子目录；发布时点明确为未知。"""
     (target / "raw" / "requests").mkdir(parents=True, exist_ok=True)
     return {
         "schema_version": 1,
@@ -244,6 +247,7 @@ def _initial_progress(target: Path, signal_day: date, source_sha: dict[str, str]
 
 
 def _scheduled_stage(local: datetime) -> int:
+    """根据上海本地时间选择登记的采集阶段。参数：local 为本地时间。返回：阶段编号；窗口外为 0。"""
     if local.time() < time(15, 6) or local.time() >= time(15, 45):
         return 0
     if local.time() < time(15, 20):
@@ -254,6 +258,7 @@ def _scheduled_stage(local: datetime) -> int:
 
 
 def _inside_stage_window(stage: int, value: datetime) -> bool:
+    """判断某次尝试是否仍处于登记阶段内。参数：stage 为阶段编号，value 为带时区时间。返回：是否在固定日期和时间窗内；不会扩展截止时点。"""
     local = _utc(value).astimezone(SHANGHAI)
     if local.date().isoformat() != "2026-12-17":
         return False
@@ -269,6 +274,7 @@ def _attempt_calendar(
     progress: dict[str, Any], target: Path, session_factory: Callable[..., Any], stage: int,
     now: datetime, clock_fn: Callable[[], datetime],
 ) -> None:
+    """在允许时窗内尝试一次交易日历请求并据此生成依赖请求。参数：progress/target 保存状态，session_factory 建立会话，stage/now/clock_fn 控制时间。返回：None。副作用：记录原始响应及请求状态；窗口关闭时记录未尝试。"""
     if not _inside_stage_window(stage, clock_fn()):
         record = progress["requests"].setdefault("calendar", _new_request())
         record["status"] = "NOT_ATTEMPTED_WINDOW_CLOSED"
@@ -284,6 +290,7 @@ def _attempt_calendar(
 
 
 def _derive_signal_sessions(progress: dict[str, Any], target: Path) -> None:
+    """规范化成功的日历响应，推导信号日前 20 个及信号日共 21 个开市日。参数：progress 保存日历请求，target 为运行目录。返回：None；结果写入进度并建立依赖请求。异常数据保持 FAILED/NEEDS_DATA，不猜测缺日。"""
     record = progress["requests"]["calendar"]
     try:
         frame = _read_success_response(target, record)
@@ -331,6 +338,7 @@ def _derive_signal_sessions(progress: dict[str, Any], target: Path) -> None:
 
 
 def _build_dependent_requests(progress: dict[str, Any], target: Path) -> None:
+    """基于完整 21 日会话表建立固定证券的基础资料、成员和双口径行情请求项。参数：progress 为采集进度，target 为运行目录。返回：None；重复调用通过 setdefault 保持幂等。"""
     sessions = progress.get("signal_sessions", [])
     if len(sessions) != 21:
         return
@@ -347,6 +355,7 @@ def _build_dependent_requests(progress: dict[str, Any], target: Path) -> None:
 
 
 def _new_request() -> dict[str, Any]:
+    """创建单个请求的初始状态。返回：PENDING 状态及空尝试列表。"""
     return {"status": "PENDING", "attempts": []}
 
 
@@ -354,6 +363,7 @@ def _attempt_pending(
     progress: dict[str, Any], target: Path, session_factory: Callable[..., Any], stage: int,
     now: datetime, clock_fn: Callable[[], datetime],
 ) -> None:
+    """在给定阶段重试尚未成功且仍有额度的冻结请求。参数：progress/target 保存请求，session_factory 建立串行会话，stage/now/clock_fn 控制时间。返回：None。副作用：最多每项三次、仅失败项进入后续阶段，并保留请求日志和原响应。"""
     if not progress.get("dependent_requests_built"):
         return
     tasks: list[tuple[str, Callable[[Any], pd.DataFrame]]] = [
@@ -427,6 +437,7 @@ def _attempt_request(
     now: datetime, key: str, call: Callable[[Any], pd.DataFrame],
     clock_fn: Callable[[], datetime],
 ) -> None:
+    """为一项待办创建数据会话并调用单次请求。参数：progress/target 为状态目录，session_factory 为会话构造器，stage/now 定义尝试阶段，key/call 标识任务，clock_fn 记录本机时点。返回：None；实际请求转交带会话执行器，初始化失败也留失败记录。"""
     if not _inside_stage_window(stage, clock_fn()):
         record = progress["requests"].setdefault(key, _new_request())
         record["status"] = "NOT_ATTEMPTED_WINDOW_CLOSED"
@@ -469,6 +480,7 @@ def _attempt_request_with_session(
     call: Callable[[Any], pd.DataFrame], stage: int, now: datetime,
     clock_fn: Callable[[], datetime],
 ) -> None:
+    """通过已建立会话调用并封存一项数据请求。参数：progress/target 保存状态，session 为当前会话，key/call 标识请求，stage/now/clock_fn 记录窗口和时间。返回：None。副作用：响应序列化为私有 CSV、绑定 SHA-256 与字段校验；错误不会覆盖先前响应。"""
     record = progress["requests"].setdefault(key, _new_request())
     attempt_number = len(record["attempts"]) + 1
     start_index = len(getattr(session, "request_log", []))
@@ -522,6 +534,7 @@ def _response_validation_error(
     *,
     expected_members: tuple[str, ...] | None = None,
 ) -> str | None:
+    """检查请求响应是否包含正确类型、字段、固定证券和完整成员信息。参数：key 为请求类别，frame 为响应表，expected_members 可指定必须出现的固定池。返回：无错误时 None，否则为错误类别；非空但不完整的成员名单不能证明缺席证券不是成员。"""
     required_by_key = {
         "calendar": {"calendar_date", "is_trading_day"},
         "stock_basic": {"code", "ipoDate", "outDate", "type"},
@@ -594,6 +607,7 @@ def _response_validation_error(
 
 
 def _record_session_start(progress: dict[str, Any], session: Any) -> None:
+    """将当前会话的启动信息写入进度。参数：progress 为采集状态，session 为供应商会话。返回：None；只记录允许公开的版本/请求元数据。"""
     events = list(getattr(session, "request_log", []))
     if not events:
         return
@@ -607,6 +621,7 @@ def _seal_capture(
     target: Path, progress: dict[str, Any], config_path: Path, pool_path: Path,
     identity_path: Path, freeze_path: Path, now: datetime,
 ) -> None:
+    """重算冻结输入、原始响应和规范文件哈希并封存采集结果。参数：target 为运行目录，progress 为逐请求状态，其他路径为冻结输入，now 为封存时点。返回：None。副作用：写 capture manifest 与 seal；任一请求/文件/哈希不通过则状态非 READY。"""
     current_source_hashes = {
         "registration_freeze": _sha(freeze_path),
         "config": _sha_required(config_path, "strategy config"),
@@ -887,6 +902,7 @@ def _seal_capture(
 
 
 def _write_capture_failure_manifest(target: Path, progress: dict[str, Any], now: datetime) -> None:
+    """在采集流程未能继续时保存失败清单。参数：target 为运行目录，progress 为已收集状态，now 为记录时点。返回：None；失败产物也保留已有原始请求，不改写为成功。"""
     manifest_path = target / "capture-manifest.json"
     if manifest_path.exists() or (target / "capture-manifest.seal.json").exists():
         raise FileExistsError("采集清单或封存记录已存在，拒绝覆盖")
@@ -964,6 +980,7 @@ def _write_capture_failure_manifest(target: Path, progress: dict[str, Any], now:
 
 
 def _raw_responses_from_progress(progress: dict[str, Any]) -> list[dict[str, Any]]:
+    """从进度状态汇总已登记原始响应文件。参数：progress 为请求清单。返回：每次尝试的来源、路径、行数和哈希引用列表。"""
     responses = []
     for key, record in sorted(progress.get("requests", {}).items()):
         for attempt in record.get("attempts", []):
@@ -980,6 +997,7 @@ def _raw_responses_from_progress(progress: dict[str, Any]) -> list[dict[str, Any
 
 
 def _validate_raw_attempt_files(target: Path, progress: dict[str, Any]) -> None:
+    """核验进度中每个原始响应是否存在且哈希正确。参数：target 为采集根目录，progress 为尝试记录。返回：无效项列表或验证摘要；缺失/改写时不允许封存通过。"""
     root = target.resolve()
     for key, record in progress.get("requests", {}).items():
         for attempt in record.get("attempts", []):
@@ -994,6 +1012,7 @@ def _validate_raw_attempt_files(target: Path, progress: dict[str, Any]) -> None:
 
 
 def _read_success_response(target: Path, record: dict[str, Any]) -> pd.DataFrame:
+    """读取并复核成功尝试的原始响应。参数：target 为运行目录，record 为请求状态。返回：响应 DataFrame。异常：状态不是成功、文件丢失或摘要不匹配时阻断。"""
     for attempt in reversed(record.get("attempts", [])):
         if attempt.get("status") == "SUCCESS" and attempt.get("raw_response_file"):
             path = target / attempt["raw_response_file"]
@@ -1004,7 +1023,11 @@ def _read_success_response(target: Path, record: dict[str, Any]) -> pd.DataFrame
 
 
 def _latest_membership_attempt_frame(target: Path, record: dict[str, Any]) -> pd.DataFrame:
-    """Read the latest retained membership response for audit only, even if validation failed."""
+    """读取最近一次留存的成员名单响应，仅用于审计查看。
+
+    参数：目标目录和该项请求记录。返回：最近响应可解析出的数据表；没有可读响应时为空表。
+    即使名单校验失败也保留原始响应供定位问题；结果不能作为已通过校验的股票池输入。
+    """
     for attempt in reversed(record.get("attempts", [])):
         relative = attempt.get("raw_response_file")
         if not relative:
@@ -1017,11 +1040,13 @@ def _latest_membership_attempt_frame(target: Path, record: dict[str, Any]) -> pd
 
 
 def _all_required_requests_succeeded(progress: dict[str, Any]) -> bool:
+    """检查所需日历及全部依赖请求是否成功。参数：progress 为请求状态。返回：布尔值；不忽略任一固定证券或窗口成员请求。"""
     requests = progress.get("requests", {})
     return bool(requests) and all(item.get("status") == "SUCCESS" for item in requests.values()) and progress.get("dependent_requests_built")
 
 
 def _pending_reasons(progress: dict[str, Any]) -> list[str]:
+    """汇总当前采集仍待解决的失败、未尝试和日历缺口。参数：progress 为进度字典。返回：可供清单使用的阻断原因列表。"""
     reasons = []
     for key, record in progress.get("requests", {}).items():
         if record.get("status") == "SUCCESS":
@@ -1037,6 +1062,7 @@ def _pending_reasons(progress: dict[str, Any]) -> list[str]:
 
 
 def _calendar_overlap(old_path: Path, new: pd.DataFrame) -> dict[str, Any]:
+    """校验新日历与冻结旧日历共有日期的开市状态一致。参数：old_path 为冻结日历文件，new 为规范化候选日历。返回：重叠核对摘要；冲突时按实现阻断。"""
     if not old_path.is_file():
         return {"status": "UNVERIFIED", "old_calendar_path": str(old_path), "old_rows": 0, "matched_rows": 0, "missing_dates": [], "mismatches": []}
     old = normalize_trading_calendar(pd.read_csv(old_path, dtype=str))
@@ -1055,12 +1081,14 @@ def _calendar_overlap(old_path: Path, new: pd.DataFrame) -> dict[str, Any]:
 
 
 def _registration_calendar_path(freeze: dict[str, Any]) -> Path:
+    """从登记冻结中读取已绑定日历文件路径。参数：freeze 为登记映射。返回：仓库内解析路径；路径缺失或不完整时阻断。"""
     item = freeze.get("frozen_input_files", {}).get("calendar", {})
     path = Path(item.get("path", ""))
     return path if path.is_absolute() else _repo_root() / path
 
 
 def _load_freeze(path: Path) -> dict[str, Any]:
+    """读取并验证带封条的冻结登记。参数：path 为登记 JSON 路径。返回：登记映射；哈希不符或 JSON 无效时抛异常。"""
     if not path.is_file():
         raise FileNotFoundError(f"缺少 registration-freeze.json：{path}")
     seal = path.with_suffix(".sha256")
@@ -1075,6 +1103,7 @@ def _load_freeze(path: Path) -> dict[str, Any]:
 
 
 def _validate_freeze_inputs(freeze: dict[str, Any], config: Path, pool: Path, input_hashes: dict[str, str]) -> None:
+    """对照登记清单核验当前配置和研究池文件。参数：freeze 为登记内容，config/pool 为输入路径，input_hashes 为本次摘要。返回：全部一致时 None。异常：路径、哈希或固定代码顺序变化时拒绝。"""
     observation = freeze.get("signal_observation", {})
     expected_schedule = {
         "signal_capture_start_local": "2026-12-17T15:06:00+08:00",
@@ -1107,6 +1136,7 @@ def _validate_freeze_inputs(freeze: dict[str, Any], config: Path, pool: Path, in
 
 
 def _listed_on(basic: pd.Series | None, day: str) -> Any:
+    """用 IPO/outDate 基础资料判断某证券在指定日期是否上市。参数：basic 为证券基础资料，day 为交易日期。返回：True/False；缺少上市日期时为未知。"""
     if basic is None:
         return pd.NA
     ipo = pd.to_datetime(basic.get("ipoDate", ""), errors="coerce")
@@ -1118,6 +1148,7 @@ def _listed_on(basic: pd.Series | None, day: str) -> Any:
 
 
 def _canonical_baostock_symbol(value: object) -> str:
+    """规范 BaoStock 代码到项目 SH/SZ 格式。参数：value 为供应商代码。返回：规范代码；无法解析时由规范器拒绝。"""
     raw = str(value).strip().upper()
     match = re.fullmatch(r"(SH|SZ)\.(\d{6})", raw)
     if match:
@@ -1126,6 +1157,7 @@ def _canonical_baostock_symbol(value: object) -> str:
 
 
 def _row_for_day(frame: pd.DataFrame, day: str) -> pd.Series | None:
+    """获取恰好一条指定日期行情。参数：frame 为证券行情，day 为交易日。返回：唯一记录，否则 None。"""
     if frame.empty or "date" not in frame:
         return None
     rows = frame.loc[frame["date"].astype(str).eq(day)]
@@ -1133,12 +1165,14 @@ def _row_for_day(frame: pd.DataFrame, day: str) -> pd.Series | None:
 
 
 def _agree_value(left: pd.Series | None, right: pd.Series | None, field: str) -> str | None:
+    """比较两个来源记录的指定字段是否一致。参数：left/right 为可选行，field 为字段名。返回：明确一致值或未知；冲突不取任一来源作为真值。"""
     values = [str(row.get(field, "")).strip() for row in (left, right) if row is not None]
     values = [value for value in values if value]
     return values[0] if values and len(set(values)) == 1 else None
 
 
 def _suspension_value(list_status: str | None, history_status: str | None) -> Any:
+    """结合每日成员 tradeStatus 和历史行情 tradestatus 推导停牌状态。参数：list_status/history_status 为两个来源的状态值。返回：来源一致时返回停牌布尔值，缺失/冲突时返回 None。"""
     if list_status in {"0", "1"} and history_status in {"0", "1"} and list_status != history_status:
         return pd.NA
     status = list_status if list_status in {"0", "1"} else history_status
@@ -1146,11 +1180,13 @@ def _suspension_value(list_status: str | None, history_status: str | None) -> An
 
 
 def _agree_st(left: pd.Series | None, right: pd.Series | None) -> Any:
+    """比较原始与复权行情行中的 ST 标记。参数：left/right 为两份来源记录。返回：两者一致的 ST 状态；冲突或缺失保持未知。"""
     value = _agree_value(left, right, "isST")
     return {"0": False, "1": True}.get(value, pd.NA)
 
 
 def _write_progress(path: Path, value: dict[str, Any]) -> None:
+    """持久化当前采集进度 JSON。参数：path 为进度文件，value 为状态对象。副作用：写入进度文件；目录由采集入口创建。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
@@ -1158,6 +1194,7 @@ def _write_progress(path: Path, value: dict[str, Any]) -> None:
 
 
 def _write_stage_manifest(target: Path, stage: int, progress: dict[str, Any]) -> None:
+    """保存指定重试阶段的进度快照。参数：target 为采集目录，stage 为阶段编号，progress 为当时状态。返回：None；用于保留阶段历史，不替代最终封条。"""
     path = target / f"stage-{stage:02d}-manifest.json"
     if path.exists():
         raise FileExistsError(f"拒绝覆盖采集阶段记录：{path.name}")
@@ -1165,6 +1202,7 @@ def _write_stage_manifest(target: Path, stage: int, progress: dict[str, Any]) ->
 
 
 def _write_new_json(path: Path, value: Any) -> None:
+    """只在目标不存在时新建 JSON 文件。参数：path 为目标，value 为对象。副作用：写入新文件；已有文件时拒绝覆盖。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, default=str)
@@ -1172,27 +1210,32 @@ def _write_new_json(path: Path, value: Any) -> None:
 
 
 def _require_new_outputs(target: Path, names: tuple[str, ...]) -> None:
+    """确认一组预期输出文件尚未存在。参数：target 为输出目录，names 为文件名元组。返回：通过时 None。异常：任一文件已存在时阻止覆盖。"""
     existing = [name for name in names if (target / name).exists()]
     if existing:
         raise FileExistsError("拒绝覆盖已有规范化采集产物：" + ", ".join(existing))
 
 
 def _append_failure(failures: dict[str, str], key: str, reason: str) -> None:
+    """向错误映射追加或更新一项失败原因。参数：failures 为错误表，key 为请求项，reason 为原因。副作用：修改传入映射。"""
     previous = failures.get(key)
     failures[key] = f"{previous};{reason}" if previous else reason
 
 
 def _truth(value: Any) -> bool:
+    """解析常见真/假表示。参数：value 为来源单元格。返回：布尔值或未知 None。"""
     if value is pd.NA or pd.isna(value):
         return False
     return bool(value)
 
 
 def _safe_key(value: str) -> str:
+    """将请求标识清理为可用于文件名的安全键。参数：value 为逻辑请求 ID。返回：安全字符串。"""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
 def _sha(path: Path) -> str:
+    """计算文件 SHA-256。参数：path 为文件路径。返回：小写十六进制摘要。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -1201,20 +1244,24 @@ def _sha(path: Path) -> str:
 
 
 def _sha_required(path: Path, label: str) -> str:
+    """计算必需文件摘要并给出角色化错误。参数：path 为文件，label 为输入名称。返回：摘要。异常：文件缺失/读取失败时阻断。"""
     if not path.is_file():
         raise FileNotFoundError(f"缺少 {label} 文件：{path}")
     return _sha(path)
 
 
 def _utc(value: datetime) -> datetime:
+    """验证 datetime 带时区并转换为 UTC。参数：value 为输入时间。返回：UTC datetime；无时区时拒绝。"""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("采集运行时间必须带时区")
     return value.astimezone(timezone.utc)
 
 
 def _iso(value: datetime) -> str:
+    """将时间写成秒精度 UTC ISO 字符串。参数：value 为带时区 datetime。返回：Z 后缀字符串。"""
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _repo_root() -> Path:
+    """返回仓库根目录。返回：从模块位置推导的绝对 Path；不依赖当前工作目录。"""
     return Path(__file__).resolve().parents[3]

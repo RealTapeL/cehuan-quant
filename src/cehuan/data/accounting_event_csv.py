@@ -1,4 +1,8 @@
-"""Strict CSV adapter for the currently scheduled accounting event subset."""
+"""将经人工复核的公司行动 CSV 转为账本事件。
+
+适配范围限于当前账本已支持的分红、1:1 代码变更、送转和配股事件；逐行校验
+事件键、来源原件哈希和审核信息。哈希只证明字节匹配，不证明公告解读正确。
+"""
 
 from __future__ import annotations
 
@@ -43,6 +47,12 @@ SOURCE_REVIEW_COLUMNS = (
 
 @dataclass(frozen=True)
 class AccountingEventBundle:
+    """一次事件 CSV 解析得到的不可变输入集合。
+
+    ``events`` 是类型化事件，税额与配股决策映射供账本调度读取，
+    ``source_audit`` 记录来源核验，``source_csv_sha256`` 绑定输入 CSV 字节。
+    """
+
     events: tuple[CashDividendEvent | CodeChangeEvent | ShareDistributionEvent | RightsOfferingEvent, ...]
     dividend_tax_cny_by_event: dict[str, Decimal | None]
     dividend_tax_treatment_by_event: dict[str, str]
@@ -53,15 +63,16 @@ class AccountingEventBundle:
 
 
 def _text(value: object) -> str:
+    """把缺值规整为空字符串，其他来源字段去除首尾空白。"""
     return "" if pd.isna(value) else str(value).strip()
 
 
 def read_accounting_event_csv(path: str | Path) -> AccountingEventBundle:
-    """Read reviewed supported event rows and verify each archived source.
+    """读取支持的公司行动事件并核验每行对应的原件。
 
-    This checks event-key uniqueness, event-to-source row association, HTTPS
-    metadata, reviewer fields, and the archived file's byte hash. It does not
-    determine whether the source document's interpretation is correct.
+    ``path`` 为事件 CSV。返回类型化事件、税务/配股处理映射、来源审计表和
+    CSV 哈希。缺列、重复事件键、未知事件类型、未审核来源、原件缺失或
+    SHA-256 不符时抛出异常；不判断公告解释是否正确，也不推断账户实际结果。
     """
     source_path = Path(path).expanduser().resolve()
     if not source_path.is_file():

@@ -1,3 +1,9 @@
+"""证券交易规则的有效日期规范与按日连接。
+
+规则包含板块、状态、涨跌停和买卖数量单位；每行来源必须有哈希和人工复核。
+缺失规则不使用此模块中的默认值补齐，区间不覆盖或重叠都作为门控失败。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -22,16 +28,19 @@ _INTEGER_COLUMNS = ("buy_min_shares", "buy_step_shares", "sell_min_shares", "sel
 
 
 def _required_columns(frame: pd.DataFrame, required: list[str], label: str) -> None:
+    """检查表是否包含契约要求的列，缺列时给出表名和字段列表。"""
     missing = sorted(set(required).difference(frame.columns))
     if missing:
         raise ValueError(f"{label} 缺少字段：" + ", ".join(missing))
 
 
 def _clean_text(values: pd.Series) -> pd.Series:
+    """把空值变成空字符串，并清理其他文本字段的首尾空格。"""
     return values.map(lambda value: "" if pd.isna(value) else str(value).strip())
 
 
 def _parse_bool(value: Any) -> bool | None:
+    """解析明确的 0/1 或 true/false；其他写法保留为未知。"""
     if pd.isna(value):
         return None
     if isinstance(value, (bool, np.bool_)):
@@ -47,6 +56,7 @@ def _parse_bool(value: Any) -> bool | None:
 
 
 def _parse_date_columns(frame: pd.DataFrame, label: str) -> pd.DataFrame:
+    """规范有效期起止日期并拒绝无效或倒置区间。"""
     result = frame.copy()
     result["valid_from"] = pd.to_datetime(result["valid_from"], errors="coerce").dt.normalize()
     valid_to_text = result["valid_to"].replace("", pd.NA)
@@ -59,6 +69,7 @@ def _parse_date_columns(frame: pd.DataFrame, label: str) -> pd.DataFrame:
 
 
 def _validate_source_review(frame: pd.DataFrame, label: str) -> None:
+    """要求每行有来源文本、64 位来源哈希和完整人工复核信息。"""
     source_hash = _clean_text(frame["source_sha256"])
     hash_ok = source_hash.map(
         lambda value: len(value) == 64 and all(character in "0123456789abcdefABCDEF" for character in value)
@@ -76,6 +87,7 @@ def _validate_source_review(frame: pd.DataFrame, label: str) -> None:
 
 
 def _validate_non_overlapping(frame: pd.DataFrame, keys: list[str], label: str) -> None:
+    """检查分组键下的有效期起点唯一且时间区间不重叠。"""
     duplicate = frame.duplicated(keys + ["valid_from"], keep=False)
     if duplicate.any():
         raise ValueError(f"{label} 存在重复有效期起始记录")
@@ -90,7 +102,11 @@ def _validate_non_overlapping(frame: pd.DataFrame, keys: list[str], label: str) 
 
 
 def normalize_market_rule_schedule(frame: pd.DataFrame) -> pd.DataFrame:
-    """Validate the reviewed, effective-dated per-security trading-rule contract."""
+    """校验按证券和生效日期登记的交易规则契约。
+
+    返回标准化且排序后的规则表；涨跌幅比例使用 0 到 1 小数，买卖数量单位
+    必须为正整数，状态必须明确。来源、复核或区间缺口不在本函数中补猜。
+    """
     _required_columns(frame, MARKET_RULE_COLUMNS, "有效日期交易规则")
     rules = frame[MARKET_RULE_COLUMNS].copy()
     rules["symbol"] = _clean_text(rules["symbol"]).str.upper()
@@ -133,10 +149,10 @@ def normalize_market_rule_schedule(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_market_rule_schedule(bars: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
-    """Apply one and only one reviewed rule row to every input security-day.
+    """把每个证券日连接到唯一有效的已复核交易规则行。
 
-    Existing rule/status fields on bars are deliberately overwritten. This avoids
-    accidentally mixing provider status columns with the audited schedule.
+    ``bars`` 为证券日行情，``schedule`` 为有效日期规则。已有规则和状态列会
+    被有意替换，避免与供应商字段混用；任一证券日无唯一匹配时阻断。
     """
     rules = normalize_market_rule_schedule(schedule)
     required = {"trade_date", "symbol"}

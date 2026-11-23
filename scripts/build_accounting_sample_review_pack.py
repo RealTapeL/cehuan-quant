@@ -1,3 +1,5 @@
+"""根据登记事件和归档原件生成供人工审核的公司行动审阅包；程序不代替审核人签认。"""
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
+    """读取事件样本登记和公告归档，生成待人工签认的审阅包；不会替审核人填入签名。"""
     parser = argparse.ArgumentParser(description="生成本机私有的公司行动公告逐字段人工审阅包")
     parser.add_argument(
         "--samples",
@@ -30,6 +33,7 @@ def main() -> int:
     args = parser.parse_args()
 
     def input_path(value: str) -> Path:
+        """把命令行路径值转换为输入路径；无效或不存在的路径由调用处报告。"""
         path = Path(value).expanduser()
         return path if path.is_absolute() else REPO_ROOT / path
 

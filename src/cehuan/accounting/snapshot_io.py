@@ -1,4 +1,8 @@
-"""Read a previously exported ledger-v2 state for a later research window."""
+"""读取、恢复并保存可跨研究窗口续跑的 ledger_v2 快照。
+
+模块将 JSON 中的金额、日期和账务记录重建为强类型模型；快照用于研究账本的连续状态，
+不是券商持仓文件。结构错误、哈希不符或日期不一致时应拒绝恢复。
+"""
 
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from cehuan.accounting.models import (
 
 
 def _date(value: Any, field: str, *, optional: bool = False) -> date | None:
+    """解析快照中的日期字段；可选字段允许空值，其余缺失或无效值阻断恢复。"""
     if value is None or value == "":
         if optional:
             return None
@@ -30,7 +35,11 @@ def _date(value: Any, field: str, *, optional: bool = False) -> date | None:
 
 
 def ledger_snapshot_from_dict(value: Mapping[str, Any]) -> LedgerSnapshot:
-    """Validate and hydrate the JSON shape emitted by ``cehuan backtest``."""
+    """校验并恢复 ``cehuan backtest`` 导出的 JSON 账本快照。
+
+    ``value`` 是 JSON 顶层映射；返回强类型 ``LedgerSnapshot``。金额转为 Decimal，
+    股数、日期及账簿模型由各自构造器校验；缺字段或不兼容状态会抛出异常。
+    """
     if not isinstance(value, Mapping):
         raise ValueError("ledger snapshot JSON 顶层必须是对象")
     required = {"portfolio_id", "cash_cny", "positions", "receivables", "claims", "journal", "entitlements"}
@@ -167,6 +176,7 @@ def ledger_snapshot_from_dict(value: Mapping[str, Any]) -> LedgerSnapshot:
 
 
 def read_ledger_snapshot(path: str | Path) -> LedgerSnapshot:
+    """读取指定快照文件并调用结构恢复器；文件或 JSON 格式错误时抛出异常。"""
     snapshot_path = Path(path).expanduser().resolve()
     if not snapshot_path.is_file():
         raise FileNotFoundError(f"ledger opening snapshot 不存在：{snapshot_path}")

@@ -1,4 +1,4 @@
-"""Run one bounded research-agent request over a sanitized real-market summary."""
+"""真实行情摘要研究入口。模块只向研究 Agent 提供从本地冻结审计摘要白名单化出的事实，不发送原始行情行、账户信息或本地私有路径；模型假设仍需程序校验。"""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ REAL_SUMMARY_CLASSIFICATION = "REAL_MARKET_DATA_RESEARCH_SUMMARY_NOT_FORMAL_BACK
 
 
 def _write_json(value: Any, path: Path) -> None:
+    """以 UTF-8 写入格式化 JSON 产物。参数：value 为可序列化对象，path 为输出路径。副作用：创建/覆盖指定运行目录内文件。"""
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
@@ -47,6 +48,7 @@ def _write_json(value: Any, path: Path) -> None:
 
 
 def _record_usage(provider_audit: dict[str, Any], model_audit: dict[str, Any]) -> None:
+    """汇总供应商返回的 token 用量和请求审计。参数：provider_audit 与 model_audit 为调用记录。返回：不含密钥的用量状态；供应商未提供用量时保留未知。"""
     attempts = model_audit.get("attempts", [])
     usage_rows = [item.get("usage") for item in attempts if isinstance(item, dict) and isinstance(item.get("usage"), dict)]
     provider_audit["usage_by_attempt"] = usage_rows
@@ -58,7 +60,7 @@ def _record_usage(provider_audit: dict[str, Any], model_audit: dict[str, Any]) -
 
 
 def _summary_for_agent(summary: dict[str, Any], summary_digest: str) -> dict[str, Any]:
-    """Whitelist facts for the model; never include local source paths or raw rows."""
+    """从真实数据摘要中筛选允许发送给模型的字段。参数：summary 为本地冻结摘要，summary_digest 为其 SHA-256。返回：脱敏白名单事实；不传本地文件路径或原始行。"""
     evidence_catalog = [
         {
             "fact_id": item["fact_id"],
@@ -89,6 +91,7 @@ def _summary_for_agent(summary: dict[str, Any], summary_digest: str) -> dict[str
 
 
 def _build_agent_input(summary: dict[str, Any], summary_digest: str, config: dict[str, Any], research_id: str) -> dict[str, Any]:
+    """构造并校验真实摘要研究 Agent 输入。参数：summary/summary_digest 绑定数据事实，config 提供冻结研究能力，research_id 标识本次运行。返回：符合研究输入 schema 的结构化对象。异常：摘要事实或能力状态不合约定时阻断。"""
     scope = summary["scope"]
     strategy = config.get("strategy", {})
     capabilities = build_experiment_capabilities(config)
@@ -161,6 +164,7 @@ def _build_agent_input(summary: dict[str, Any], summary_digest: str, config: dic
 
 
 def _proposal_review(hypothesis: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """对模型假设做程序侧受控实验能力检查。参数：hypothesis 为已校验提案，config 为冻结策略配置。返回：可实现/待实现/拒绝状态和原因；不修改配置、不运行回测。"""
     changes = hypothesis["proposed_changes"]
     if len(changes) != 1:
         return {
@@ -198,6 +202,7 @@ def _proposal_review(hypothesis: dict[str, Any], config: dict[str, Any]) -> dict
 
 def _report(summary: dict[str, Any], hypothesis: dict[str, Any] | None, proposal: dict[str, Any] | None,
             model_status: str, model_audit: dict[str, Any] | None) -> str:
+    """生成真实摘要研究的 Markdown 报告。参数：summary、可选假设与审查结果、model_status 和 model_audit 共同决定内容。返回：报告文本，分开展示事实、Agent 建议和限制。"""
     data = summary["dataset"]
     lines = [
         "# 策环真实行情摘要研究报告",
@@ -304,6 +309,7 @@ def _load_frozen_summary(
     verify_reconstruction: bool = True,
     summary_rebuilder: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """读取并核验已冻结摘要。参数：path 为摘要文件，repository_root 用于解析路径，verify_reconstruction 控制是否重建比较，summary_rebuilder 为可选重建函数。返回：摘要对象、文件哈希及审计信息。异常：哈希或重建内容不匹配时阻断。"""
     repository_root = repository_root.resolve()
     summary_path = Path(path).expanduser()
     summary_path = (summary_path if summary_path.is_absolute() else repository_root / summary_path).resolve()
@@ -356,7 +362,7 @@ def run_real_summary_research(*, output_root: str | Path = "outputs/real-market-
                               agent_config_path: str | Path | None = None,
                               summary_path: str | Path | None = None,
                               max_retries: int | None = None) -> Path:
-    """Build a private fact pack and make one explicit LLM-mode request if configured."""
+    """基于冻结真实行情摘要运行一次受限假设研究。参数：output_root 为独立产物目录，agent_config_path 为模型设置，summary_path 指向已冻结摘要，max_retries 限制请求重试。返回：运行 ID、模型状态和报告路径。副作用：真实 LLM 模式会发送脱敏摘要并可能计费；不读取账户数据、不运行收益回测、不生成订单。"""
     root = Path(output_root).expanduser()
     root = (root if root.is_absolute() else REPO_ROOT / root).resolve()
     ignored_root = (REPO_ROOT / "outputs").resolve()

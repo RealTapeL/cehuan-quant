@@ -1,3 +1,5 @@
+"""策环测试模块：验证 H1、H2 假设原型的窗口、时点、目标、执行和日历约束。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -12,6 +14,7 @@ from cehuan.research.hypothesis_prototypes import (
 
 
 def _h1_inputs() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """私有测试辅助函数，用于H1输入。 返回：tuple[pd.DataFrame, pd.DataFrame, list[str]]，供调用处构造夹具或断言复用。"""
     dates = pd.bdate_range("2025-01-01", periods=21).strftime("%Y-%m-%d").tolist()
     calendar = pd.DataFrame({"trade_date": dates, "is_open": True})
     rows = []
@@ -32,6 +35,7 @@ def _h1_inputs() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
 
 
 def test_h1_requires_exact_complete_21_session_known_non_suspended_window() -> None:
+    """验证H1要求完全一致完整21交易日已知非停牌窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, calendar, dates = _h1_inputs()
     signal_date = dates[-1]
     expected = {
@@ -49,6 +53,7 @@ def test_h1_requires_exact_complete_21_session_known_non_suspended_window() -> N
 
 
 def test_h1_insufficient_history_and_unknown_calendar_are_explicit() -> None:
+    """验证H1不足历史与未知日历明确。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, calendar, dates = _h1_inputs()
     short_calendar = calendar.iloc[-20:].copy()
     short_bars = bars.loc[(bars.symbol == "CLEAR") & bars.trade_date.isin(short_calendar.trade_date)]
@@ -73,6 +78,7 @@ def test_h1_insufficient_history_and_unknown_calendar_are_explicit() -> None:
 
 
 def test_h1_future_data_cannot_change_prior_signal_and_reranks_only_eligible() -> None:
+    """验证H1未来数据不能变更之前信号与重新排名仅合格。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars, calendar, dates = _h1_inputs()
     candidates = pd.DataFrame([
         {"symbol": "HALTED", "signal_date": dates[-1], "momentum": 0.3, "rank": 1},
@@ -106,6 +112,7 @@ def _h2(
     minimum_fee: float = 5.0,
     existing_positions: dict[str, int] | None = None,
 ) -> dict:
+    """私有测试辅助函数，用于H2。 参数：`rank2_price`：代码标识“rank2”（含义待核实）价格场景输入；`rank2_suspended`：代码标识“rank2”（含义待核实）停牌场景输入；`rank2_can_buy`：代码标识“rank2”（含义待核实）可以买入场景输入；`execution_price`：成交价格场景输入；`execution_suspended`：成交停牌场景输入；`execution_can_buy`：成交可以买入场景输入；`ranking_available_at_utc`：排名可用于UTC场景输入；`decision_price_available_at_utc`：决策价格可用于UTC场景输入；`decision_status_available_at_utc`：决策状态可用于UTC场景输入；`execution_price_available_at_utc`：成交价格可用于UTC场景输入；`execution_status_available_at_utc`：成交状态可用于UTC场景输入；`fallback_can_buy`：回退可以买入场景输入；`cash`：现金场景输入；`risk`：代码标识“risk”（含义待核实）场景输入；`fee_rate`：费用代码标识“rate”（含义待核实）场景输入；`minimum_fee`：最小费用场景输入；`existing_positions`：已有持仓场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     ranked = pd.DataFrame([
         {"symbol": "PRIMARY", "rank": 1, "momentum": 0.5},
         {"symbol": "REPLACEMENT", "rank": 2, "momentum": 0.4},
@@ -146,6 +153,7 @@ def _h2(
 
 
 def test_h2_zero_target_is_decided_after_open_and_executes_next_session() -> None:
+    """验证H2零目标决定之后开盘与执行下一条交易日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _h2()
     order = result["replacement_orders"][0]
     fill = result["execution_results"][0]
@@ -161,6 +169,7 @@ def test_h2_zero_target_is_decided_after_open_and_executes_next_session() -> Non
 
 
 def test_h2_skips_zero_or_unavailable_candidates_and_retains_cash_if_none() -> None:
+    """验证H2跳过零或不可用候选与保留现金若无。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     zero = _h2(rank2_price=8.0)
     assert zero["replacement_orders"][0]["symbol"] == "FALLBACK"
     assert any(item["status"] == "SKIPPED_ZERO_AFTER_LOT_AT_DECISION_OPEN" for item in zero["candidate_evaluations"])
@@ -173,12 +182,14 @@ def test_h2_skips_zero_or_unavailable_candidates_and_retains_cash_if_none() -> N
 
 
 def test_h2_keeps_cash_when_all_replacements_are_zero_or_not_buyable() -> None:
+    """验证H2保持现金当全部替换候选零或不可买。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _h2(rank2_price=8.0, rank2_can_buy=False, fallback_can_buy=False)
     assert result["replacement_orders"][0]["order_status"] == "NO_REPLACEMENT_CANDIDATE_REMAINS_CASH"
     assert result["execution_results"] == []
 
 
 def test_h2_execution_price_never_reselects_and_budget_or_cash_can_block() -> None:
+    """验证H2成交价格不会重新选择与预算或现金可以阻断。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     risk_block = _h2(execution_price=6.0, risk=550)
     assert risk_block["replacement_orders"][0]["symbol"] == "REPLACEMENT"
     assert risk_block["replacement_orders"][0]["planned_shares"] == 100
@@ -195,16 +206,19 @@ def test_h2_execution_price_never_reselects_and_budget_or_cash_can_block() -> No
 
 
 def test_h2_rejects_rankings_that_were_not_available_by_decision() -> None:
+    """验证H2拒绝排名该不可用截至决策。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="signal_date"):
         _h2(ranking_available_at_utc="2025-01-06T02:00:00Z")
 
 
 def test_h2_close_based_ranking_cannot_be_timestamped_before_signal_close() -> None:
+    """验证H2收盘基于排名不能记录时间之前信号收盘。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="不能早于 signal_date 15:00"):
         _h2(ranking_available_at_utc="2025-01-03T06:59:00Z")
 
 
 def test_h2_checks_price_and_status_availability_independently() -> None:
+    """验证H2检查价格与状态可用性分别。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     late_decision_status = _h2(decision_status_available_at_utc="2025-01-06T01:32:00Z")
     assert any(
         item.get("reason") == "SECURITY_STATUS_NOT_AVAILABLE_AT_DECISION"
@@ -216,6 +230,7 @@ def test_h2_checks_price_and_status_availability_independently() -> None:
 
 
 def test_h2_does_not_treat_zero_target_existing_holding_as_replacement_slot() -> None:
+    """验证H2不视为零目标已有持仓为替代名额。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     result = _h2(existing_positions={"PRIMARY": 100})
     assert result["replacement_orders"] == []
     review = result["primary_target_reviews"][0]
@@ -223,6 +238,7 @@ def test_h2_does_not_treat_zero_target_existing_holding_as_replacement_slot() ->
 
 
 def test_h2_rejects_same_session_or_invalid_time_ordering() -> None:
+    """验证H2拒绝相同交易日或无效时间先后顺序。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ranked = pd.DataFrame([{"symbol": "A", "rank": 1, "momentum": 0.1}])
     quote_columns = ["symbol", "trade_date", "open_price_cny", "price_available_at_utc", "price_source", "status_available_at_utc", "status_source", "is_suspended", "is_listed", "can_buy"]
     decision = pd.DataFrame(columns=quote_columns)
@@ -243,6 +259,7 @@ def test_h2_rejects_same_session_or_invalid_time_ordering() -> None:
 
 
 def _daily_calendar(start: str, end: str, open_dates: set[str]) -> pd.DataFrame:
+    """私有测试辅助函数，用于每日日历。 参数：`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入；`open_dates`：开盘日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
     return pd.DataFrame([
         {"trade_date": day, "is_open": day in open_dates, "source": "synthetic_calendar"}
         for day in pd.date_range(start, end, freq="D").strftime("%Y-%m-%d")
@@ -250,6 +267,7 @@ def _daily_calendar(start: str, end: str, open_dates: set[str]) -> pd.DataFrame:
 
 
 def test_h2_calendar_accepts_weekend_gap_and_holiday_when_next_opens_are_correct() -> None:
+    """验证H2日历接受周末缺口与节假日当下一条开市正确。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     calendar = _daily_calendar(
         "2025-01-03", "2025-01-08",
         {"2025-01-03", "2025-01-07", "2025-01-08"},
@@ -268,6 +286,7 @@ def test_h2_calendar_accepts_weekend_gap_and_holiday_when_next_opens_are_correct
     ],
 )
 def test_h2_calendar_rejects_skipped_open_session_or_closed_date(calendar, decision, execution, message) -> None:
+    """验证H2日历拒绝跳过开盘交易日或休市日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`calendar`：日历场景输入；`decision`：决策场景输入；`execution`：成交场景输入；`message`：消息场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match=message):
         validate_h2_session_sequence(
             calendar, signal_date="2025-01-03", decision_session_date=decision, execution_session_date=execution,
@@ -275,6 +294,7 @@ def test_h2_calendar_rejects_skipped_open_session_or_closed_date(calendar, decis
 
 
 def test_h2_calendar_rejects_unknown_duplicate_or_missing_dates() -> None:
+    """验证H2日历拒绝未知重复或缺失日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     complete = _daily_calendar("2025-01-03", "2025-01-07", {"2025-01-03", "2025-01-06", "2025-01-07"})
     unknown = complete.copy().astype({"is_open": "object"})
     unknown.loc[unknown.trade_date.eq("2025-01-04"), "is_open"] = None

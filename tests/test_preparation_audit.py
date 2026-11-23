@@ -1,3 +1,5 @@
+"""策环测试模块：验证审计输入目录、来源登记、哈希核验及原子产物写入。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import csv
@@ -19,11 +21,13 @@ verify_source_registers = _AUDIT.verify_source_registers
 
 
 def _write_json(path, value):
+    """私有测试辅助函数，用于写入JSON。 参数：`path`：路径场景输入；`value`：值场景输入。 返回值供调用处构造夹具或断言复用。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
 def _write_csv(path, rows):
+    """私有测试辅助函数，用于写入CSV。 参数：`path`：路径场景输入；`rows`：行场景输入。 返回值供调用处构造夹具或断言复用。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(rows[0]) if rows else ["event_key"]
     with path.open("w", newline="", encoding="utf-8") as stream:
@@ -35,6 +39,7 @@ def _write_csv(path, rows):
 def _audit_fixture(
     root, *, swap_event_hashes=False, duplicate_public_key=False, mismatch_unknown_source=False
 ):
+    """私有测试辅助函数，用于审计夹具。 参数：`root`：代码标识“root”（含义待核实）场景输入；`swap_event_hashes`：换股事件哈希场景输入；`duplicate_public_key`：重复代码标识“public”（含义待核实）密钥场景输入；`mismatch_unknown_source`：不符未知来源场景输入。 返回值供调用处构造夹具或断言复用。"""
     evidence = root / "data/private/evidence/preparation-20261029"
     evidence.mkdir(parents=True)
     a_path = evidence / "source-a.pdf"
@@ -119,6 +124,7 @@ def _audit_fixture(
 
 
 def test_source_register_matches_each_event_key_to_its_own_source(tmp_path):
+    """验证来源登记匹配每项事件密钥到其自身来源。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     _audit_fixture(tmp_path, swap_event_hashes=True)
 
     result = verify_source_registers(tmp_path)
@@ -131,6 +137,7 @@ def test_source_register_matches_each_event_key_to_its_own_source(tmp_path):
 
 
 def test_source_register_rejects_duplicate_event_keys(tmp_path):
+    """验证来源登记拒绝重复事件键。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     _audit_fixture(tmp_path, duplicate_public_key=True)
 
     result = verify_source_registers(tmp_path)
@@ -140,6 +147,7 @@ def test_source_register_rejects_duplicate_event_keys(tmp_path):
 
 
 def test_source_register_matches_each_unknown_symbol_to_its_source_row(tmp_path):
+    """验证来源登记匹配每项未知证券代码到其来源行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     _audit_fixture(tmp_path, mismatch_unknown_source=True)
 
     result = verify_source_registers(tmp_path)
@@ -151,6 +159,7 @@ def test_source_register_matches_each_unknown_symbol_to_its_source_row(tmp_path)
 
 
 def test_new_run_directory_refuses_to_overwrite_existing_report(tmp_path):
+    """验证新运行目录拒绝到覆盖已有报告。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     destination = tmp_path / "run-20261102"
     create_run_directory(destination)
     (destination / "run-manifest.json").write_text("original", encoding="utf-8")
@@ -162,11 +171,13 @@ def test_new_run_directory_refuses_to_overwrite_existing_report(tmp_path):
 
 
 def test_run_directory_rejects_path_like_ids(tmp_path):
+    """验证运行目录拒绝路径例如编号。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="run-id"):
         create_run_directory(tmp_path / "../escape")
 
 
 def test_atomic_write_publishes_complete_file(tmp_path):
+    """验证原子写入发布完整文件。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     target = tmp_path / "report.json"
 
     atomic_write_text(target, '{"complete": true}\n')

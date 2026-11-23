@@ -1,3 +1,5 @@
+"""用合成 1:1 代码变更检查持仓迁移、信号保护与交易流水；不连接真实账户。"""
+
 from __future__ import annotations
 
 import argparse
@@ -17,10 +19,12 @@ from cehuan.config import load_config
 
 
 def _write_json(payload: object, path: Path) -> None:
+    """将代码变更诊断结果序列化到指定 JSON 文件。"""
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def run(output_root: Path) -> Path:
+    """运行合成 1:1 代码变更持仓迁移案例并保存审计结果；不代表真实账户记录。"""
     output_root.mkdir(parents=True, exist_ok=True)
     run_dir = output_root / f"synthetic-code-change-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(exist_ok=False)
@@ -145,6 +149,7 @@ def run(output_root: Path) -> Path:
 
 
 def main() -> int:
+    """解析输出目录并运行合成证券身份变更诊断；不连接行情或券商。"""
     parser = argparse.ArgumentParser(description="Run a synthetic 1:1 code-change ledger diagnostic; no broker calls")
     parser.add_argument("--output", default="outputs/synthetic-code-change-diagnostic")
     args = parser.parse_args()

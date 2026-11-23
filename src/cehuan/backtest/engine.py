@@ -1,3 +1,10 @@
+"""执行策环固定规则日线策略的研究回测与账务诊断。
+
+本模块将规范行情、信号、交易日历、市场规则、费用和公司行动连接为次日开盘模拟；
+依赖信号层、输入哈希、checkpoint、事件调度和账本。正式模式必须通过 readiness 审计；
+诊断回退值不代表真实历史规则或华泰费率，回测输出也不是券商委托。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -73,6 +80,7 @@ from cehuan.data.adjustment import select_signal_prices, signal_price_sources
 
 
 def _git_metadata() -> dict[str, Any]:
+    """读取当前仓库提交号和脏工作区标记；Git 不可用时相应字段留空。"""
     root = Path(__file__).resolve().parents[3]
     commit: str | None = None
     dirty: bool | None = None
@@ -94,16 +102,17 @@ def _git_metadata() -> dict[str, Any]:
 
 
 def _normalized_event_table_digest(frame: pd.DataFrame) -> str:
-    """Backwards-compatible alias for the shared checkpoint-v1 digest."""
+    """兼容旧调用方的事件表摘要别名，复用共享 checkpoint-v1 口径。"""
     return normalized_event_table_digest(frame)
 
 
 def _normalized_table_digest(frame: pd.DataFrame) -> str:
-    """Backwards-compatible alias for the shared checkpoint-v1 digest."""
+    """兼容旧调用方的无序规范表摘要别名，复用共享 checkpoint-v1 口径。"""
     return normalized_table_digest(frame)
 
 
 def _sha256_path(path: str | Path) -> str:
+    """分块读取文件并计算 SHA-256。"""
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -112,12 +121,10 @@ def _sha256_path(path: str | Path) -> str:
 
 
 def _accounting_price_evidence_sha256(symbol: str, trade_date: str, row: pd.Series) -> str:
-    """Hash the canonical quote evidence used by one accounting valuation.
+    """摘要账务估值所使用的一条证券日收盘价证据。
 
-    This is deliberately row-scoped so a continuous run and a checkpointed
-    run produce the same ledger evidence for the same symbol/date quote.
-    The complete input files and windows remain bound by the experiment and
-    checkpoint data hashes.
+    按证券和日期逐行生成，保证连续运行与 checkpoint 续跑在同一行情下取得相同证据摘要；
+    完整输入文件和窗口仍由实验及 checkpoint 哈希绑定。该摘要不证明供应商来源内容正确。
     """
     close = Decimal(str(float(row["close"]))).normalize()
     suspended = row.get("is_suspended")
@@ -135,10 +142,12 @@ def _accounting_price_evidence_sha256(symbol: str, trade_date: str, row: pd.Seri
 
 
 def _fees(notional: float, side: str, costs: dict[str, Any]) -> float:
+    """按费用配置汇总指定成交额和方向的各项费用。"""
     return sum(_fee_components(notional, side, costs).values())
 
 
 def _fee_components(notional: float, side: str, costs: dict[str, Any]) -> dict[str, float]:
+    """拆分计算佣金、卖出印花税和过户费，费率来自传入配置。"""
     commission = max(
         float(costs.get("minimum_commission_cny", 0.0)),
         notional * float(costs.get("commission_rate", 0.0)),
@@ -160,6 +169,7 @@ def _price_limit_block(
     *,
     require_quote_bounds: bool = False,
 ) -> str | None:
+    """用前收盘、开盘价和适用涨跌幅阈值判断保守的价格限制阻断。"""
     if previous_close is None or pd.isna(previous_close) or not math.isfinite(float(previous_close)) or float(previous_close) <= 0:
         if require_quote_bounds:
             return "计算价格约束缺少有效前收盘，按保守规则阻断"
@@ -183,7 +193,7 @@ def _price_limit_block(
 
 
 def _require_code_change_open_eligibility(row: pd.Series, day_date: str, symbol: str) -> None:
-    """Check only facts needed at the simulated open; full OHLC is audited separately."""
+    """仅检查模拟开盘时可用的代码变更条件；完整 OHLC 完整性由其他审计负责。"""
     open_value = row.get("open")
     if pd.isna(open_value) or not math.isfinite(float(open_value)) or float(open_value) <= 0:
         raise ValueError(f"{day_date} {symbol} 生效日开盘价无效，不能迁移持仓")
@@ -194,6 +204,7 @@ def _require_code_change_open_eligibility(row: pd.Series, day_date: str, symbol:
 
 
 def _metrics(equity: pd.Series, returns: pd.Series, turnover: float, benchmark: pd.Series) -> dict[str, Any]:
+    """根据净值、收益序列、换手和基准序列计算诊断指标。"""
     if equity.empty:
         return {}
     valid_returns = returns.dropna()
@@ -230,6 +241,7 @@ def _chronological_evaluation(
     rolling_window_sessions: int,
     rolling_step_sessions: int,
 ) -> dict[str, Any]:
+    """按时间顺序生成开发/验证/测试切片及固定规则滚动诊断摘要。"""
     count = len(curve)
     if not 0 < development_fraction < 1 or not 0 < validation_fraction < 1:
         raise ValueError("回测 development_fraction 与 validation_fraction 必须在 0 和 1 之间")
@@ -353,11 +365,13 @@ def run_backtest(
     h1_calendar: pd.DataFrame | None = None,
     source_data_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Run a small long-only daily baseline with next-session-open execution.
+    """运行次日开盘执行的日线多头研究基线或诊断对照。
 
-    It uses unadjusted OHLC for execution/valuation, adjusted close for signal
-    continuity, point-in-time share rules when supplied (otherwise configured
-    research fallbacks), fees, and conservative price-limit checks.
+    ``frame`` 是规范行情，``initial_cash_cny`` 是研究组合期初现金，``config`` 控制策略、
+    市场、费用与回测约束；其余关键字参数提供基准、审计、身份事件、公司行动、账本快照、
+    checkpoint 和日历。返回交易、净值与审计产物。信号基于收盘后可用数据，最早次开市日
+    开盘执行；执行/估值用未复权 OHLC，信号按一致复权口径计算。缺失状态会按门控阻断，
+    未验证规则或费用回退仅属诊断假设；正式模式还需重新核验 readiness，不能自动下单。
     """
     started = time.perf_counter()
     accounting_mode = str(accounting_mode).strip().lower()
@@ -408,6 +422,7 @@ def run_backtest(
         raise ValueError("当前有效日期规则/费率接入仅支持 accounting_mode='ledger_v2' 的非正式研究诊断")
     if initial_cash_cny <= 0:
         raise ValueError("回测资金必须大于 0；请显式传入演示或研究资金")
+    # data 是本次回测唯一使用的规范行情视图；原始文件哈希另行绑定，不与规范内容摘要混用。
     data = normalize_bar_frame(
         frame,
         copy_frame=not mutate_input,
@@ -577,6 +592,7 @@ def run_backtest(
         _normalized_table_digest(normalized_calendar) if normalized_calendar is not None else None
     )
 
+    # signal_price 只供信号连续性计算；执行价仍使用原始 OHLC。
     data["signal_price"], current_signal_modes = select_signal_prices(data)
     data["signal_price_source"] = signal_price_sources(data)
     current_modes = {str(symbol): mode for symbol, mode in current_signal_modes.items()}
@@ -754,6 +770,7 @@ def run_backtest(
 
     if backtest_checkpoint is not None:
         opening_accounting_snapshot = backtest_checkpoint.ledger_snapshot
+    # cash/holdings 是引擎的轻量投影；ledger_v2 模式下以账本为准并在阶段后同步。
     cash = float(initial_cash_cny)
     holdings: dict[str, int] = {}
     cost_basis_cny: dict[str, float] = {}
@@ -948,6 +965,7 @@ def run_backtest(
         action_day: date,
         day_frame: pd.DataFrame,
     ) -> None:
+        """在收盘阶段用当日底层收盘价代理估值未登记送转权利。"""
         if execution_ledger is None:
             raise ValueError("送转权利估值仅支持 ledger_v2")
         row = day_frame.loc[event.symbol] if event.symbol in day_frame.index else None
@@ -976,6 +994,7 @@ def run_backtest(
         action_day: date,
         day_frame: pd.DataFrame,
     ) -> None:
+        """在收盘阶段估值配股权利；缺收盘价或停牌状态未知时阻断。"""
         if execution_ledger is None:
             raise ValueError("配股权利估值仅支持 ledger_v2")
         row = day_frame.loc[event.symbol] if event.symbol in day_frame.index else None
@@ -995,6 +1014,7 @@ def run_backtest(
         )
 
     def sync_projection_from_ledger() -> None:
+        """把账本现金和持仓批次汇总同步到回测目标生成所用的投影状态。"""
         nonlocal cash
         if execution_ledger is None:
             return
@@ -1030,6 +1050,7 @@ def run_backtest(
                     raise ValueError(f"期初待登记权利 {claim.event_id} 缺少对应送转事件")
                 active_distribution_claims[event.event_id] = event
 
+    # None 表示尚无待执行信号，空字典则可表示已产生清仓目标，checkpoint 必须区分。
     pending_targets: dict[str, float] | None = None
     if backtest_checkpoint is not None:
         targets_active = backtest_checkpoint.pending_targets_active

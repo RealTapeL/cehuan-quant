@@ -1,4 +1,4 @@
-"""Small, replaceable structured-output adapter for the strategy research agent."""
+"""策略研究 Agent 的结构化模型适配层。它校验输入/输出契约，提供 Stub 与 OpenAI-compatible Chat Completions 实现，并限制重试及危险动作；API Key 仅用于请求头，不进入审计产物。"""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ HYPOTHESIS_SCHEMA_PATH = Path(__file__).resolve().parents[3] / "examples" / "str
 
 
 def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the existing strategy-research-agent input contract without a new dependency."""
+    """验证研究 Agent 输入 schema、数据可信度、冻结策略、实验能力和禁止动作。参数：payload 为待发送给模型的结构化输入。返回：通过校验后的字典副本。异常：字段、日期、哈希、能力白名单或安全边界不符时抛出 ValueError；不会发起网络请求。"""
     missing = INPUT_REQUIRED - set(payload)
     extra = set(payload) - INPUT_REQUIRED - INPUT_OPTIONAL
     if missing or extra:
@@ -206,6 +206,7 @@ def validate_strategy_research_input(payload: Mapping[str, Any]) -> dict[str, An
 
 
 def _is_synthetic_research_input(payload: Mapping[str, Any]) -> bool:
+    """根据输入可信度标签判断是否属于合成研究。参数：payload 为已校验或待校验输入。返回：是否满足合成输入标记；只识别明确标签，不推断数据来源。"""
     trust = payload.get("data_trust", {})
     if not isinstance(trust, Mapping):
         return False
@@ -217,6 +218,7 @@ def _is_synthetic_research_input(payload: Mapping[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class ModelReply:
+    """模型适配器的统一响应值，保存正文、provider/model、脱敏 endpoint 和供应商返回 usage；不包含 API Key。"""
     content: str
     provider: str
     model: str
@@ -225,27 +227,34 @@ class ModelReply:
 
 
 class ResearchModelRequestError(RuntimeError):
-    """Transport/API failure where retrying may duplicate a billable request."""
+    """模型传输或 API 请求失败异常。对可能产生计费的请求不假设安全重试；调用方应记录失败类型。"""
 
 
 class ResearchHypothesisRejected(ValueError):
+    """研究假设解析或内容校验失败异常。保存安全审计字典，不应把原始模型正文放入异常消息或日志。"""
     def __init__(self, message: str, *, audit: dict[str, Any]):
+        """保存安全错误消息及结构化审计。参数：message 为可展示摘要，audit 为不含模型正文的失败元数据。副作用：把审计记录挂到异常对象。"""
         self.audit = audit
         super().__init__(message)
 
 
 class ResearchModel(Protocol):
+    """模型适配协议，规定 provider/model 标识及 generate 调用形状；具体网络行为由实现类决定。"""
     provider: str
     model: str
 
-    def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply: ...
+    def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
+        """定义结构化模型调用接口。参数：phase 区分研究阶段，prompt 为指令文本，context 为受控上下文。返回：ModelReply；实现不应执行工具、下单或修改策略。"""
+        ...
 
 
 class StubResearchModel:
+    """用于本地流程验证的确定性模型替身。它根据动态实验能力清单构造可校验假设，不代表真实 LLM 调用或市场研究结论。"""
     provider = "stub"
     model = "cehuan-structured-stub-v1"
 
     def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
+        """按动态实验能力清单生成确定性测试假设。参数：phase 指定研究阶段，prompt 仅为接口兼容参数，context 提供研究 ID、摘要和支持参数。返回：标记为 stub 的 ModelReply。异常：未提供能力清单时抛出 ValueError；不访问网络。"""
         capabilities = context.get("experiment_capabilities") or {}
         supported = capabilities.get("supported_parameters", [])
         if not supported:
@@ -303,6 +312,7 @@ class StubResearchModel:
 
 
 class OpenAICompatibleResearchModel:
+    """OpenAI-compatible Chat Completions 客户端。生命周期为单次请求；API Key 保存在实例私有属性并仅写入 Authorization 头，异常中不附原始响应正文。"""
     provider = "openai-compatible-chat-completions"
 
     def __init__(
@@ -314,6 +324,7 @@ class OpenAICompatibleResearchModel:
         timeout_seconds: float = 120,
         reasoning_effort: str | None = None,
     ) -> None:
+        """验证并保存模型连接参数。参数：model/base_url/api_key 指定端点和凭据，timeout_seconds 为单次请求超时，reasoning_effort 为可选推理档位。异常：URL、传输安全或推理档位不合法时抛出 ValueError。API Key 不写日志。"""
         parsed = urllib.parse.urlsplit(base_url)
         if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValueError("LLM base URL 必须是有效 HTTP(S) 地址")
@@ -334,10 +345,12 @@ class OpenAICompatibleResearchModel:
 
     @property
     def safe_endpoint(self) -> str:
+        """返回不含 query、fragment 或 URL 凭据的 endpoint 标识。返回：适合审计的 URL 字符串；不会包含 API Key。"""
         parsed = urllib.parse.urlsplit(self.base_url)
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
     def generate(self, *, phase: str, prompt: str, context: Mapping[str, Any]) -> ModelReply:
+        """发送一次 Chat Completions 请求。参数：phase 为阶段标签，prompt 为模型输入，context 在此适配器中仅保留接口兼容，不额外序列化发送。返回：含正文、模型标识和供应商 usage 的 ModelReply。副作用：网络请求，可能计费。异常：传输/API 失败抛 ResearchModelRequestError，响应结构错误抛不含原文的 ValueError。"""
         url = f"{self.base_url}/chat/completions"
         request_payload = {
             "model": self.model,
@@ -366,6 +379,7 @@ class OpenAICompatibleResearchModel:
             diagnostic_parts = []
 
             def safe_diagnostic_value(value: Any, limit: int) -> str:
+                """脱敏并截断供应商错误字段。参数：value 为诊断字段，limit 为最大字符数。返回：可安全记录的文本。"""
                 safe_value = str(value)
                 if self._api_key:
                     safe_value = safe_value.replace(self._api_key, "[REDACTED]")
@@ -413,6 +427,7 @@ class OpenAICompatibleResearchModel:
 
 
 def resolve_research_model(settings: Mapping[str, Any], requested_mode: str | None = None) -> tuple[ResearchModel, dict[str, Any]]:
+    """按显式模式、配置和环境变量选择 Stub 或真实 LLM。参数：settings 为非敏感模型设置，requested_mode 可覆盖默认 mode。返回：模型对象及不含密钥的审计配置。异常：模式或必要真实配置不合法时抛出 ValueError；显式 llm 不会静默回退。"""
     mode = (requested_mode or str(settings.get("mode", "auto"))).lower()
     if mode not in {"auto", "stub", "llm"}:
         raise ValueError("研究 Agent mode 只能是 auto、stub 或 llm")
@@ -459,6 +474,7 @@ def build_hypothesis_prompt(
     input_data_digest: str,
     experiment_id: str,
 ) -> str:
+    """构造某阶段的假设生成提示。参数：input_payload 为已验证研究输入，phase 为阶段，input_data_digest 绑定输入，experiment_id 标识候选实验。返回：提示文本；模型可见能力由输入清单提供，执行器仍独立校验。"""
     output_schema = json.loads(HYPOTHESIS_SCHEMA_PATH.read_text(encoding="utf-8"))
     real_summary = input_payload.get("market_research_summary")
     synthetic_input = _is_synthetic_research_input(input_payload)
@@ -520,6 +536,7 @@ def generate_validated_hypothesis(
     experiment_id: str,
     max_retries: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """调用模型并验证结构化假设，按上限执行受控重试。参数：model 为适配器，input_payload 为研究输入，phase/digest/experiment_id 绑定本轮，max_retries 限制额外尝试次数。返回：通过 schema、安全边界和能力检查的假设及调用审计。副作用：可能发送请求并产生费用。异常：请求失败、输出格式错误或假设被拒绝时抛出带安全审计的异常。"""
     if max_retries < 0 or max_retries > 2:
         raise ValueError("模型重试次数必须在 0 到 2 之间")
     validated_input = validate_strategy_research_input(input_payload)

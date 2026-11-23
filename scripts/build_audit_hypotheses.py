@@ -1,3 +1,5 @@
+"""读取已登记审计产物并构造可追溯的候选研究假设输入；核对来源哈希，不修改被审计的来源记录。"""
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +24,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _sha256(path: Path) -> str:
+    """计算审计文件的 SHA-256，用于核对登记的证据字节。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -30,11 +33,13 @@ def _sha256(path: Path) -> str:
 
 
 def _digest_object(value: object) -> str:
+    """按项目约定序列化对象并计算摘要；调用方负责保证对象字段含义正确。"""
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    """读取并解析 JSON 审计输入；缺失或格式错误时向上抛出。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"JSON 顶层必须是对象：{path}")
@@ -42,16 +47,19 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, value: object) -> None:
+    """将结构化审计产物写为 JSON；输出路径由本次运行确定。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def _git_context() -> dict[str, Any]:
+    """读取 Git 提交、分支和工作区上下文并写入产物元数据。"""
     commit = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     changes = subprocess.run(["git", "status", "--porcelain"], check=True, capture_output=True, text=True).stdout.splitlines()
     return {"commit": commit, "worktree_clean": not bool(changes), "uncommitted_paths": [line[3:] for line in changes]}
 
 
 def _read_and_verify_inventory(audit_dir: Path) -> dict[str, str]:
+    """读取审计文件清单并核对所列路径和哈希；不读取清单之外的文件。"""
     inventory_path = audit_dir / "audit-artifact-inventory.csv"
     if not inventory_path.is_file():
         raise FileNotFoundError(f"来源审计包缺少清单：{inventory_path}")
@@ -81,7 +89,10 @@ def _read_and_verify_inventory(audit_dir: Path) -> dict[str, str]:
 
 
 def _publish_new_directory(staging: Path, output_dir: Path) -> None:
-    """Publish once, using an exclusive sibling lock and refusing replacement."""
+    """使用同级独占锁将暂存产物一次性发布到新目录。
+
+    参数：暂存目录和目标目录。返回：无；目标已存在或锁不可用时拒绝替换。
+    """
     lock_path = output_dir.parent / f".{output_dir.name}.publish-lock"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -108,6 +119,7 @@ def _legacy_package_review(
     config: dict[str, Any],
     actual_config_sha256: str,
 ) -> dict[str, Any]:
+    """根据旧版登记格式整理来源包审核结果；兼容分支不提升原证据等级。"""
     paths = {
         "input": audit_dir / "research-agent-input.json",
         "hypothesis_suspension": audit_dir / "research-agent-hypothesis-suspension.json",
@@ -159,6 +171,7 @@ def _build_payloads(
     actual_config_sha256: str,
     evidence_hashes: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """从通过哈希核对的审计材料构造候选假设输入及来源记录；不执行假设。"""
     frozen_inputs = summary.get("input_hashes", {})
     input_digest = _digest_object({
         "audit_summary_sha256": evidence_hashes["trade-audit-summary.json"],
@@ -343,7 +356,11 @@ def _build_payloads(
 
 
 def build(audit_dir: Path, config_path: Path, output_dir: Path) -> dict[str, Any]:
-    """Create a new research package while treating the source audit as immutable."""
+    """基于来源审计构造新的研究假设包，并保持来源审计只读。
+
+    参数：审计目录、策略配置路径和唯一输出目录。返回：本次假设包摘要。
+    来源登记或哈希核验失败时停止；不会覆盖原审计，也不会执行候选策略。
+    """
     audit_dir = audit_dir.expanduser().resolve()
     config_path = config_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -475,6 +492,7 @@ def build(audit_dir: Path, config_path: Path, output_dir: Path) -> dict[str, Any
 
 
 def main() -> int:
+    """解析审计包和输出目录，构造新的研究假设材料；源审计文件保持只读。"""
     parser = argparse.ArgumentParser(description="Create a schema-validated research package without modifying its source audit.")
     parser.add_argument("--audit-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)

@@ -1,3 +1,5 @@
+"""策环测试模块：验证分红、送转、配股、换股和退市等公司行动的账本状态、时间顺序及未决阻断。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -20,6 +22,7 @@ from cehuan.accounting import (
 
 
 def _source() -> ActionSource:
+    """私有测试辅助函数，用于来源。 返回：ActionSource，供调用处构造夹具或断言复用。"""
     return ActionSource(
         source_id="synthetic-notice-1",
         url="https://example.invalid/notice.pdf",
@@ -32,6 +35,7 @@ def _source() -> ActionSource:
 
 
 def _lot(lot_id: str = "lot-1", *, shares: int = 100, basis: str = "1000") -> PositionLot:
+    """私有测试辅助函数，用于批次。 参数：`lot_id`：批次编号场景输入；`shares`：股份场景输入；`basis`：口径场景输入。 返回：PositionLot，供调用处构造夹具或断言复用。"""
     return PositionLot(
         lot_id=lot_id,
         symbol="SH600000",
@@ -44,10 +48,12 @@ def _lot(lot_id: str = "lot-1", *, shares: int = 100, basis: str = "1000") -> Po
 
 
 def _price(price: str, day: str) -> PriceMark:
+    """私有测试辅助函数，用于价格。 参数：`price`：价格场景输入；`day`：日场景输入。 返回：PriceMark，供调用处构造夹具或断言复用。"""
     return PriceMark(Decimal(price), date.fromisoformat(day), "synthetic fixture", 0)
 
 
 def _dividend() -> CashDividendEvent:
+    """私有测试辅助函数，用于分红。 返回：CashDividendEvent，供调用处构造夹具或断言复用。"""
     return CashDividendEvent(
         event_id="div-1",
         symbol="SH600000",
@@ -64,6 +70,7 @@ def _distribution(
     *, ratio: str = "0.3", effective_date: str = "2026-10-30",
     registration_date: str | None = None, tradable_date: str = "2026-11-05",
 ) -> ShareDistributionEvent:
+    """私有测试辅助函数，用于送转。 参数：`ratio`：比例场景输入；`effective_date`：生效日期场景输入；`registration_date`：登记日期场景输入；`tradable_date`：可交易日期场景输入。 返回：ShareDistributionEvent，供调用处构造夹具或断言复用。"""
     return ShareDistributionEvent(
         event_id="dist-1",
         symbol="SH600000",
@@ -78,6 +85,7 @@ def _distribution(
 
 
 def _rights() -> RightsOfferingEvent:
+    """私有测试辅助函数，用于配股权利。 返回：RightsOfferingEvent，供调用处构造夹具或断言复用。"""
     return RightsOfferingEvent(
         event_id="rights-1",
         symbol="SH600000",
@@ -93,6 +101,7 @@ def _rights() -> RightsOfferingEvent:
 
 
 def _share_swap() -> ShareSwapMergerEvent:
+    """私有测试辅助函数，用于股份换股。 返回：ShareSwapMergerEvent，供调用处构造夹具或断言复用。"""
     return ShareSwapMergerEvent(
         event_id="swap-1",
         old_symbol="SH601989",
@@ -113,6 +122,7 @@ def _share_swap() -> ShareSwapMergerEvent:
 
 
 def test_dividend_accrual_and_payment_do_not_double_count_nav():
+    """验证分红应计与发放不重复计算净值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _dividend()
 
@@ -142,6 +152,7 @@ def test_dividend_accrual_and_payment_do_not_double_count_nav():
 
 
 def test_unknown_dividend_tax_blocks_nav_and_cash_settlement():
+    """验证未知分红税款阻断净值与现金结算。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _dividend()
     ledger.record_cash_dividend(event, as_of=event.record_date)
@@ -156,6 +167,7 @@ def test_unknown_dividend_tax_blocks_nav_and_cash_settlement():
 
 
 def test_deferred_dividend_tax_tracks_lots_payment_cash_sales_and_account_reconciliation():
+    """验证递延分红税款跟踪批次发放现金卖出与账户对账。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     first_lot = _lot("lot-early", shares=100, basis="800")
     second_lot = PositionLot(
         lot_id="lot-late", symbol="SH600000", total_shares=100, sellable_shares=100,
@@ -252,6 +264,7 @@ def test_deferred_dividend_tax_tracks_lots_payment_cash_sales_and_account_reconc
 
 
 def test_no_holder_dividend_with_deferred_policy_creates_no_phantom_tax_state():
+    """验证没有持有人分红带有递延政策创建没有虚假税款状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("100"))
     event = _dividend()
     ledger.record_cash_dividend(event, as_of=event.record_date)
@@ -272,6 +285,7 @@ def test_no_holder_dividend_with_deferred_policy_creates_no_phantom_tax_state():
 
 
 def test_share_distribution_preserves_cost_and_blocks_trading_new_shares_until_date():
+    """验证股份送转保留费用与阻断交易新股份直到日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _distribution()
     ledger.record_share_distribution(event, as_of=event.record_date)
@@ -300,6 +314,7 @@ def test_share_distribution_preserves_cost_and_blocks_trading_new_shares_until_d
 
 
 def test_share_distribution_preserves_separate_existing_lots_and_total_basis():
+    """验证股份送转保留分开已有批次与总额口径。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     first = _lot("lot-a", shares=50, basis="450")
     second = PositionLot(
         lot_id="lot-b", symbol="SH600000", total_shares=50, sellable_shares=50,
@@ -318,6 +333,7 @@ def test_share_distribution_preserves_separate_existing_lots_and_total_basis():
 
 
 def test_distribution_record_date_snapshot_uses_close_holdings_after_same_day_sale():
+    """验证送转登记日期快照使用收盘持仓之后相同日卖出。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("0"), positions=(_lot(shares=200, basis="2000"),))
     event = _distribution()
     ledger.apply_fill(TradeFill(
@@ -354,6 +370,7 @@ def test_distribution_record_date_snapshot_uses_close_holdings_after_same_day_sa
 def test_record_date_entitlement_uses_end_of_day_shares_and_survives_restore(
     event_factory, case, opening_shares, fills, expected_entitled, post_capture_fills,
 ):
+    """验证登记日期权益资格使用结束的日股份与仍保留恢复。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`event_factory`：事件工厂场景输入；`case`：代码标识“case”（含义待核实）场景输入；`opening_shares`：开盘股份场景输入；`fills`：成交场景输入；`expected_entitled`：预期代码标识“entitled”（含义待核实）场景输入；`post_capture_fills`：POST采集成交场景输入。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = event_factory()
     positions = (_lot(shares=opening_shares),) if opening_shares else ()
     ledger = PortfolioLedger(Decimal("100000"), positions=positions)
@@ -417,6 +434,7 @@ def test_record_date_entitlement_uses_end_of_day_shares_and_survives_restore(
 
 
 def test_distribution_without_record_date_holding_creates_no_trade_or_phantom_position():
+    """验证送转缺少登记日期持仓创建没有交易或虚假持仓。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"))
     event = _distribution()
 
@@ -430,6 +448,7 @@ def test_distribution_without_record_date_holding_creates_no_trade_or_phantom_po
 
 
 def test_fractional_share_distribution_requires_account_result_and_evidence():
+    """验证小数股份送转要求账户结果与证据。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _distribution(ratio="0.1339")
     with pytest.raises(ValueError, match="账户层最终获配股数"):
@@ -450,6 +469,7 @@ def test_fractional_share_distribution_requires_account_result_and_evidence():
 
 
 def test_distribution_claim_survives_record_date_sale_and_settles_on_registration():
+    """验证送转声明仍保留登记日期卖出与结算在登记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     event = _distribution(
         effective_date="2026-11-02", registration_date="2026-11-03", tradable_date="2026-11-04",
@@ -500,6 +520,7 @@ def test_distribution_claim_survives_record_date_sale_and_settles_on_registratio
 
 
 def test_rights_must_be_explicitly_subscribed_or_declined():
+    """验证配股权利必须明确地认购或放弃。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = _rights()
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -528,6 +549,7 @@ def test_rights_must_be_explicitly_subscribed_or_declined():
 
 
 def test_rights_subscription_is_cash_out_then_separate_untradable_claim_then_lot():
+    """验证配股权利认购现金退出随后分开不可交易声明随后批次。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = _rights()
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -557,6 +579,7 @@ def test_rights_subscription_is_cash_out_then_separate_untradable_claim_then_lot
 
 
 def test_rights_subscription_with_insufficient_cash_is_atomic_and_remains_unresolved():
+    """验证配股权利认购带有不足现金原子与仍为未解决。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = _rights()
     ledger = PortfolioLedger(Decimal("100"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -578,6 +601,7 @@ def test_rights_subscription_with_insufficient_cash_is_atomic_and_remains_unreso
 
 
 def test_rights_partial_subscription_is_rejected_without_mutating_ledger():
+    """验证配股权利部分认购拒绝缺少改变账本。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = _rights()
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -600,6 +624,7 @@ def test_rights_partial_subscription_is_rejected_without_mutating_ledger():
 
 
 def test_fractional_rights_require_evidenced_integer_allocation():
+    """验证小数配股权利要求有证据整数分配。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = replace(_rights(), rights_per_old_share=Decimal("0.15"))
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(shares=10, basis="100"),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -626,6 +651,7 @@ def test_fractional_rights_require_evidenced_integer_allocation():
 
 
 def test_rights_claim_proxy_and_ledger_snapshot_resume_distinguish_registration_from_tradability():
+    """验证配股权利声明代理与账本快照续跑区分登记从可交易状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = replace(_rights(), registration_date="2026-11-07")
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -673,6 +699,7 @@ def test_rights_claim_proxy_and_ledger_snapshot_resume_distinguish_registration_
 
 
 def test_rights_close_proxy_refuses_unknown_or_suspended_market_state():
+    """验证配股权利收盘代理拒绝未知或停牌市场状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     event = _rights()
     ledger = PortfolioLedger(Decimal("500"), positions=(_lot(),))
     ledger.record_rights_offering(event, as_of=event.record_date)
@@ -690,6 +717,7 @@ def test_rights_close_proxy_refuses_unknown_or_suspended_market_state():
 
 
 def test_code_change_migrates_each_lot_without_cash_or_trade_and_rejects_merger_ratio():
+    """验证代码变更迁移每项批次缺少现金或交易与拒绝合并比例。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     source = _source()
     event = CodeChangeEvent(
         event_id="code-change-1",
@@ -738,6 +766,7 @@ def test_code_change_migrates_each_lot_without_cash_or_trade_and_rejects_merger_
 
 
 def test_event_id_cannot_be_reused_for_a_different_event_family():
+    """验证事件编号不能重复使用针对不同事件类型。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     ledger = PortfolioLedger(Decimal("2000"))
     ledger.apply_fill(TradeFill(
         fill_id="shared-event-id", trade_date="2026-11-02", symbol="SH600000",
@@ -753,6 +782,7 @@ def test_event_id_cannot_be_reused_for_a_different_event_family():
 
 
 def test_share_swap_keeps_claim_untradable_then_creates_separate_new_lot():
+    """验证股份换股保持声明不可交易随后创建分开新批次。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     old_lot = PositionLot(
         lot_id="old-china-shipbuilding-lot", symbol="SH601989", total_shares=1000,
         sellable_shares=0, cost_basis_cny=Decimal("12000"),
@@ -820,6 +850,7 @@ def test_share_swap_keeps_claim_untradable_then_creates_separate_new_lot():
 
 
 def test_share_swap_claim_valuation_is_for_one_date_only():
+    """验证股份换股声明估值针对一项日期仅。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     old_lot = PositionLot(
         lot_id="old", symbol="SH601989", total_shares=1000, sellable_shares=0,
         cost_basis_cny=Decimal("12000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
@@ -849,6 +880,7 @@ def test_share_swap_claim_valuation_is_for_one_date_only():
 
 
 def test_delisting_cash_settlement_moves_to_receivable_and_never_reuses_old_price():
+    """验证退市现金结算移动到应收款与不会复用旧价格。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     lot = PositionLot(
         lot_id="delisted-lot", symbol="SH600000", total_shares=100, sellable_shares=100,
         cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
@@ -876,6 +908,7 @@ def test_delisting_cash_settlement_moves_to_receivable_and_never_reuses_old_pric
 
 
 def test_delisting_cash_amount_announced_after_close_cannot_backfill_delisting_nav():
+    """验证退市现金金额公告公布之后收盘不能回填退市净值。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     lot = PositionLot(
         lot_id="delisted-lot", symbol="SH600000", total_shares=100, sellable_shares=100,
         cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
@@ -900,6 +933,7 @@ def test_delisting_cash_amount_announced_after_close_cannot_backfill_delisting_n
 
 
 def test_delisting_without_settlement_stays_unvalued_until_same_day_claim_mark():
+    """验证退市缺少结算保持未估值直到相同日声明估值标记。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     lot = PositionLot(
         lot_id="delisted-lot", symbol="SZ000001", total_shares=100, sellable_shares=0,
         cost_basis_cny=Decimal("5000"), acquired_on="2024-01-03", sellable_from="2024-01-04",
@@ -926,6 +960,7 @@ def test_delisting_without_settlement_stays_unvalued_until_same_day_claim_mark()
 
 
 def test_action_event_requires_timestamped_source_and_explicit_booking_date():
+    """验证行动事件要求记录时间来源与明确入账日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     with pytest.raises(ValueError, match="必须包含时区"):
         CashDividendEvent(
             event_id="bad-time", symbol="SH600000", record_date="2026-10-29",

@@ -1,3 +1,5 @@
+"""策环测试模块：验证 BaoStock 点时股票池快照、名单完整性、状态对账和正式门控。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 import json
 import hashlib
 
@@ -16,12 +18,15 @@ from cehuan.cli.main import main
 
 
 class _FakeUniverseSession:
+    """测试辅助类“_FakeUniverseSession”，用于承载模拟股票池交易日相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     package_version = "test"
 
     def __init__(self):
+        """初始化测试辅助对象`_FakeUniverseSession`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.request_log = []
 
     def _record(self, endpoint, frame):
+        """实现测试替身_FakeUniverseSession的登记行为；用于控制被测代码与断言，不访问真实服务。 参数：`endpoint`：接口场景输入；`frame`：数据表场景输入。 返回值供调用处构造夹具或断言复用。"""
         self.request_log.append({
             "endpoint": endpoint,
             "started_at_utc": "2025-01-03T00:00:00+00:00",
@@ -33,12 +38,14 @@ class _FakeUniverseSession:
         return frame
 
     def trade_calendar(self, start, end):
+        """实现测试替身_FakeUniverseSession的交易日历行为；用于控制被测代码与断言，不访问真实服务。 参数：`start`：代码标识“start”（含义待核实）场景输入；`end`：结束场景输入。 返回值供调用处构造夹具或断言复用。"""
         return self._record("query_trade_dates", pd.DataFrame([
             {"calendar_date": "2025-01-02", "is_trading_day": "1"},
             {"calendar_date": "2025-01-03", "is_trading_day": "1"},
         ]))
 
     def stock_basic(self):
+        """实现测试替身_FakeUniverseSession的股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 返回值供调用处构造夹具或断言复用。"""
         return self._record("query_stock_basic", pd.DataFrame([
             {"code": "sh.600000", "code_name": "浦发银行", "ipoDate": "1999-11-10", "outDate": "", "type": "1", "status": "1"},
             {"code": "sh.600001", "code_name": "退市样例", "ipoDate": "1999-11-10", "outDate": "2025-01-03", "type": "1", "status": "0"},
@@ -46,6 +53,7 @@ class _FakeUniverseSession:
         ]))
 
     def all_stocks(self, day):
+        """实现测试替身_FakeUniverseSession的全部股票行为；用于控制被测代码与断言，不访问真实服务。 参数：`day`：日场景输入。 返回值供调用处构造夹具或断言复用。"""
         frame = pd.DataFrame([
             {"code": "sh.600000", "tradeStatus": "1", "code_name": "浦发银行"},
             {"code": "sh.600001", "tradeStatus": "0", "code_name": "退市样例"},
@@ -56,6 +64,7 @@ class _FakeUniverseSession:
 
 
 def test_universe_snapshot_filters_nonstocks_keeps_unknowns_and_resumes(tmp_path):
+    """验证股票池快照筛选非股票保持未知项与续跑。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     first = create_baostock_universe_snapshot(
         _FakeUniverseSession(), "2025-01-02", "2025-01-03", tmp_path,
         "universe-test", batch_size=1,
@@ -81,6 +90,7 @@ def test_universe_snapshot_filters_nonstocks_keeps_unknowns_and_resumes(tmp_path
 
 
 def test_universe_snapshot_can_defer_finalization_until_bars_are_attached(tmp_path):
+    """验证股票池快照可以延后最终封存直到行情附加。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     delayed = create_baostock_universe_snapshot(
         _FakeUniverseSession(), "2025-01-02", "2025-01-03", tmp_path,
         "defer-test", batch_size=2, defer_finalize=True,
@@ -105,6 +115,7 @@ def test_universe_snapshot_can_defer_finalization_until_bars_are_attached(tmp_pa
 
 
 def test_universe_resume_rejects_changed_previously_verified_daily_file(tmp_path):
+    """验证股票池续跑拒绝变更此前已每日文件。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     first = create_baostock_universe_snapshot(
         _FakeUniverseSession(), "2025-01-02", "2025-01-03", tmp_path,
         "integrity-test", batch_size=1,
@@ -123,6 +134,7 @@ def test_universe_resume_rejects_changed_previously_verified_daily_file(tmp_path
 
 
 def test_request_log_resume_recovers_complete_uncommitted_tail_and_rejects_prefix_tamper(tmp_path):
+    """验证请求日志续跑恢复完整未提交尾部与拒绝前缀篡改。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     path = tmp_path / "request_log.jsonl"
     checkpoint_path = tmp_path / "checkpoint.json"
     first = json.dumps({"endpoint": "login", "request_count": 1}) + "\n"
@@ -147,6 +159,7 @@ def test_request_log_resume_recovers_complete_uncommitted_tail_and_rejects_prefi
 
 
 def test_point_in_time_filter_reports_missing_quotes_and_daily_status_mismatch():
+    """验证时点在时间筛选报告缺失行情与每日状态不符。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     membership = pd.DataFrame([
         {"trade_date": "2025-01-02", "symbol": "SH600000", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1", "basic_status_at_retrieval": "1", "basic_out_date": ""},
         {"trade_date": "2025-01-02", "symbol": "SH600001", "pool_status": "STOCK_MEMBER", "daily_trade_status": "0", "basic_status_at_retrieval": "0", "basic_out_date": "2025-01-02"},
@@ -172,6 +185,7 @@ def test_point_in_time_filter_reports_missing_quotes_and_daily_status_mismatch()
 
 
 def test_point_in_time_filter_explains_only_a_confirmed_successor_bar_without_rewriting_raw_gap():
+    """验证时点在时间筛选解释仅已确认承继代码行情行缺少重写原始缺口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     membership = pd.DataFrame([
         {"trade_date": "2025-02-17", "symbol": "SZ300114", "pool_status": "STOCK_MEMBER", "daily_trade_status": "0"},
         {"trade_date": "2025-02-17", "symbol": "SZ302132", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
@@ -198,6 +212,7 @@ def test_point_in_time_filter_explains_only_a_confirmed_successor_bar_without_re
 
 
 def test_unregistered_identity_change_remains_an_unresolved_missing_bar():
+    """验证未登记身份变更仍为未解决缺失行情行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     membership = pd.DataFrame([
         {"trade_date": "2025-02-17", "symbol": "SZ300114", "pool_status": "STOCK_MEMBER", "daily_trade_status": "0"},
         {"trade_date": "2025-02-17", "symbol": "SZ302132", "pool_status": "STOCK_MEMBER", "daily_trade_status": "1"},
@@ -217,6 +232,7 @@ def test_unregistered_identity_change_remains_an_unresolved_missing_bar():
 
 
 def test_out_date_evidence_audit_requires_exact_row_and_date_match(tmp_path):
+    """验证退出日期证据审计要求完全一致行与日期匹配。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     reconciliation = tmp_path / "reconciliation.csv"
     pd.DataFrame([{
         "trade_date": "2025-05-22", "symbol": "SZ300630", "outDate": "2025-05-22",
@@ -253,6 +269,7 @@ def test_out_date_evidence_audit_requires_exact_row_and_date_match(tmp_path):
 
 
 def test_streaming_universe_audit_keeps_delisted_sample_and_checks_status(tmp_path):
+    """验证流式股票池审计保持已退市样本与检查状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     universe = tmp_path / "universe"
     universe.mkdir()
     pd.DataFrame([
@@ -320,6 +337,7 @@ def test_streaming_universe_audit_keeps_delisted_sample_and_checks_status(tmp_pa
 
 
 def test_streaming_universe_audit_rejects_a_trading_day_missing_membership(tmp_path):
+    """验证流式股票池审计拒绝交易日缺失成员资格。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     universe = tmp_path / "universe"
     universe.mkdir()
     pd.DataFrame([{
@@ -350,6 +368,7 @@ def test_streaming_universe_audit_rejects_a_trading_day_missing_membership(tmp_p
 
 
 def test_official_backtest_command_rejects_universe_reconciliation_failure(tmp_path, capsys):
+    """验证官方回测命令拒绝股票池对账失败。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     bars_path = tmp_path / "bars.csv"
     pd.DataFrame([{
         "trade_date": "2025-01-02", "symbol": "SH600000", "open": 10,
@@ -377,6 +396,7 @@ def test_official_backtest_command_rejects_universe_reconciliation_failure(tmp_p
 
 
 def test_point_in_time_backtest_requires_explicit_mode_and_config_toggle_cannot_enable_formal(tmp_path, capsys):
+    """验证时点在时间回测要求明确模式与配置开关不能启用正式。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`capsys`：pytest 提供的标准输出捕获工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config_path = tmp_path / "config.toml"
     config_path.write_text("[research]\nformal_point_in_time_baseline_enabled = true\n", encoding="utf-8")
     exit_code = main([

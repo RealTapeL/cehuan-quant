@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Recheck the private 2023-2025 preparation inputs and write a private manifest.
-
-This audit is read-only with respect to source snapshots and archives. It writes
-only new JSON reports under data/private/audits/.
-"""
+"""核验 2023—2025 准备快照、备份、来源登记和归档哈希，并生成新的私有清单；不改写原始快照。"""
 
 from __future__ import annotations
 
@@ -41,6 +37,7 @@ PUBLIC_EVIDENCE = (
 
 
 def sha256_file(path: Path) -> str:
+    """计算文件字节的 SHA-256，供快照、备份和归档之间逐项比对。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -49,15 +46,18 @@ def sha256_file(path: Path) -> str:
 
 
 def read_json(path: Path) -> dict[str, Any]:
+    """读取并解析 JSON 文件；缺失或格式错误会中止相应输入核验。"""
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def csv_rows(path: Path) -> list[dict[str, str]]:
+    """读取 CSV 行为字典列表；字段名沿用文件表头。"""
     with path.open(newline="", encoding="utf-8-sig") as stream:
         return list(csv.DictReader(stream))
 
 
 def git_value(root: Path, *args: str) -> str:
+    """在指定仓库读取单项 Git 元数据；命令失败时由调用处报告。"""
     result = subprocess.run(
         ["git", *args], cwd=root, check=True, capture_output=True, text=True
     )
@@ -65,6 +65,7 @@ def git_value(root: Path, *args: str) -> str:
 
 
 def package_version(*candidates: str) -> str | None:
+    """取得当前项目包版本；用于审计运行环境记录。"""
     for candidate in candidates:
         try:
             return importlib.metadata.version(candidate)
@@ -74,17 +75,20 @@ def package_version(*candidates: str) -> str | None:
 
 
 def new_run_id(now: datetime | None = None) -> str:
+    """根据传入时刻生成唯一审计运行标识；不表示数据供应商发布时间。"""
     timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     return "preparation-" + timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
 
 
 def create_run_directory(path: Path) -> None:
+    """创建本次审计专用目录；拒绝覆盖已存在目录。"""
     if ".." in path.parts or not RUN_ID_PATTERN.fullmatch(path.name):
         raise ValueError("run-id 只能包含字母、数字、点、下划线和连字符")
     path.mkdir(parents=True, exist_ok=False)
 
 
 def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    """通过临时文件再替换的方式写入文本，避免留下半写文件。"""
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding=encoding, newline="") as stream:
@@ -101,6 +105,7 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
 
 
 def verify_catalog(root: Path, snapshot: Path, manifest_name: str, catalog_key: str) -> dict[str, Any]:
+    """核对目录清单声明的文件、键和值与快照实际内容；不修复或改写快照。"""
     manifest_path = snapshot / manifest_name
     manifest = read_json(manifest_path)
     catalog = manifest.get(catalog_key)
@@ -174,6 +179,7 @@ def verify_catalog(root: Path, snapshot: Path, manifest_name: str, catalog_key: 
 
 
 def verify_backup(root: Path, source: Path, backup: Path, catalog: dict[str, str]) -> dict[str, Any]:
+    """将来源文件与备份文件按清单逐项比较；缺失或哈希不符会记为未通过。"""
     missing: list[str] = []
     mismatched: list[str] = []
     for checked, (relative, expected) in enumerate(catalog.items(), start=1):
@@ -245,6 +251,7 @@ def verify_backup(root: Path, source: Path, backup: Path, catalog: dict[str, str
 
 
 def archive_hash_map(root: Path, folder: Path) -> dict[str, list[str]]:
+    """为指定归档目录生成相对路径到 SHA-256 的映射；不解释文件语义。"""
     found: dict[str, list[str]] = {}
     if folder.exists():
         for path in folder.rglob("*"):
@@ -254,6 +261,7 @@ def archive_hash_map(root: Path, folder: Path) -> dict[str, list[str]]:
 
 
 def verify_source_registers(root: Path) -> dict[str, Any]:
+    """核对来源登记表、事件键和归档文件之间的对应关系；人工复核状态单独保留。"""
     evidence_root = root / "data/private/evidence/preparation-20261029"
     local_hashes = archive_hash_map(root, evidence_root)
 
@@ -437,6 +445,7 @@ def verify_source_registers(root: Path) -> dict[str, Any]:
 
 
 def main() -> int:
+    """执行准备输入的只读核验并创建新审计清单；输出目录唯一，不覆盖已有运行。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--run-id", help="唯一运行 ID；默认自动生成 UTC 时间戳 ID")

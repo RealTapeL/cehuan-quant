@@ -1,3 +1,5 @@
+"""候选池证据重建工具。模块从候选文件、冻结行情/配置及原始运行锚点中重建候选成员，帮助区分原始产物与事后重建；不据此推断历史数据当时已可得。"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +16,10 @@ def classify_candidate_inventory(
     candidate_path: str | Path,
     inventory_path: str | Path | None,
 ) -> dict[str, Any]:
-    """Compare a candidate artifact with a supplied inventory, without claiming runtime provenance."""
+    """将候选行与可选证券清单进行分类核对。
+    参数：candidate_path 为候选文件，inventory_path 为证券清单；后者缺省时保留无法分类状态。
+    返回：逐行分类结果及汇总信息。
+    异常：必需列缺失或文件解析失败时阻断。"""
     candidate = Path(candidate_path)
     if inventory_path is None:
         return {
@@ -88,7 +93,10 @@ def reconstruct_candidate_pool(
     frozen_config_path: str | Path,
     expected_candidates: pd.DataFrame,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Recreate ranked signal rows from frozen bars/config using the production signal adapters."""
+    """从冻结行情和配置重建候选池，并与预期候选逐项比较。
+    参数：frozen_bars_path/frozen_config_path 为冻结输入，expected_candidates 为已记录候选。
+    返回：重建候选及差异审计。
+    限制：这是事后重建，不能证明原始运行时的信息可得性。"""
     bars_path, config_path = Path(frozen_bars_path), Path(frozen_config_path)
     if not bars_path.is_file() or not config_path.is_file():
         missing = [str(path) for path in (bars_path, config_path) if not path.is_file()]
@@ -181,7 +189,10 @@ def inspect_original_run_candidate_anchor(
     manifest_path: str | Path | None,
     candidate_path: str | Path,
 ) -> dict[str, Any]:
-    """Check a runtime manifest claim while keeping unsigned manifest authenticity unverified."""
+    """检查原运行清单能否为候选文件提供来源锚点。
+    参数：manifest_path 为可选清单，candidate_path 为候选文件。
+    返回：文件摘要、锚点匹配状态和无法验证原因。
+    异常：文件存在但内容无法解析时记录为不可验证。"""
     if manifest_path is None:
         return {"status": "UNVERIFIED", "manifest_status": "NOT_PROVIDED", "reason": "No original-run manifest was supplied."}
     manifest_file, candidate = Path(manifest_path), Path(candidate_path)
@@ -245,6 +256,9 @@ def inspect_original_run_candidate_anchor(
 
 
 def _truthy(value: object) -> bool | None:
+    """将常见布尔表示规范为真假值。
+    参数：value 为输入单元格。
+    返回：能识别时返回布尔值，缺失或无法识别时返回 None。"""
     if pd.isna(value) or str(value).strip() == "":
         return None
     text = str(value).strip().lower()
@@ -256,6 +270,9 @@ def _truthy(value: object) -> bool | None:
 
 
 def _sha256_file(path: Path) -> str:
+    """流式计算文件 SHA-256，避免一次性读入大文件。
+    参数：path 为文件路径。
+    返回：小写十六进制摘要；文件无法读取时抛出文件系统异常。"""
     import hashlib
 
     digest = hashlib.sha256()

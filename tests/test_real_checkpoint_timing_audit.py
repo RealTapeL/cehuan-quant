@@ -1,3 +1,5 @@
+"""策环测试模块：验证真实 checkpoint 时点审计中的持仓区间和下一开市日边界。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -15,6 +17,7 @@ _next_open_after = _AUDIT["_next_open_after"]
 
 
 def test_sold_at_open_is_not_held_through_record_date_close() -> None:
+    """验证已卖出于开盘不已持有经过登记日期收盘。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     trades = pd.DataFrame([
         {"symbol": "SH600001", "trade_date": "2025-01-03", "side": "BUY", "quantity": 100, "_row_order": 0},
         {"symbol": "SH600001", "trade_date": "2025-01-06", "side": "SELL", "quantity": 100, "_row_order": 1},
@@ -33,6 +36,7 @@ def test_sold_at_open_is_not_held_through_record_date_close() -> None:
 
 
 def test_partial_sale_keeps_remaining_position_open() -> None:
+    """验证部分卖出保持剩余持仓开盘。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     trades = pd.DataFrame([
         {"symbol": "SH600001", "trade_date": "2025-01-03", "side": "BUY", "quantity": 300, "_row_order": 0},
         {"symbol": "SH600001", "trade_date": "2025-01-06", "side": "SELL", "quantity": 100, "_row_order": 1},
@@ -51,6 +55,7 @@ def test_partial_sale_keeps_remaining_position_open() -> None:
 
 
 def test_next_open_session_is_exact_not_lexical() -> None:
+    """验证下一条开盘交易日完全一致不词序。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     calendar = pd.DataFrame({
         "trade_date": ["2025-01-10", "2025-01-11", "2025-01-12", "2025-01-13", "2025-01-14"],
         "is_open": ["true", "false", "false", "true", "true"],
@@ -61,6 +66,7 @@ def test_next_open_session_is_exact_not_lexical() -> None:
 
 
 def test_next_open_session_requires_explicit_calendar_state() -> None:
+    """验证下一条开盘交易日要求明确日历状态。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     calendar = pd.DataFrame({"trade_date": ["2025-01-13"], "is_open": [""]})
 
     with pytest.raises(ValueError, match="is_open 必须明确"):
@@ -68,6 +74,7 @@ def test_next_open_session_requires_explicit_calendar_state() -> None:
 
 
 def test_next_open_session_rejects_duplicate_dates() -> None:
+    """验证下一条开盘交易日拒绝重复日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     calendar = pd.DataFrame({
         "trade_date": ["2025-01-13", "2025-01-13"],
         "is_open": ["true", "false"],

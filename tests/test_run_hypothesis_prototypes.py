@@ -1,3 +1,5 @@
+"""策环测试模块：验证假设原型运行清单可复现且拒绝覆盖已有产物。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +14,7 @@ _BUILD_RUN = runpy.run_path("scripts/run_hypothesis_prototypes.py")["build_run"]
 
 
 def test_synthetic_hypothesis_run_is_registered_and_reproducible(tmp_path: Path) -> None:
+    """验证合成假设运行已登记与可复现。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "run"
     result = _BUILD_RUN(output)
     manifest = result["manifest"]
@@ -38,6 +41,7 @@ def test_synthetic_hypothesis_run_is_registered_and_reproducible(tmp_path: Path)
 
 
 def test_synthetic_hypothesis_run_refuses_to_overwrite(tmp_path: Path) -> None:
+    """验证合成假设运行拒绝到覆盖。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     output = tmp_path / "existing"
     output.mkdir()
     (output / "keep.txt").write_text("keep", encoding="utf-8")

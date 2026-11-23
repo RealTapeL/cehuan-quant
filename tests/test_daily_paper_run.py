@@ -1,3 +1,5 @@
+"""策环测试模块：验证每日纸面流程的合成采集、排名、简报及缺数据阻断。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -18,6 +20,7 @@ SIGNAL_DATE = "2026-11-20"
 
 
 def _inputs(root: Path) -> tuple[Path, Path, Path]:
+    """私有测试辅助函数，用于输入。 参数：`root`：代码标识“root”（含义待核实）场景输入。 返回：tuple[Path, Path, Path]，供调用处构造夹具或断言复用。"""
     pool = root / "selected_pool.csv"
     pool.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"symbol": FIXED_SYMBOLS}).to_csv(pool, index=False)
@@ -28,29 +31,36 @@ def _inputs(root: Path) -> tuple[Path, Path, Path]:
 
 
 class _SyntheticBaoStock:
+    """测试辅助类“_SyntheticBaoStock”，用于承载合成BaoStock股票相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
     package_version = "synthetic-test-only"
 
     def __init__(self, *, dates: list[str], omit_signal_member: bool = False, **kwargs: Any) -> None:
+        """初始化测试辅助对象`_SyntheticBaoStock`的状态；参数提供模拟响应或夹具字段，不触发真实外部操作。"""
         self.dates = dates
         self.omit_signal_member = omit_signal_member
         self.request_log: list[dict[str, Any]] = []
 
     def __enter__(self) -> "_SyntheticBaoStock":
+        """实现测试替身_SyntheticBaoStock的进入行为；用于控制被测代码与断言，不访问真实服务。 返回：'_SyntheticBaoStock'，供调用处构造夹具或断言复用。"""
         return self
 
     def __exit__(self, *args: Any) -> None:
+        """实现测试替身_SyntheticBaoStock的退出行为；用于控制被测代码与断言，不访问真实服务。 参数：`*args`：参数场景输入。 返回：None，供调用处构造夹具或断言复用。"""
         return None
 
     def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """实现测试替身_SyntheticBaoStock的交易日历行为；用于控制被测代码与断言，不访问真实服务。 参数：`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         return pd.DataFrame({"calendar_date": self.dates, "is_trading_day": ["1"] * len(self.dates)})
 
     def stock_basic(self, symbol: str) -> pd.DataFrame:
+        """实现测试替身_SyntheticBaoStock的股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         code = f"{symbol[:2].lower()}.{symbol[2:]}"
         return pd.DataFrame([{
             "code": code, "code_name": symbol, "ipoDate": "2010-01-01", "outDate": "", "type": "1",
         }])
 
     def all_stocks(self, day: str) -> pd.DataFrame:
+        """实现测试替身_SyntheticBaoStock的全部股票行为；用于控制被测代码与断言，不访问真实服务。 参数：`day`：日场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         symbols = list(FIXED_SYMBOLS)
         if self.omit_signal_member and day == SIGNAL_DATE:
             symbols = symbols[:-1]
@@ -63,6 +73,7 @@ class _SyntheticBaoStock:
     def history(
         self, symbol: str, start_date: str, end_date: str, adjustflag: str, fields: str,
     ) -> pd.DataFrame:
+        """实现测试替身_SyntheticBaoStock的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入；`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入；`adjustflag`：代码标识“adjustflag”（含义待核实）场景输入；`fields`：字段场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
         code = f"{symbol[:2].lower()}.{symbol[2:]}"
         slope = 0.08 + 0.005 * FIXED_SYMBOLS.index(symbol)
         rows = []
@@ -85,9 +96,11 @@ class _SyntheticBaoStock:
 
 
 def _clock(start: datetime):
+    """私有测试辅助函数，用于时钟。 参数：`start`：代码标识“start”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
     tick = [0]
 
     def now() -> datetime:
+        """实现测试替身_clock的当前行为；用于控制被测代码与断言，不访问真实服务。 返回：datetime，供调用处构造夹具或断言复用。"""
         value = start + timedelta(seconds=tick[0])
         tick[0] += 1
         return value
@@ -98,12 +111,14 @@ def _clock(start: datetime):
 def _run(
     root: Path, monkeypatch, *, omit_signal_member: bool = False,
 ) -> tuple[Path, list[dict[str, Any]]]:
+    """私有测试辅助函数，用于运行。 参数：`root`：代码标识“root”（含义待核实）场景输入；`monkeypatch`：pytest 提供的环境/属性替换工具；`omit_signal_member`：代码标识“omit”（含义待核实）信号成员场景输入。 返回：tuple[Path, list[dict[str, Any]]]，供调用处构造夹具或断言复用。"""
     monkeypatch.setattr(daily_paper_run, "REPO_ROOT", root)
     pool, config, identity = _inputs(root / "inputs")
     dates = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
     factory_arguments: list[dict[str, Any]] = []
 
     def factory(**kwargs: Any) -> _SyntheticBaoStock:
+        """实现测试替身_run的工厂行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回：_SyntheticBaoStock，供调用处构造夹具或断言复用。"""
         factory_arguments.append(kwargs)
         return _SyntheticBaoStock(dates=dates, omit_signal_member=omit_signal_member, **kwargs)
 
@@ -123,6 +138,7 @@ def _run(
 
 
 def test_daily_paper_workflow_synthetic_capture_rank_and_brief(tmp_path: Path, monkeypatch) -> None:
+    """验证每日纸面流程合成采集排序与简报。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, factory_arguments = _run(tmp_path, monkeypatch)
 
     manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
@@ -151,6 +167,7 @@ def test_daily_paper_workflow_synthetic_capture_rank_and_brief(tmp_path: Path, m
 
 
 def test_incomplete_member_response_blocks_ranking_and_model(tmp_path: Path, monkeypatch) -> None:
+    """验证不完整成员响应阻断排名与模型。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     run_dir, _ = _run(tmp_path, monkeypatch, omit_signal_member=True)
 
     manifest = json.loads((run_dir / "daily-run-manifest.json").read_text(encoding="utf-8"))
@@ -167,11 +184,13 @@ def test_incomplete_member_response_blocks_ranking_and_model(tmp_path: Path, mon
 
 
 def test_before_close_is_needs_data_without_provider_or_model_request(tmp_path: Path, monkeypatch) -> None:
+    """验证之前收盘需要数据缺少供应商或模型请求。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
     pool, config, identity = _inputs(tmp_path / "inputs")
     called = []
 
     def forbidden_session(**kwargs: Any):
+        """实现测试替身test_before_close_is_needs_data_without_provider_or_model_request的禁止交易日行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
         called.append(kwargs)
         raise AssertionError("pre-close gate must not open BaoStock")
 
@@ -197,6 +216,7 @@ def test_before_close_is_needs_data_without_provider_or_model_request(tmp_path: 
 
 
 def test_calendar_not_confirming_signal_day_blocks_before_price_capture(tmp_path: Path, monkeypatch) -> None:
+    """验证日历不确认信号日阻断之前价格采集。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
     pool, config, identity = _inputs(tmp_path / "inputs")
     sessions = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
@@ -204,19 +224,24 @@ def test_calendar_not_confirming_signal_day_blocks_before_price_capture(tmp_path
     calls: list[str] = []
 
     class StaleCalendarBaoStock(_SyntheticBaoStock):
+        """测试辅助类“StaleCalendarBaoStock”，用于承载过期日历BaoStock股票相关的合成状态或模拟行为；对象仅在当前测试过程中使用，不代表真实供应商或账户对象。"""
         def trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
+            """实现测试替身StaleCalendarBaoStock的交易日历行为；用于控制被测代码与断言，不访问真实服务。 参数：`start_date`：代码标识“start”（含义待核实）日期场景输入；`end_date`：结束日期场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
             calls.append("calendar")
             return super().trade_calendar(start_date, end_date)
 
         def stock_basic(self, symbol: str) -> pd.DataFrame:
+            """实现测试替身StaleCalendarBaoStock的股票基础资料行为；用于控制被测代码与断言，不访问真实服务。 参数：`symbol`：证券代码场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
             calls.append(f"basic:{symbol}")
             return super().stock_basic(symbol)
 
         def history(self, *args: Any, **kwargs: Any) -> pd.DataFrame:
+            """实现测试替身StaleCalendarBaoStock的历史行为；用于控制被测代码与断言，不访问真实服务。 参数：`*args`：参数场景输入；`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回：pd.DataFrame，供调用处构造夹具或断言复用。"""
             calls.append("history")
             return super().history(*args, **kwargs)
 
     def factory(**kwargs: Any) -> StaleCalendarBaoStock:
+        """实现测试替身test_calendar_not_confirming_signal_day_blocks_before_price_capture的工厂行为；用于控制被测代码与断言，不访问真实服务。 参数：`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回：StaleCalendarBaoStock，供调用处构造夹具或断言复用。"""
         return StaleCalendarBaoStock(dates=sessions, **kwargs)
 
     start = datetime(2026, 11, 20, 16, 0, tzinfo=SHANGHAI)
@@ -242,12 +267,14 @@ def test_calendar_not_confirming_signal_day_blocks_before_price_capture(tmp_path
 
 
 def test_modified_raw_response_hash_blocks_ranking_and_model(tmp_path: Path, monkeypatch) -> None:
+    """验证修改原始响应哈希阻断排名与模型。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     pool, config, identity = _inputs(tmp_path / "inputs")
     monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
     original_request = daily_paper_run._request
     mutated = False
 
     def mutate_sealed_source(*args: Any, **kwargs: Any):
+        """实现测试替身test_modified_raw_response_hash_blocks_ranking_and_model的修改已封存来源行为；用于控制被测代码与断言，不访问真实服务。 参数：`*args`：参数场景输入；`**kwargs`：代码标识“kwargs”（含义待核实）场景输入。 返回值供调用处构造夹具或断言复用。"""
         nonlocal mutated
         result = original_request(*args, **kwargs)
         request_id = args[4]

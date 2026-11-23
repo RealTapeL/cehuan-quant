@@ -1,3 +1,5 @@
+"""将已支持的策略假设映射到受控诊断实验并封存结果；使用合成输入，不改当前有效策略。"""
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +24,7 @@ from cehuan.research.hypothesis_prototypes import (
 
 
 def _sha256(path: Path) -> str:
+    """计算实验输入或产物的文件哈希，供运行清单绑定。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -30,16 +33,19 @@ def _sha256(path: Path) -> str:
 
 
 def _write_json(path: Path, value: object) -> None:
+    """将实验结构化结果写为 JSON 文件；调用方负责保证目录为本次新建目录。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def _git_context() -> dict[str, Any]:
+    """记录原型实验所用代码提交和工作区状态。"""
     commit = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     paths = subprocess.run(["git", "status", "--porcelain"], check=True, capture_output=True, text=True).stdout.splitlines()
     return {"commit": commit, "worktree_clean": not bool(paths), "uncommitted_paths": [line[3:] for line in paths]}
 
 
 def _publish_new_directory(staging: Path, output_dir: Path) -> None:
+    """将暂存目录发布到新运行目录；目标已存在时拒绝覆盖。"""
     lock_path = output_dir.parent / f".{output_dir.name}.publish-lock"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -61,6 +67,7 @@ def _publish_new_directory(staging: Path, output_dir: Path) -> None:
 
 
 def _synthetic_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """构造原型诊断所需的合成行情、状态和事件输入；不混入真实市场数据。"""
     dates = pd.bdate_range("2025-01-06", periods=21).strftime("%Y-%m-%d").tolist()
     signal_date = dates[-1]
     calendar = pd.DataFrame({"trade_date": dates, "is_open": True})
@@ -140,6 +147,7 @@ def _synthetic_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[
 
 
 def build_run(output_dir: Path) -> dict[str, Any]:
+    """执行已支持的假设原型并保存输入、配置与结果；未支持规则保持待实现状态。"""
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
         raise FileExistsError(f"实验输出已存在，拒绝覆盖：{output_dir}")
@@ -258,6 +266,7 @@ def build_run(output_dir: Path) -> dict[str, Any]:
 
 
 def main() -> int:
+    """解析原型运行参数并创建独立实验产物；不修改当前有效策略。"""
     parser = argparse.ArgumentParser(description="Run deterministic H1/H2 synthetic research prototypes; no market data or orders.")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()

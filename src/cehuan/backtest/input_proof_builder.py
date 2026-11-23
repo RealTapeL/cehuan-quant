@@ -1,7 +1,8 @@
-"""Rebuild checkpoint input proofs from project-normalized local inputs.
+"""使用项目适配器从本地输入重建 checkpoint 规范化证明。
 
-The builder is read-only with respect to backtest state. It does not merge
-inputs, create checkpoints, or execute a strategy.
+本模块只读回测状态，重建配置、行情、日历、事件、规则、费率和来源文件的绑定报告；
+不合并输入、不创建 checkpoint，也不执行策略。文件哈希、规范内容、来源审核与历史
+可得时点分别报告，任何一层缺少材料都不会自动视为通过。
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ PROVENANCE_OPTIONAL_COLUMNS = (
 
 
 def sha256_file(path: str | Path) -> str:
+    """分块计算本地文件 SHA-256，不输出文件内容。"""
     digest = hashlib.sha256()
     with Path(path).expanduser().resolve().open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -70,6 +72,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 def _resolve(path: str | Path, relative_to: Path | None = None) -> Path:
+    """按可选基准目录解析绝对路径，并展开用户目录标记。"""
     value = Path(path).expanduser()
     if not value.is_absolute() and relative_to is not None:
         value = relative_to / value
@@ -77,6 +80,7 @@ def _resolve(path: str | Path, relative_to: Path | None = None) -> Path:
 
 
 def _json_safe(value: Any) -> Any:
+    """递归转换日期、Decimal、numpy 标量和空值，使数据可安全写入 JSON。"""
     if value is None or value is pd.NA or value is pd.NaT:
         return None
     if isinstance(value, pd.Timestamp):
@@ -99,6 +103,7 @@ def _json_safe(value: Any) -> Any:
 def _read_provenance_registry(
     path: Path | None,
 ) -> tuple[dict[tuple[str, str, str], dict[str, str]], dict[str, Any]]:
+    """读取来源/时点登记表并按类型、行 ID、来源角色建立唯一映射。"""
     if path is None:
         return {}, {"status": "UNVERIFIED", "reason": "未提供来源与时点登记表", "rows": 0}
     if not path.is_file():
@@ -134,6 +139,7 @@ def _read_provenance_registry(
 
 
 def _aware_utc(value: Any) -> str | None:
+    """将带时区时间文本规范为 UTC；仅日期、空值或解析失败返回 None。"""
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -146,6 +152,7 @@ def _aware_utc(value: Any) -> str | None:
 
 
 def _reviewed(entry: Mapping[str, Any]) -> bool:
+    """判断登记记录是否具有审核状态、审核人和可解析审核日期。"""
     if str(entry.get("review_status", "")).upper() != "REVIEWED":
         return False
     if not str(entry.get("reviewed_by", "")).strip():
@@ -166,6 +173,7 @@ def _registry_match(
     source_role: str = "primary",
     expected_source_url: str | None = None,
 ) -> dict[str, Any]:
+    """将一条规范输入行与来源登记、原件哈希、可得时点及审核记录匹配。"""
     entry = registry.get((input_type.upper(), row_id, source_role))
     if entry is None:
         return {
@@ -233,6 +241,7 @@ def _registry_match(
 
 
 def _artifact(path: Path | None, *, status: str | None = None, detail: str | None = None) -> dict[str, Any]:
+    """生成文件路径、SHA-256 与状态记录；缺失路径或文件保持未验证。"""
     if path is None:
         return {"path": None, "sha256": None, "status": status or "UNVERIFIED", "detail": detail}
     if not path.is_file():
@@ -241,11 +250,12 @@ def _artifact(path: Path | None, *, status: str | None = None, detail: str | Non
 
 
 def _not_applicable_artifact(reason: str) -> dict[str, Any]:
+    """构造有明确理由的“不适用”文件记录，不虚构文件路径或摘要。"""
     return {"path": None, "sha256": None, "not_applicable": True, "status": "VERIFIED", "detail": reason}
 
 
 def _audit_status(rows: list[Mapping[str, Any]]) -> str:
-    """Aggregate audit rows without treating missing evidence as a match."""
+    """汇总审计行状态；缺证据保留 UNVERIFIED，不当作匹配通过。"""
     statuses = [str(row.get("status", "UNVERIFIED")) for row in rows]
     if not statuses or "FAILED" in statuses:
         return "FAILED" if "FAILED" in statuses else "UNVERIFIED"
@@ -253,6 +263,7 @@ def _audit_status(rows: list[Mapping[str, Any]]) -> str:
 
 
 def _audit_claimed_proof_files(claimed: Any, claimed_path: Path) -> tuple[str, list[dict[str, Any]]]:
+    """重新读取 claimed proof 声明的文件并核对路径和 SHA-256。"""
     if not isinstance(claimed, dict) or not isinstance(claimed.get("inputs"), dict):
         return "FAILED", [{"role": "claimed_proof", "status": "FAILED", "detail": "proof 缺少 inputs 对象"}]
     inputs = claimed["inputs"]
@@ -370,6 +381,7 @@ def _audit_claimed_proof_files(claimed: Any, claimed_path: Path) -> tuple[str, l
 
 
 def _audit_canonical_rows(proof: Any) -> tuple[str, list[dict[str, Any]]]:
+    """核对证明 payload 与各事件、规则、费用规范行的内容摘要和外层字段。"""
     if not isinstance(proof, dict) or not isinstance(proof.get("inputs"), dict):
         return "FAILED", [{"role": "proof", "status": "FAILED", "detail": "缺少 inputs 对象"}]
     audits: list[dict[str, Any]] = []
@@ -425,6 +437,7 @@ def _audit_canonical_rows(proof: Any) -> tuple[str, list[dict[str, Any]]]:
 def _compare_artifact_declarations(
     rebuilt: Mapping[str, Any], claimed: Any,
 ) -> tuple[str, list[str]]:
+    """比较重建证明与既有证明的 artifact 哈希声明，返回状态和差异项。"""
     if not isinstance(claimed, dict) or not isinstance(claimed.get("inputs"), dict):
         return "FAILED", ["claimed proof 缺少 inputs 对象"]
     claimed_artifacts = claimed["inputs"].get("artifacts")
@@ -455,6 +468,7 @@ def _schedule_proof_rows(
     registry: Mapping[tuple[str, str, str], dict[str, str]],
     registry_path: Path | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """将规范规则或费率行转成绑定来源登记的 proof 行及逐行审计结果。"""
     output: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     for raw in frame.to_dict(orient="records"):
@@ -491,6 +505,7 @@ def _accounting_event_rows(
     registry_path: Path | None,
     source_base_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """从类型化公司行动调度生成事件 proof，并核对来源、税务和配股决策证据。"""
     if bundle is None or schedule is None:
         return [], []
     source_by_id = {
@@ -587,10 +602,10 @@ def _identity_and_corporate_event_rows(
     registry: Mapping[tuple[str, str, str], dict[str, str]],
     registry_path: Path | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Bind each normalized identity/action row to its required source archives.
+    """将规范身份事件和公司行动逐条绑定到必需来源原件。
 
-    A merger event has two independently checked source roles: the implementation
-    result notice and the old security's last-trading notice.
+    返回身份事件行、公司行动行和来源审计记录。换股合并分别核对实施结果公告与旧证券
+    最后交易公告；两种来源角色不能相互替代。
     """
     identity_rows: list[dict[str, Any]] = []
     corporate_rows: list[dict[str, Any]] = []
@@ -600,6 +615,7 @@ def _identity_and_corporate_event_rows(
         *, family: str, input_type: str, raw: Mapping[str, Any], source_specs: list[dict[str, Any]],
         output: list[dict[str, Any]],
     ) -> None:
+        """把单条身份或公司行动规范行绑定到要求的来源原件。"""
         canonical_row = _json_safe(dict(raw))
         event_id = str(canonical_row["event_id"])
         row_id = f"{family}:{event_id}"
@@ -736,6 +752,7 @@ def _rebuild_chain(
     checkpoint: BacktestCheckpoint,
     current_bars_path: Path | None,
 ) -> tuple[str | None, dict[str, Any], list[dict[str, Any]]]:
+    """按历史窗口清单重算行情链，并核对 checkpoint 的最后窗口和总链哈希。"""
     if manifest_path is None:
         return None, {"status": "UNVERIFIED", "reason": "未提供完整历史窗口清单", "verified_windows": 0}, []
     if not manifest_path.is_file():
@@ -851,6 +868,7 @@ def _rebuild_chain(
 
 
 def _cutoff_evidence(path: Path | None, checkpoint: BacktestCheckpoint) -> tuple[dict[str, Any], dict[str, Any]]:
+    """核验决策截止时点证据是否绑定 checkpoint、原件哈希和人工审核记录。"""
     if path is None:
         return {"status": "UNVERIFIED", "reason": "checkpoint v1 本身不含精确决策截止时点"}, {}
     if not path.is_file():
@@ -907,7 +925,13 @@ def rebuild_checkpoint_input_proof(
     cutoff_evidence_path: str | Path | None = None,
     claimed_proof_path: str | Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Reconstruct the checkpoint's normalized input proof via project adapters."""
+    """通过项目数据适配器重建 checkpoint 的规范化输入证明和审计报告。
+
+    必需参数是已封存 checkpoint；其他路径指向配置、行情、日历、身份事件、公司行动、
+    账务事件、规则、费用、历史窗口清单、来源登记、截止时点证据及可选既有 proof。
+    返回重建 proof 与状态报告。该只读过程不执行续跑；缺文件、哈希冲突或时点证据不足
+    会分别标记 FAILED/UNVERIFIED。
+    """
     checkpoint.require_sealed()
     config_file = _resolve(config_path)
     bars_file = _resolve(bars_path or checkpoint.source_data_path) if (bars_path or checkpoint.source_data_path) else None
@@ -948,6 +972,7 @@ def rebuild_checkpoint_input_proof(
     session_dates: list[date] = []
 
     def file_record(name: str, path: Path | None, required: bool = True) -> None:
+        """登记单个输入文件是否存在及其字节 SHA-256。"""
         if path is None:
             file_rows.append({
                 "input": name, "path": None,
@@ -1164,6 +1189,7 @@ def rebuild_checkpoint_input_proof(
         for row in report["issues"]
     )
     def event_family_status(rows: list[dict[str, Any]]) -> str:
+        """汇总同类事件来源和审核状态；缺来源或缺人工复核仍为未验证。"""
         statuses = [str(row.get("source_status", "UNVERIFIED")) for row in rows]
         reviews = [
             str(source.get("review_status", "UNVERIFIED"))
@@ -1329,6 +1355,7 @@ def rebuild_checkpoint_input_proof(
                 "rules", "fees", "identity_events", "corporate_actions", "normalized_input_digests",
             )
             def semantic_rows(source_inputs: Mapping[str, Any], family: str) -> Any:
+                """对规范事件/规则/费率行排序并清除路径后用于语义比较。"""
                 rows = source_inputs.get(family)
                 if not isinstance(rows, list):
                     return rows
@@ -1336,6 +1363,7 @@ def rebuild_checkpoint_input_proof(
                 identity_key = "event_id" if family in {"events", "identity_events", "corporate_actions"} else "row_id"
 
                 def strip_paths(value: Any) -> Any:
+                    """递归移除仅表示本机位置的 source_path，保留输入语义字段。"""
                     if isinstance(value, dict):
                         return {key: strip_paths(item) for key, item in value.items() if key != "source_path"}
                     if isinstance(value, list):
@@ -1437,12 +1465,14 @@ def rebuild_checkpoint_input_proof(
         normalized_binding_status = "VERIFIED"
     file_audits = file_rows + proof_file_audit + claimed_file_audit
     def is_cutoff_audit(row: Mapping[str, Any]) -> bool:
+        """判断文件审计记录是否属于决策截止时点证据。"""
         role = str(row.get("role", ""))
         return row.get("input") == "cutoff_evidence" or any(
             value in role for value in ("cutoff_evidence", "decision_cutoff_source")
         )
 
     def is_source_evidence_audit(row: Mapping[str, Any]) -> bool:
+        """判断记录是否属于来源登记或事件、规则、费率的原件证据。"""
         role = str(row.get("role", ""))
         return row.get("input") == "provenance_registry" or role == "provenance_registry" or any(
             role.startswith(f"{family}:")

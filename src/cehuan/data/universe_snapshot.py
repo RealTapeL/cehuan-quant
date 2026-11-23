@@ -1,3 +1,10 @@
+"""按日保存并核对 BaoStock 证券名单的点时快照。
+
+本模块把交易日历、每日证券名单、原始请求和行情覆盖情况整理为可续跑、可审计的快照；
+供数据准备和股票池审计流程调用。它依赖 BaoStock 适配器与规范化函数，并用断点和
+SHA-256 防止覆盖已完成产物；当前证券基础资料不能替代历史逐日状态。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -25,6 +32,7 @@ from cehuan.data.security_identity import (
 
 
 def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+    """先写临时 CSV 再原子替换目标文件，避免中断留下半份文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_csv(temporary, index=False, encoding="utf-8")
@@ -32,6 +40,7 @@ def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
 
 
 def _atomic_json(value: Any, path: Path) -> None:
+    """以 UTF-8 原子写入 JSON 元数据；是否允许覆盖由调用方控制。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
@@ -39,6 +48,7 @@ def _atomic_json(value: Any, path: Path) -> None:
 
 
 def _sha256(path: Path) -> str:
+    """分块计算文件 SHA-256，用于绑定断点和快照产物。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -52,6 +62,7 @@ def _flush_baostock_requests(
     checkpoint: dict[str, Any],
     checkpoint_path: Path,
 ) -> None:
+    """追加尚未落盘的请求记录，并同步断点计数、日志字节数和哈希。"""
     if not session.request_log:
         return
     records = list(session.request_log)
@@ -71,6 +82,7 @@ def _flush_baostock_requests(
 
 
 def _verify_request_log(path: Path, checkpoint: dict[str, Any], checkpoint_path: Path) -> None:
+    """验证已提交日志前缀；完整尾行可恢复，损坏或截断内容会阻断续跑。"""
     if not path.exists():
         if int(checkpoint.get("request_log_bytes", 0)):
             raise ValueError("断点记录了请求日志，但 JSONL 文件不存在")
@@ -113,6 +125,7 @@ def _pin_checkpoint_artifact(
     required_columns: set[str],
     unique_column: str,
 ) -> None:
+    """校验元数据文件字段、唯一键和既有哈希后，将其登记到断点。"""
     if not path.is_file():
         raise ValueError(f"断点元数据文件不存在：{path}")
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -133,6 +146,7 @@ def _pin_checkpoint_artifact(
 
 
 def _as_text(value: object) -> str | None:
+    """把非空标量规范成去除首尾空白的文本，空值返回 None。"""
     if value is None or pd.isna(value):
         return None
     text = str(value).strip()
@@ -140,6 +154,7 @@ def _as_text(value: object) -> str | None:
 
 
 def _validate_daily_list_file(path: Path, day: str) -> dict[str, Any]:
+    """校验每日原始名单的必需列、代码非空与唯一性，并返回文件清单。"""
     if not path.is_file():
         raise ValueError(f"已标记完成的日期缺少原始文件：{path}")
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -173,7 +188,7 @@ def record_baostock_universe_failure(
     session: BaoStockSession,
     error: BaseException,
 ) -> Path | None:
-    """Persist session-level failures, including failures during login before a snapshot starts."""
+    """在采集或登录阶段失败时保留会话错误和请求证据，不覆盖已完成快照。"""
     parent = Path(root).expanduser().resolve()
     work = parent / f".{snapshot_id}.partial"
     destination = parent / snapshot_id
@@ -217,6 +232,7 @@ def record_baostock_universe_failure(
 
 
 def _date_is_in_basic_interval(day: str, basic: pd.Series) -> bool | None:
+    """按基础资料上市、退市日期判断区间；缺上市日时返回未知，不构成历史名单证据。"""
     ipo = _as_text(basic.get("ipoDate"))
     out_date = _as_text(basic.get("outDate"))
     if not ipo:
@@ -225,6 +241,7 @@ def _date_is_in_basic_interval(day: str, basic: pd.Series) -> bool | None:
 
 
 def _load_optional_bars(path: str | Path | None) -> tuple[set[tuple[str, str]], dict[tuple[str, str], dict[str, object]]]:
+    """读取可选规范行情，建立交易日/证券键集合及逐行详情映射。"""
     if path is None:
         return set(), {}
     frame = pd.read_csv(path, dtype={"symbol": str, "trade_date": str})
@@ -252,7 +269,13 @@ def create_baostock_universe_snapshot(
     defer_finalize: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Build a daily securities-list snapshot, keeping every date request resumable."""
+    """采集每日证券名单快照并支持校验后续跑。
+
+    日期参数定义采集区间；``root`` 与 ``snapshot_id`` 指定唯一产物目录；
+    ``batch_size`` 控制阶段性落盘，``resume`` 只恢复匹配原请求的未完成任务；
+    ``bars_path`` 用于行情覆盖核对，``defer_finalize`` 和回调用于分批协调。
+    返回快照清单。请求失败、断点哈希变化或目标已存在时会抛异常并保留现场。
+    """
     start, end = _parse_date(start_date), _parse_date(end_date)
     if start > end:
         raise ValueError("start_date 必须不晚于 end_date")
@@ -313,6 +336,7 @@ def create_baostock_universe_snapshot(
     basics_path = raw_dir / "stock_basic_all_types.csv"
 
     def run_query(endpoint: str, function: Any) -> pd.DataFrame:
+        """执行供应商查询；失败时先刷写请求日志和断点，再重新抛出异常。"""
         try:
             return function()
         except (Exception, KeyboardInterrupt) as exc:
@@ -717,7 +741,7 @@ def export_baostock_universe_symbol_union(
     universe_path: str | Path,
     output_path: str | Path,
 ) -> dict[str, Any]:
-    """Export the union of type-1 stocks present on any captured historical date."""
+    """导出历史日名单中的股票代码并集；该并集不能当作逐日点时股票池。"""
     source = Path(universe_path).expanduser().resolve()
     output = Path(output_path).expanduser().resolve()
     manifest_path = source / "manifest.json"
@@ -817,7 +841,12 @@ def filter_bars_to_point_in_time_universe(
     membership: pd.DataFrame,
     security_identity_events: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
-    """Keep only daily bars whose code is a confirmed type-1 daily-list member."""
+    """仅保留当日名单确认的股票行情，并汇总过滤和未解决差异。
+
+    ``bars`` 是规范行情，``membership`` 是带每日成员及交易状态的名单；可选身份
+    事件用于解释代码变更造成的缺行情。返回过滤行情、对账摘要和差异明细；重复键、
+    缺少成员字段或身份事件无法解释的情况不会被静默视作完整覆盖。
+    """
     required = {"trade_date", "symbol", "pool_status", "daily_trade_status"}
     missing = required.difference(membership.columns)
     if missing:
@@ -1007,7 +1036,7 @@ def filter_bars_to_point_in_time_universe(
 
 
 def _iter_csv_groups(path: Path, key_column: str, usecols: list[str], chunksize: int = 50_000):
-    """Yield adjacent date groups from a sorted CSV with bounded memory."""
+    """分块读取已排序 CSV，并以有限内存逐组产出相邻日期数据。"""
     carry: pd.DataFrame | None = None
     previous_key: str | None = None
     for chunk in pd.read_csv(
@@ -1048,7 +1077,11 @@ def audit_baostock_universe_prices(
     security_identity_events_sha256: str | None = None,
     out_date_evidence_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Compare a date-specific universe to bars using bounded-memory CSV groups."""
+    """按日期分块对账证券名单与行情，分别报告覆盖和未解释差异。
+
+    本审计证明的是输入文件之间的对账结果；同源名单与行情不能独立证明供应商历史
+    数据完整，未知类型、停牌或 ST 状态也不会因此变成已核实。
+    """
     universe_root = Path(universe_dir).expanduser().resolve()
     membership_path = universe_root / "securities_by_date.csv"
     manifest_path = universe_root / "manifest.json"

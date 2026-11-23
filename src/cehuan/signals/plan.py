@@ -1,3 +1,10 @@
+"""生成研究候选及受门控的人工审核计划。
+
+本模块复用信号、交易日历和正式 readiness 审计；研究输出不是券商委托。
+``MANUAL_REVIEW`` 必须基于真实输入重新核验 readiness，持仓卖出检查独立于
+新买股票池；未知上市、停牌、ST、交易规则或持仓字段会阻断审核计划。
+"""
+
 from __future__ import annotations
 
 import math
@@ -38,7 +45,14 @@ PLAN_COLUMNS = [
 
 
 class PlanReadinessError(ValueError):
+    """人工审核计划因 readiness 检查不通过而拒绝生成的异常。
+
+    ``report`` 保存程序计算的检查结果与阻断原因，供 CLI 输出诊断；该异常
+    不代表行情或账户状态已被自动修复。
+    """
+
     def __init__(self, report: dict[str, object]):
+        """保存阻断报告并构造面向 CLI 的简短错误信息。"""
         self.report = report
         super().__init__("人工审核计划未通过准入：" + "; ".join(report["blocking_reasons"]))
 
@@ -48,7 +62,12 @@ def _confirmed_stock_members(
     signal_date: object,
     current_symbols: set[str] | None = None,
 ) -> tuple[set[str], dict[str, object]]:
-    """Return only same-day confirmed stock members; reject ambiguous membership."""
+    """提取指定日期明确确认的股票成员，并拒绝歧义状态。
+
+    ``universe`` 是按日成员表，``current_symbols`` 可提供行情覆盖用于缺失核对；
+    返回确认成员集合及诊断。重复记录、无效代码、没有当日记录或没有确认股票成员时
+    会阻断；已有持仓仍可独立进入退出计划审核。
+    """
     required = {"trade_date", "symbol", "pool_status"}
     if not required.issubset(universe.columns):
         raise ValueError("点时股票池缺少 trade_date/symbol/pool_status")
@@ -100,7 +119,14 @@ def _manual_plan_readiness(
     readiness_evaluation_window: dict[str, str] | None,
     runtime_config: dict[str, object],
 ) -> dict[str, object]:
+    """从实际市场、持仓和 readiness 输入重建人工计划准入结果。
+
+    参数包括行情、日历、点时股票池、持仓及其时点、正式 readiness 报告、
+    实际输入上下文、评价窗口、运行时刻和配置。返回检查状态与阻断项；
+    不足以重新审计或任一门控不满足时标记 NOT_READY，不生成计划文件。
+    """
     local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    # blockers 仅汇总当前可从输入验证的条件；缺少证据不当作通过。
     blockers: list[str] = []
     checks: dict[str, object] = {}
     if formal_readiness is None:
@@ -278,13 +304,21 @@ def generate_plan(
     readiness_context: dict[str, str | object] | None = None,
     readiness_evaluation_window: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Create a non-actionable research candidate or a gated manual-review plan."""
+    """根据最新可用行情生成研究候选或准入后的人工审核计划。
+
+    ``frame``、现金、策略配置、可选持仓/日历/点时股票池及用途共同决定输出；
+    MANUAL_REVIEW 还要求实际 readiness 上下文和评价窗口。返回计划 DataFrame，
+    研究用途不允许执行数量；人工审核用途只生成供用户复核的文件内容，绝不
+    调用券商。时点不一致、数据不完整、规则未知或 readiness 未通过时抛出
+    ``ValueError``/``PlanReadinessError``。
+    """
     if purpose not in {"RESEARCH_ONLY", "SYNTHETIC_DIAGNOSTIC", "MANUAL_REVIEW"}:
         raise ValueError("purpose 只能是 RESEARCH_ONLY、SYNTHETIC_DIAGNOSTIC 或 MANUAL_REVIEW")
     if cash_cny <= 0:
         raise ValueError("生成计划前请明确输入可用现金；系统不会读取或猜测账户资金")
     if not math.isfinite(float(cash_cny)):
         raise ValueError("输入现金必须是有限数值")
+    # data 是本次计划使用的规范化历史行情及其收盘信号，不包含账户外部数据。
     data = add_momentum(frame, int(config["strategy"]["lookback_sessions"]))
     if data.empty:
         raise ValueError("没有可用于计划的行情数据")
@@ -337,6 +371,7 @@ def generate_plan(
         raise ValueError("最新交易日行情快照在标记的收盘可用时间前获取；请在收盘后重新拉取数据再生成计划")
     current = current.sort_values(["momentum", "symbol"], ascending=[False, True])
     current_by_symbol = {str(row["symbol"]): row for _, row in current.iterrows()}
+    # candidate_scope 只约束新买候选；已有持仓在后续退出审查中仍单独保留。
     candidate_scope = current.copy()
     universe_audit: dict[str, object] | None = None
     if universe is not None:
@@ -350,6 +385,7 @@ def generate_plan(
         "universe_supplied": False,
         "candidate_scope": "all current bars; no point-in-time universe supplied",
     }
+    # existing 保存输入持仓快照中的股数、可卖数和均价；缺可卖数仍保持未知。
     existing: dict[str, dict[str, float]] = {}
     if positions is not None and not positions.empty:
         for _, row in positions.iterrows():
@@ -485,6 +521,7 @@ def generate_plan(
 
     def add_row(symbol: str, action: str, current_shares: int, target_shares: int, weight: float | None,
                 price: float | None, basis: str, risks: str, price_condition: str) -> None:
+        """把单证券计划行与其行情规则证据加入待输出列表。"""
         row = current_by_symbol.get(symbol, {})
         rule_values = {
             column: row.get(column, pd.NA) if hasattr(row, "get") else pd.NA
@@ -631,6 +668,11 @@ def generate_plan(
 
 
 def plan_markdown(plan: pd.DataFrame) -> str:
+    """将计划 DataFrame 渲染为中文 Markdown。
+
+    空表返回无候选提示；非空表展示生成时点、数据截止、动作、数量和风险。
+    该文本仍是研究/人工审核材料，不会触发委托。
+    """
     if plan.empty:
         return "# 策环交易计划\n\n本次没有生成候选。请检查数据窗口、状态字段和现金输入。\n"
     first = plan.iloc[0]
@@ -658,6 +700,7 @@ def plan_markdown(plan: pd.DataFrame) -> str:
 
 
 def _plan_purpose_description(purpose: str) -> str:
+    """返回不同计划用途对应的安全边界说明文案。"""
     if purpose == "MANUAL_REVIEW":
         return "准入检查允许输出人工审核数量；仍需用户复核并在华泰手动操作，本文件不会下单。"
     if purpose == "SYNTHETIC_DIAGNOSTIC":

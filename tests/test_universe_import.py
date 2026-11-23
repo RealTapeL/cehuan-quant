@@ -1,3 +1,5 @@
+"""策环测试模块：验证导入的点时股票池保留未知状态并拒绝用当前名单回填历史。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 import pandas as pd
 import pytest
 
@@ -5,6 +7,7 @@ from cehuan.data.universe_import import import_historical_universe_csv
 
 
 def test_import_preserves_unknown_state_and_requires_date_specific_source_rows(tmp_path):
+    """验证导入保留未知状态与要求日期特定来源行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     source = tmp_path / "external.csv"
     pd.DataFrame([
         {
@@ -42,6 +45,7 @@ def test_import_preserves_unknown_state_and_requires_date_specific_source_rows(t
 
 
 def test_import_rejects_current_list_backfill_and_duplicate_rows(tmp_path):
+    """验证导入拒绝当前列表回填与重复行。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     source = tmp_path / "external.csv"
     row = {
         "trade_date": "2025-01-02",

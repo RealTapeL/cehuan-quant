@@ -1,3 +1,9 @@
+"""有限股票池日线拉取辅助函数。
+
+该模块顺序调用注入的数据 provider，不负责构造历史点时股票池；任一证券
+请求失败时汇总错误并拒绝返回部分成功数据。
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -14,7 +20,13 @@ def fetch_pool_daily(
     max_symbols: int = 50,
     delay_seconds: float = 0.0,
 ) -> pd.DataFrame:
-    """Fetch a configured finite pool sequentially; fail instead of saving partial data."""
+    """顺序获取配置股票池的指定区间日线。
+
+    ``provider`` 提供 ``fetch_daily``，``universe`` 含证券代码与可选名称；
+    日期为 ISO 字符串，``max_symbols`` 限制池规模，``delay_seconds`` 控制
+    请求间等待。成功返回按日期和代码排序的合并表；任一证券失败、代码无效
+    或超出上限时抛出异常，不输出部分结果文件。
+    """
     if "symbol" not in universe.columns:
         raise ValueError("股票池 CSV 必须包含 symbol 列")
     if universe.empty:

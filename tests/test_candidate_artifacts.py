@@ -1,3 +1,5 @@
+"""策环测试模块：验证候选池清单、哈希和原始运行锚点的证据等级。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import json
@@ -13,12 +15,14 @@ from cehuan.research.candidate_artifacts import (
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     import hashlib
 
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_candidate_inventory_match_is_not_an_original_run_anchor(tmp_path: Path) -> None:
+    """验证候选清单匹配不原始运行锚点。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("signal_date,symbol,rank\n2025-01-01,SH600001,1\n", encoding="utf-8")
     inventory = tmp_path / "artifact-inventory.csv"
@@ -31,6 +35,7 @@ def test_candidate_inventory_match_is_not_an_original_run_anchor(tmp_path: Path)
 
 
 def test_candidate_inventory_duplicate_name_is_ambiguous(tmp_path: Path) -> None:
+    """验证候选清单重复名称有歧义。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("content\n", encoding="utf-8")
     inventory = tmp_path / "artifact-inventory.csv"
@@ -42,6 +47,7 @@ def test_candidate_inventory_duplicate_name_is_ambiguous(tmp_path: Path) -> None
 
 
 def test_candidate_inventory_hash_mismatch_and_not_provided_are_distinct(tmp_path: Path) -> None:
+    """验证候选清单哈希不符与不提供不同。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("content\n", encoding="utf-8")
     inventory = tmp_path / "artifact-inventory.csv"
@@ -51,6 +57,7 @@ def test_candidate_inventory_hash_mismatch_and_not_provided_are_distinct(tmp_pat
 
 
 def test_original_run_manifest_without_runtime_candidate_hash_is_unverified(tmp_path: Path) -> None:
+    """验证原始运行清单缺少运行时候选哈希未。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("content\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
@@ -63,6 +70,7 @@ def test_original_run_manifest_without_runtime_candidate_hash_is_unverified(tmp_
 
 
 def test_matching_original_run_hash_claim_is_still_unverified_without_trusted_parent(tmp_path: Path) -> None:
+    """验证匹配原始运行哈希声明仍然未缺少可信上游。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("content\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
@@ -77,6 +85,7 @@ def test_matching_original_run_hash_claim_is_still_unverified_without_trusted_pa
 
 
 def test_original_run_hash_mismatch_duplicate_and_invalid_manifest_fail(tmp_path: Path) -> None:
+    """验证原始运行哈希不符重复与无效清单失败。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     candidate = tmp_path / "candidate-pool-by-signal.csv"
     candidate.write_text("content\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
@@ -102,6 +111,7 @@ def test_original_run_hash_mismatch_duplicate_and_invalid_manifest_fail(tmp_path
 
 
 def test_candidate_pool_can_be_rebuilt_from_frozen_bars_and_config(tmp_path: Path) -> None:
+    """验证候选股票池可以重建从冻结行情与配置。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     dates = pd.bdate_range("2025-01-02", periods=22).strftime("%Y-%m-%d")
     bars = []
     for symbol, multiplier in (("SH600001", 1.0), ("SZ000001", 1.3)):

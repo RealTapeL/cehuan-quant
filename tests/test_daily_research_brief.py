@@ -1,3 +1,5 @@
+"""策环测试模块：验证每日研究简报的交易日选择、来源时间、哈希和无数据状态。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -25,10 +27,12 @@ SYNTHETIC_INPUT = Path(__file__).resolve().parents[1] / "examples" / "strategy-r
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write_calendar(path: Path) -> None:
+    """私有测试辅助函数，用于写入日历。 参数：`path`：路径场景输入。 返回：None，供调用处构造夹具或断言复用。"""
     frame = pd.DataFrame([
         {"trade_date": "2026-11-20", "is_open": True, "previous_trade_date": "", "source": "synthetic.calendar", "retrieved_at_utc": "2026-11-21T00:00:00Z"},
         {"trade_date": "2026-11-21", "is_open": False, "previous_trade_date": "", "source": "synthetic.calendar", "retrieved_at_utc": "2026-11-21T00:00:00Z"},
@@ -47,6 +51,7 @@ def _write_calendar(path: Path) -> None:
 
 
 def test_latest_completed_session_respects_close_and_excludes_future_calendar_days() -> None:
+    """验证最新完成交易日遵守收盘与排除未来日历日期。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 无显式参数。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     frame = normalize_trading_calendar(pd.DataFrame([
         {"trade_date": "2026-11-20", "is_open": True, "source": "test"},
         {"trade_date": "2026-11-23", "is_open": True, "source": "test"},
@@ -58,6 +63,7 @@ def test_latest_completed_session_respects_close_and_excludes_future_calendar_da
 
 
 def test_incomplete_daily_capture_is_reported_with_hash_and_local_times(tmp_path: Path) -> None:
+    """验证不完整每日采集报告带有哈希与本地时间。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     observation = tmp_path / "observation"
     observation.mkdir()
     (observation / "ranking-status.json").write_text(json.dumps({
@@ -80,6 +86,7 @@ def test_incomplete_daily_capture_is_reported_with_hash_and_local_times(tmp_path
 
 
 def test_synthetic_agent_and_brief_renderer_are_explicitly_stubbed(tmp_path: Path) -> None:
+    """验证合成Agent与简报渲染器明确地使用stub。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     config = load_config()
     payload = json.loads(SYNTHETIC_INPUT.read_text(encoding="utf-8"))
     payload["frozen_strategy"]["config_sha256"] = "a" * 64
@@ -134,6 +141,7 @@ def test_synthetic_agent_and_brief_renderer_are_explicitly_stubbed(tmp_path: Pat
 
 
 def test_missing_fresh_rank_writes_needs_data_without_model_request(tmp_path: Path) -> None:
+    """验证缺失新鲜排序写入需要数据缺少模型请求。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     calendar_path = tmp_path / "calendar" / "trading-calendar.csv"
     _write_calendar(calendar_path)
     now = datetime(2026, 11, 21, 10, 0, tzinfo=SHANGHAI)

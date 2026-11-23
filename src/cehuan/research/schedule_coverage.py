@@ -1,3 +1,5 @@
+"""交易规则与费用日程覆盖审计。模块调用项目规范化适配器，检查指定证券日或交易日的有效期覆盖；覆盖通过只代表输入结构和范围匹配，不代表来源内容已独立核实。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +16,11 @@ def audit_schedule_file(
     *, path: str | Path | None, label: str,
     required_pairs: set[tuple[str, str]], required_dates: set[str],
 ) -> tuple[dict[str, Any], pd.DataFrame | None, list[dict[str, Any]]]:
-    """Validate optional schedule input and report coverage only for the requested scope."""
+    """检查可选规则/费用文件在请求范围内的覆盖情况。
+    参数：path 为日程文件，label 指定 market_rules 或 fee_schedule，required_pairs 为证券-日期集合，required_dates 为费用覆盖日期。
+    返回：审计摘要、规范化日程（如有）和来源文件记录。
+    副作用：只读 CSV 并计算 SHA-256。
+    异常：label 不受支持时抛出 ValueError；文件或规范化问题以 FAILED 状态返回。"""
     if label not in {"market_rules", "fee_schedule"}:
         raise ValueError("label must be market_rules or fee_schedule")
     if path is None:
@@ -64,6 +70,9 @@ def audit_schedule_file(
 
 
 def _effective_rows(schedule: pd.DataFrame, *, symbol: str, day: str) -> list[dict[str, Any]]:
+    """筛选某证券在指定日期有效的规则行。
+    参数：schedule 为规范规则表，symbol 为证券代码，day 为交易日。
+    返回：有效期覆盖该日的规则记录；多行重叠会保留供调用方判定。"""
     date_value = pd.Timestamp(day)
     matches = schedule.loc[
         schedule.symbol.astype(str).eq(symbol)
@@ -74,6 +83,9 @@ def _effective_rows(schedule: pd.DataFrame, *, symbol: str, day: str) -> list[di
 
 
 def _input_record(path: Path, role: str) -> dict[str, Any]:
+    """生成日程输入的路径、角色、哈希和存在状态记录。
+    参数：path 为文件路径，role 为输入用途。
+    返回：审计记录字典；缺失文件的摘要为 None。"""
     if not path.is_file():
         return {"path": str(path.resolve()), "role": role, "sha256": None, "status": "MISSING"}
     digest = hashlib.sha256()

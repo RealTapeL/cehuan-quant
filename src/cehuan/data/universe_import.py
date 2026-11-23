@@ -1,3 +1,9 @@
+"""导入带来源日期证据的历史股票池文件。
+
+要求来源记录日期与成员日期一致；当前证券名单不能回填历史。导入过程保留
+未知状态并写入新的私有快照和哈希清单，不静默删除重复成员。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -24,6 +30,7 @@ REQUIRED_COLUMNS = {
 
 
 def _sha256(path: Path) -> str:
+    """分块计算文件 SHA-256，用于快照清单绑定文件字节。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -32,6 +39,7 @@ def _sha256(path: Path) -> str:
 
 
 def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+    """先写同目录临时 CSV，再原子替换目标文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_csv(temporary, index=False, encoding="utf-8")
@@ -39,6 +47,7 @@ def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
 
 
 def _atomic_json(value: Any, path: Path) -> None:
+    """先写同目录临时 JSON，再原子发布完整清单。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
@@ -50,7 +59,11 @@ def import_historical_universe_csv(
     root: str | Path,
     snapshot_id: str,
 ) -> dict[str, Any]:
-    """Import dated membership evidence without synthesizing history from a current list."""
+    """导入带日期的成员证据，不用当前名单合成历史成员。
+
+    输入文件、字段映射和来源声明决定可导入记录；输出规范成员文件及哈希清单。
+    来源日期、成员状态或代码无法核验时保留未知/阻断，不推断缺失历史。
+    """
     if not re.fullmatch(r"[A-Za-z0-9._-]+", snapshot_id) or ".." in snapshot_id:
         raise ValueError("snapshot_id 只能包含字母、数字、点、下划线和连字符")
     source_file = Path(input_path).expanduser().resolve()

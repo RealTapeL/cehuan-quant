@@ -1,3 +1,5 @@
+"""策环测试模块：验证 10 日与 20 日动量配对排名使用共同候选和同一冻结输入。 测试均应使用受控夹具，不访问真实券商；涉及网络的分支由测试替身隔离。"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -16,10 +18,12 @@ from cehuan.research.lookback_pair import (
 
 
 def _sha(path: Path) -> str:
+    """私有测试辅助函数，用于SHA。 参数：`path`：路径场景输入。 返回：str，供调用处构造夹具或断言复用。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _inputs(tmp_path: Path) -> dict[str, Path]:
+    """私有测试辅助函数，用于输入。 参数：`tmp_path`：pytest 提供的临时目录。 返回：dict[str, Path]，供调用处构造夹具或断言复用。"""
     repo = Path(__file__).resolve().parents[1]
     signal = "2026-12-17"
     dates = pd.bdate_range(end=signal, periods=21).strftime("%Y-%m-%d").tolist()
@@ -110,6 +114,7 @@ def _inputs(tmp_path: Path) -> dict[str, Path]:
 
 
 def _run(inputs: dict[str, Path], output: Path, *, mode: str = "SYNTHETIC") -> dict:
+    """私有测试辅助函数，用于运行。 参数：`inputs`：输入场景输入；`output`：输出场景输入；`mode`：模式场景输入。 返回：dict，供调用处构造夹具或断言复用。"""
     return create_lookback_pair_ranking(
         bars_path=inputs["bars"],
         config_path=inputs["config"],
@@ -127,6 +132,7 @@ def _run(inputs: dict[str, Path], output: Path, *, mode: str = "SYNTHETIC") -> d
 
 
 def _refresh_capture(inputs: dict[str, Path]) -> None:
+    """私有测试辅助函数，用于刷新采集。 参数：`inputs`：输入场景输入。 返回：None，供调用处构造夹具或断言复用。"""
     capture_path = inputs["capture"]
     capture = json.loads(capture_path.read_text(encoding="utf-8"))
     for key, source_key in (
@@ -138,6 +144,7 @@ def _refresh_capture(inputs: dict[str, Path]) -> None:
 
 
 def test_paired_rankings_use_same_candidates_and_only_change_lookback(tmp_path: Path) -> None:
+    """验证配对排名使用相同候选与仅变更回看窗口。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     result = _run(inputs, tmp_path / "pair-run")
     out = Path(result["output_dir"])
@@ -174,6 +181,7 @@ def test_paired_rankings_use_same_candidates_and_only_change_lookback(tmp_path: 
 
 
 def test_known_suspension_is_excluded_from_both_arms_without_shrinking_silently(tmp_path: Path) -> None:
+    """验证已知停牌排除从两组两组缺少缩小静默地。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     bars = pd.read_csv(inputs["bars"])
     date = bars.loc[bars["symbol"].eq(FIXED_SYMBOLS[0]), "trade_date"].iloc[4]
@@ -194,6 +202,7 @@ def test_known_suspension_is_excluded_from_both_arms_without_shrinking_silently(
 
 
 def test_known_nonmember_and_signal_day_st_are_excluded_symmetrically(tmp_path: Path) -> None:
+    """验证已知非成员与信号日ST状态排除对称。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     universe = pd.read_csv(inputs["universe"])
     nonmember = FIXED_SYMBOLS[0]
@@ -218,6 +227,7 @@ def test_known_nonmember_and_signal_day_st_are_excluded_symmetrically(tmp_path: 
 
 
 def test_unknown_status_blocks_whole_signal_and_writes_no_rankings(tmp_path: Path) -> None:
+    """验证未知状态阻断整个信号与写入没有排名。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     bars = pd.read_csv(inputs["bars"])
     target = (bars["symbol"].eq(FIXED_SYMBOLS[0]) & bars["trade_date"].eq("2026-12-17"))
@@ -238,6 +248,7 @@ def test_unknown_status_blocks_whole_signal_and_writes_no_rankings(tmp_path: Pat
 
 
 def test_unknown_membership_blocks_instead_of_treating_as_nonmember(tmp_path: Path) -> None:
+    """验证未知成员资格阻断而非的视为为非成员。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     universe = pd.read_csv(inputs["universe"])
     target = universe["symbol"].eq(FIXED_SYMBOLS[1]) & universe["trade_date"].eq("2026-12-17")
@@ -252,6 +263,7 @@ def test_unknown_membership_blocks_instead_of_treating_as_nonmember(tmp_path: Pa
 
 
 def test_missing_and_duplicate_session_block_the_paired_day(tmp_path: Path) -> None:
+    """验证缺失与重复交易日阻断配对日。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     for case in ("missing", "duplicate"):
         root = tmp_path / case
         root.mkdir()
@@ -273,6 +285,7 @@ def test_missing_and_duplicate_session_block_the_paired_day(tmp_path: Path) -> N
 
 
 def test_invalid_adjusted_price_blocks_instead_of_falling_back_to_raw(tmp_path: Path) -> None:
+    """验证无效复权价格阻断而非的递补回到到原始。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     bars = pd.read_csv(inputs["bars"])
     target = bars["symbol"].eq(FIXED_SYMBOLS[3]) & bars["trade_date"].eq("2026-12-10")
@@ -289,6 +302,7 @@ def test_invalid_adjusted_price_blocks_instead_of_falling_back_to_raw(tmp_path: 
 
 
 def test_identity_event_inside_signal_window_blocks_without_auto_stitching(tmp_path: Path) -> None:
+    """验证身份事件范围内信号窗口阻断缺少自动拼接。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     event = {column: "" for column in IDENTITY_EVENT_COLUMNS}
     event.update({
@@ -315,6 +329,7 @@ def test_identity_event_inside_signal_window_blocks_without_auto_stitching(tmp_p
 
 
 def test_capture_hash_mismatch_is_blocked_and_inputs_are_bound(tmp_path: Path) -> None:
+    """验证采集哈希不符阻断与输入绑定。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     capture = json.loads(inputs["capture"].read_text(encoding="utf-8"))
     capture["input_sha256"]["bars"] = "0" * 64
@@ -329,6 +344,7 @@ def test_capture_hash_mismatch_is_blocked_and_inputs_are_bound(tmp_path: Path) -
 
 
 def test_frozen_momentum_implementation_hash_mismatch_blocks(tmp_path: Path) -> None:
+    """验证冻结动量实现哈希不符阻断。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     implementation = tmp_path / "frozen-strategy.py"
     implementation.write_text("# reviewed implementation v1\n", encoding="utf-8")
@@ -350,6 +366,7 @@ def test_frozen_momentum_implementation_hash_mismatch_blocks(tmp_path: Path) -> 
 
 
 def test_forward_mode_rejects_non_baostock_capture_before_ranking(tmp_path: Path) -> None:
+    """验证前瞻模式拒绝非BaoStock采集之前排名。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     inputs = _inputs(tmp_path)
     result = _run(inputs, tmp_path / "wrong-provider-run", mode="FORWARD_PAPER")
     assert result["manifest"]["status"] == "NEEDS_DATA"

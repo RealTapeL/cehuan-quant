@@ -1,3 +1,9 @@
+"""规范行情与交易日历的数据质量检查。
+
+检查缺失、重复、价格关系、来源混用和状态字段；警告不等于错误，
+``healthy`` 只代表本模块所执行的结构检查通过，不证明供应商历史完整。
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -14,6 +20,13 @@ def check_data_quality(
     large_change_warning: float = 0.50,
     calendar: pd.DataFrame | None = None,
 ) -> dict[str, object]:
+    """检查行情结构、基本价格关系、状态字段和可选日历一致性。
+
+    ``frame`` 为统一行情，``max_age_days`` 可选地检查最新交易日的自然日
+    新鲜度，``large_change_warning`` 是原始收盘价单日变化告警阈值，``calendar``
+    提供明确日历时才核对开市状态。返回行数、错误和警告；不会修复数据，
+    也不会把缺失状态推断为非停牌或无公司行动。
+    """
     data = normalize_bar_frame(frame)
     errors: list[str] = []
     warnings: list[str] = []
@@ -62,6 +75,7 @@ def check_data_quality(
         errors.append(f"OHLC 关系异常 {int(bad_ohlc.sum())} 行")
     if (data["volume_shares"] < 0).any():
         errors.append("存在负成交量")
+    # 这里只用未复权 close 产生异常变动提示，不将其用于策略动量或收益结论。
     raw_return = data.sort_values(["symbol", "trade_date"]).groupby("symbol")["close"].pct_change()
     large_changes = int((raw_return.abs() > large_change_warning).sum())
     if large_changes:

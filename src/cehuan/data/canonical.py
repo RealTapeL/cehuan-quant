@@ -1,3 +1,10 @@
+"""策环行情表的代码、日期、字段和 dtype 规范。
+
+数据适配器在此边界之后应转换成统一列；这里不判断来源可信度或历史状态
+是否完整。行情成交量单位为股、成交额单位为人民币元，缺字段保留为空或
+按必需字段校验失败，不以默认值填补。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -39,10 +46,15 @@ REQUIRED_BAR_COLUMNS = ["trade_date", "symbol", "open", "high", "low", "close", 
 
 
 def canonical_symbol(value: object) -> str:
-    """Normalize common A-share code forms to Qlib-style exchange prefixes."""
+    """将常见 A 股代码格式规范为项目使用的交易所前缀形式。
+
+    ``value`` 可为带交易所后缀、前缀或纯六位代码；返回规范代码。无法唯一识别
+    交易所时不擅自补前缀；指数与股票代码冲突时保留可确认的显式前缀。
+    """
     symbol = str(value).strip().upper().replace(" ", "")
 
     def inferred_exchange(code: str) -> str | None:
+        """按代码前缀推测常见沪深京市场；无法唯一判断时返回空值。"""
         if not code.isdigit() or len(code) != 6:
             return None
         if code.startswith("6"):
@@ -71,10 +83,12 @@ def canonical_symbol(value: object) -> str:
 
 
 def parse_optional_bool(series: pd.Series) -> pd.Series:
+    """把已知布尔写法映射为 nullable boolean，未知写法保留为 NA。"""
     true_values = {True, 1, "1", "true", "True", "TRUE", "是", "Y", "y"}
     false_values = {False, 0, "0", "false", "False", "FALSE", "否", "N", "n"}
 
     def parse(value: object) -> object:
+        """解析单个状态值；不认识的值不猜测为真或假。"""
         if pd.isna(value) or value == "":
             return pd.NA
         if value in true_values:
@@ -87,6 +101,7 @@ def parse_optional_bool(series: pd.Series) -> pd.Series:
 
 
 def _map_categorical_values(series: pd.Series, mapper) -> pd.Series:
+    """对类别列只映射唯一类别，以降低大行情表规范化的内存用量。"""
     categorical = series.astype("category")
     mapped = [mapper(value) for value in categorical.cat.categories]
     if len(set(mapped)) != len(mapped):
@@ -103,6 +118,7 @@ def _map_categorical_values(series: pd.Series, mapper) -> pd.Series:
 
 
 def _parse_categorical_bool(series: pd.Series) -> pd.Series:
+    """按类别码解析布尔状态，未知类别保持 nullable boolean 缺值。"""
     categorical = series.astype("category")
     parsed = [parse_optional_bool(pd.Series([value])).iloc[0] for value in categorical.cat.categories]
     codes = categorical.cat.codes.to_numpy(copy=True)
@@ -118,6 +134,7 @@ def _parse_categorical_bool(series: pd.Series) -> pd.Series:
 
 
 def _parse_categorical_date(series: pd.Series) -> pd.Series:
+    """按类别码解析日期并重建有序日期类别，坏值映射为缺值码。"""
     categorical = series.astype("category")
     parsed = pd.to_datetime(pd.Series(categorical.cat.categories), errors="coerce").dt.date.tolist()
     categories = sorted({value for value in parsed if value is not pd.NaT and not pd.isna(value)})
@@ -141,7 +158,11 @@ def normalize_bar_frame(
     compact: bool = False,
     assume_sorted: bool = False,
 ) -> pd.DataFrame:
-    """Normalize project CSV data to the canonical schema and safe dtypes."""
+    """将行情数据规范为统一列、代码、日期和安全 dtype。
+
+    参数控制是否复制、内存紧凑化及是否信任输入排序；返回规范行情表。必需字段、
+    无效日期或不合法价格不会被默认值掩盖，具体校验失败时抛出异常。
+    """
     data = frame.copy() if copy_frame else frame
     data.columns = [str(column).strip() for column in data.columns]
     if "date" in data.columns and "trade_date" not in data.columns:
@@ -196,6 +217,11 @@ def normalize_bar_frame(
 
 
 def read_bars(path: str | Path, *, compact: bool = False) -> pd.DataFrame:
+    """从 CSV 读取行情并规范列名、代码、单位字段及日期类型。
+
+    ``compact=False`` 采用易操作的常规 dtype；为批量历史数据启用
+    ``compact=True`` 时使用类别列节省内存。文件 I/O 或必需字段错误会抛出。
+    """
     if not compact:
         return normalize_bar_frame(pd.read_csv(path))
     dtype: dict[str, object] = {
@@ -212,6 +238,11 @@ def read_bars(path: str | Path, *, compact: bool = False) -> pd.DataFrame:
 
 
 def write_bars(frame: pd.DataFrame, path: str | Path) -> Path:
+    """将行情按规范列顺序写入 CSV 并返回目标路径。
+
+    输入先经 ``normalize_bar_frame`` 处理；函数会创建父目录并写文件，
+    不负责为结果附加来源证明或 SHA-256 清单。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     normalize_bar_frame(frame).to_csv(target, index=False, date_format="%Y-%m-%d")

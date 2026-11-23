@@ -1,4 +1,4 @@
-"""Create a hash-bound daily report and optional one-shot LLM review of a paper ranking."""
+"""纸面排名复盘入口。模块从已封存的排名、窗口审计和抓取清单重建程序事实，可将最小事实集交给模型解释并验证；不重抓行情、不做收益回测、不生成订单。"""
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ ACTION_PATTERN = re.compile(
 
 
 def _canonical_source_symbol(value: object) -> str:
+    """规范供应商来源中的证券代码。参数：value 为来源字段。返回：项目规范代码；无法映射时返回空值或由规范化器报错。"""
     raw = str(value).strip().upper()
     prefixed = re.fullmatch(r"(SH|SZ|BJ)\.(\d{6})", raw)
     if prefixed:
@@ -60,24 +61,28 @@ POSITIVE_PERFORMANCE_PATTERN = re.compile(
 
 
 class PaperReviewValidationError(ValueError):
-    """A safe local validation error; never contains raw model response text."""
+    """可安全归档的本地模型复盘校验异常。只包含错误类别和字段位置，不携带完整模型输出。"""
 
     def __init__(self, code: str, field: str):
+        """创建安全校验异常。参数：code 为错误类别，field 为问题字段路径。返回：异常对象；消息不包含模型原文。"""
         self.code = code
         self.field = field
         super().__init__(f"{code}:{field}")
 
 
 def _repo_path(path: str | Path) -> Path:
+    """解析项目内相对路径或绝对路径。参数：path 为输入路径。返回：解析后的绝对 Path。"""
     value = Path(path).expanduser()
     return (value if value.is_absolute() else REPO_ROOT / value).resolve()
 
 
 def _write_json(value: Any, path: Path) -> None:
+    """将 JSON 对象写入输出文件。参数：value 为可序列化值，path 为文件路径。副作用：写入指定运行目录。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
+    """读取并解析 JSON 文件。参数：path 为文件，label 用于错误消息。返回：JSON 对象。异常：读取或解析失败时抛出可定位错误。"""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -88,6 +93,7 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def _verify_file(path: Path, expected: str, label: str) -> str:
+    """验证文件存在和登记 SHA-256。参数：path 为文件，expected 为摘要，label 为输入角色。返回：匹配时 None。异常：缺失或不匹配时拒绝复盘。"""
     if not path.is_file():
         raise ValueError(f"{label} 文件不存在")
     actual = sha256_file(path)
@@ -97,6 +103,7 @@ def _verify_file(path: Path, expected: str, label: str) -> str:
 
 
 def _to_local(utc_value: str | None) -> str | None:
+    """将 UTC 时间文本转换为上海时间显示。参数：utc_value 为可选时间字符串。返回：本地时间文本或 UNKNOWN；时区缺失/格式错误按函数实现处理。"""
     if not utc_value:
         return None
     value = datetime.fromisoformat(utc_value.replace("Z", "+00:00"))
@@ -106,7 +113,7 @@ def _to_local(utc_value: str | None) -> str | None:
 
 
 def _selection_rule_for_report(rule: str) -> str:
-    """Render the frozen code-based selection rule in Chinese when it matches the known contract."""
+    """把登记的选择规则映射为可读中文说明。参数：rule 为规则标识。返回：已知契约的中文描述；未知标识仍以原文显示，不猜规则。"""
     normalized = " ".join(rule.casefold().split())
     if all(token in normalized for token in ("for each of sh and sz", "ascending", "select first five", "do not use prices")):
         return "在本次抓取名单中，沪市（SH）和深市（SZ）分别按六位证券代码升序，各取前 5 只；不按价格、收益、动量、名称或策略排名挑选"
@@ -114,6 +121,7 @@ def _selection_rule_for_report(rule: str) -> str:
 
 
 def _csv(path: Path, label: str) -> pd.DataFrame:
+    """读取并检查 CSV 文件。参数：path 为输入文件，label 为用途。返回：DataFrame；文件缺失或解析失败时抛出校验错误。"""
     if not path.is_file():
         raise ValueError(f"{label} 文件不存在")
     try:
@@ -123,6 +131,7 @@ def _csv(path: Path, label: str) -> pd.DataFrame:
 
 
 def _check_rank_frame(frame: pd.DataFrame, label: str, *, allow_empty: bool = False) -> pd.DataFrame:
+    """检查排名表的字段、证券及名次结构。参数：frame 为排名表，label 用于错误定位，allow_empty 控制是否允许空表。返回：校验通过的表或 None。异常：重复、字段缺失或不允许的空表时拒绝。"""
     needed = {"signal_date", "symbol", "momentum", "rank", "selected_target"}
     if not needed.issubset(frame.columns):
         raise ValueError(f"{label} 缺少必要字段")
@@ -149,7 +158,7 @@ def _check_rank_frame(frame: pd.DataFrame, label: str, *, allow_empty: bool = Fa
 def build_paper_ranking_facts(
     *, ranking_dir: str | Path, capture_manifest_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Rebuild facts from a sealed paper-ranking directory without rerunning its ranking."""
+    """从封存纸面排名目录重建可核查程序事实，不重新运行排名。参数：ranking_dir 为排名归档，capture_manifest_path 可绑定来源抓取清单。返回：排名、窗口、来源、限制和证据目录。副作用：只读输入并计算哈希。异常：文件哈希、结构或跨文件事实不一致时拒绝。"""
     run_dir = _repo_path(ranking_dir)
     manifest_path = run_dir / "paper-ranking-manifest.json"
     manifest = _read_json(manifest_path, "排名运行清单")
@@ -313,6 +322,7 @@ def build_paper_ranking_facts(
     if not report_created_after_run or "research-report.md" in (manifest.get("files") or {}):
         raise ValueError("research-report.md 未能证明是在排名封存后另行生成")
     def _ranking_rows(frame: pd.DataFrame, limit: int = 5) -> list[dict[str, Any]]:
+        """将排名 CSV 行变为 JSON 安全的程序事实列表。参数：frame 为规范排名 DataFrame。返回：名次、证券和动量记录列表。"""
         return [{
             "rank": int(row["rank"]),
             "symbol": str(row["symbol"]),
@@ -540,6 +550,7 @@ def build_paper_ranking_facts(
 
 
 def build_review_prompt(model_input: Mapping[str, Any]) -> str:
+    """将白名单程序事实编入模型复盘提示。参数：model_input 为已脱敏事实包。返回：要求具体解释排名差异、引用证据并承认限制的中文提示。"""
     ranking = model_input["ranking"]
     window = model_input["window_gate"]
     no_exclusion_instruction = (
@@ -586,6 +597,7 @@ JSON 必须恰好包含这些字段：schema, review_status, signal_date, origin
 
 
 def validate_model_review(content: str, facts: Mapping[str, Any]) -> dict[str, Any]:
+    """解析并校验纸面排名复盘。参数：content 为模型 JSON 文本，facts 为程序重建事实。返回：通过验证的字典。异常：JSON/schema、排名事实、引用、边界或模板回声不符时抛 PaperReviewValidationError。"""
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -711,6 +723,7 @@ def validate_model_review(content: str, facts: Mapping[str, Any]) -> dict[str, A
 
 
 def _report_markdown(facts: Mapping[str, Any], review: Mapping[str, Any] | None, status: str, audit: Mapping[str, Any]) -> str:
+    """生成纸面排名与模型复盘报告。参数：facts 为程序事实，review 为可选模型输出，status 和 audit 描述调用状态。返回：中文 Markdown；缺少模型解释时仍保留程序排名和失败原因。"""
     ranking = facts["ranking"]
     generated = facts["ranking_generated_at_local"]
     review_date = str(audit["review_started_at_local"])[:10]
@@ -817,6 +830,7 @@ def run_paper_ranking_review(
     *, ranking_dir: str | Path, capture_manifest_path: str | Path | None = None,
     output_root: str | Path = "outputs/paper-ranking-reviews", agent_config_path: str | Path | None = None,
 ) -> Path:
+    """从已有排名目录构造事实、显式进行一次 LLM 复盘并写入唯一目录。参数：ranking_dir 为已封存排名，capture_manifest_path 为可选抓取清单，output_root 为运行目录，agent_config_path 为模型配置。返回：新运行目录。副作用：可能产生一次模型调用费用并写事实/提示/审计/报告。模型缺配置或输出不合规时不回退 Stub；不连接券商。"""
     facts = build_paper_ranking_facts(ranking_dir=ranking_dir, capture_manifest_path=capture_manifest_path)
     now = datetime.now(SHANGHAI)
     run_id = f"paper-review-{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"

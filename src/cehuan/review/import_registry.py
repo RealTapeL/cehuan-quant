@@ -1,4 +1,4 @@
-"""Idempotency ledger for imported fill CSV files."""
+"""成交导入幂等登记簿。模块使用文件 SHA-256、跨进程锁和原子替换阻止完全相同导出被重复登记；不同文件可能包含重叠成交，仍需单独人工/规则审查。"""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ from typing import Iterator
 
 
 class DuplicateFillImportError(ValueError):
-    """Raised when the exact same fill export is imported into a registry twice."""
+    """成交导入登记中已存在相同源文件摘要时抛出的重复导入异常。它只识别整文件完全相同，不代表能识别不同导出间的重叠行。"""
 
 
 def find_fill_import_record(
     fills_csv: str | Path,
     registry_path: str | Path,
 ) -> dict[str, object] | None:
-    """Return the existing row for an exact source hash under the registry lock."""
+    """按成交文件 SHA-256 查找已存在的导入登记。参数：fills_csv 为成交文件，registry_path 为登记簿。返回：匹配记录或 None。副作用：只读文件并持有排他锁；文件缺失/schema 错误时阻断。"""
     source = Path(fills_csv).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     if not source.is_file():
@@ -41,6 +41,7 @@ def find_fill_import_record(
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
+    """在指定锁文件上取得跨进程排他锁。参数：path 为锁文件。返回：上下文管理器。副作用：创建锁文件并在上下文期间锁定；异常退出仍释放锁。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -51,6 +52,7 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
 
 
 def _atomic_write(path: Path, payload: str) -> None:
+    """用同目录临时文件与原子替换更新登记簿。参数：path 为目标，payload 为完整文本。副作用：写临时文件、fsync 并替换；失败时尝试清理临时文件并重新抛出异常。"""
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
@@ -74,14 +76,7 @@ def register_fill_import(
     cycle_run_id: str | None = None,
     output_manifest_path: str | Path | None = None,
 ) -> dict[str, object]:
-    """Record one source file hash, rejecting an exact replay before double count.
-
-    The registry is local state. Its lock and atomic replacement make concurrent
-    imports serialize on macOS/Linux; each successful import remains auditable.
-    When supplied, the completed review manifest must already bind the same fill
-    hash and import ID; the registry then stores that manifest path and hash.
-    Changed exports naturally receive a different hash and can be imported.
-    """
+    """将一次人工成交复盘与来源文件摘要登记，拒绝同一文件重复计入。参数：fills_csv 为导出，registry_path 为本地登记簿，row_count 为行数，cycle_run_id 可关联研究周期，output_manifest_path 可绑定已完成复盘。返回：导入回执。副作用：在锁内原子更新本地登记簿。异常：重复摘要、复盘产物不完整或绑定哈希不一致时阻断。"""
     source = Path(fills_csv).expanduser().resolve()
     registry = Path(registry_path).expanduser().resolve()
     if not source.is_file():

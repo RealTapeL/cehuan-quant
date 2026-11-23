@@ -1,8 +1,4 @@
-"""Conservative cross-file fill overlap classification.
-
-This module works on explicitly normalized CSV columns. It does not assume a
-broker-specific execution-id column and never drops or merges rows.
-"""
+"""跨文件成交重叠审查原型。它仅分类记录并保留原始文件/行号，不删除、不合并、不写入账户账本；没有可靠成交编号时相同字段只标疑似重复。"""
 
 from __future__ import annotations
 
@@ -25,6 +21,7 @@ OUTPUT_COLUMNS = (
 
 
 def _decimal_text(value: str, field: str, *, positive: bool = True) -> str:
+    """将十进制字段解析并规范为稳定文本。参数：value 为原始字符串，field 为错误定位，positive 控制是否必须为正。返回：规范十进制文本。异常：格式错误、非有限或非正数时抛 ValueError。"""
     try:
         parsed = Decimal(value.strip())
     except (InvalidOperation, ValueError) as exc:
@@ -41,6 +38,7 @@ def _load_export(
     correction_link_column: str | None,
     status_column: str | None,
 ) -> list[dict[str, str | int]]:
+    """读取并规范一份成交导出，同时绑定文件哈希和原始行号。参数：path 为 CSV，execution_id_column/correction_link_column/status_column 为用户明确指定的可选列名。返回：规范成交记录列表。异常：核心列、指定列、日期、方向或股数不合法时拒绝；不猜券商编号格式。"""
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"成交导出文件不存在：{source}")
@@ -104,13 +102,7 @@ def audit_cross_file_fills(
     correction_link_column: str | None = None,
     status_column: str | None = None,
 ) -> pd.DataFrame:
-    """Classify current rows against prior exports without merging or dropping.
-
-    The normalized columns `trade_date,symbol,side,quantity,price` are required.
-    A stable execution identifier is used only when the caller names its column
-    explicitly. Without one, matching trade details are only
-    `POSSIBLE_DUPLICATE` and must be reviewed by a person.
-    """
+    """将当前导出逐行与一个或多个旧导出分类比较。参数：previous_files 为历史文件序列，current_file 为本次文件，可选字段名只有经用户指定才使用。返回：每行 NEW/EXACT_DUPLICATE/CONFLICT/POSSIBLE_DUPLICATE/CORRECTION_OR_REVERSAL 及来源证据。副作用：只读文件。异常：字段或记录格式无效时阻断；不会自动合并或改写账户盈亏。"""
     prior_rows: list[dict[str, str | int]] = []
     for path in previous_files:
         prior_rows.extend(_load_export(
@@ -127,6 +119,7 @@ def audit_cross_file_fills(
     )
 
     def signature(item: dict[str, str | int]) -> tuple[str, ...]:
+        """构造用于疑似重复比较的成交字段签名。参数：item 为规范记录。返回：日期、代码、方向、股数、价格和成交时间元组；字段相同不证明是同一笔成交。"""
         return tuple(str(item[key]) for key in (*CORE_COLUMNS, "trade_time"))
 
     prior_by_id: dict[str, list[dict[str, str | int]]] = {}
