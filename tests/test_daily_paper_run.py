@@ -145,12 +145,15 @@ def test_daily_paper_workflow_synthetic_capture_rank_and_brief(tmp_path: Path, m
     capture = json.loads((run_dir / "capture-manifest.json").read_text(encoding="utf-8"))
     ranking_manifest = json.loads((run_dir / "ranking" / "paper-ranking-manifest.json").read_text(encoding="utf-8"))
     brief_manifest = json.loads((Path(manifest["brief_path"]).parent / "brief-manifest.json").read_text(encoding="utf-8"))
+    report_text = (run_dir / "daily-run-report.md").read_text(encoding="utf-8")
 
     assert factory_arguments[0]["max_retries"] == 0
     assert manifest["status"] == "COMPLETED_DAILY_PAPER_BRIEF"
     assert manifest["rankings_generated"] is True
     assert manifest["model_calls"] == 1
     assert manifest["llm_request_count"] == 0
+    assert "研究 Agent 调用数（含 Stub）：`1`" in report_text
+    assert "LLM 请求数：`0`" in report_text
     assert manifest["returns_computed"] is False
     assert manifest["orders_generated"] is False
     assert manifest["broker_connected"] is False

@@ -905,7 +905,8 @@ def _write_daily_run_report(run_dir: Path, manifest: dict[str, Any]) -> None:
         f"- 固定 10 只流程试运行池：`{', '.join(manifest.get('research_pool', {}).get('symbols', []))}`",
         f"- 21 开市日窗口：`{len(manifest.get('required_sessions', []))}` 日",
         f"- 研究排名已生成：`{manifest.get('rankings_generated', False)}`",
-        f"- LLM 请求数：`{manifest.get('model_calls', 0)}`",
+        f"- 研究 Agent 调用数（含 Stub）：`{manifest.get('model_calls', 0)}`",
+        f"- LLM 请求数：`{manifest.get('llm_request_count', 0)}`",
         "- 收益计算：否；订单/可执行股数：否；券商连接：否；正式基线：`NOT_READY`。", "",
         "## 数据门控与限制", "",
     ]
