@@ -183,6 +183,57 @@ def test_incomplete_member_response_blocks_ranking_and_model(tmp_path: Path, mon
     assert not list((tmp_path / "outputs" / "daily-briefs").glob("*/brief-manifest.json"))
 
 
+def test_empty_history_responses_are_sealed_as_needs_data(tmp_path: Path, monkeypatch) -> None:
+    """验证所有行情响应为空时正常封存 NEEDS_DATA，且不进入排名或模型。"""
+    monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)
+    pool, config, identity = _inputs(tmp_path / "inputs")
+    dates = pd.bdate_range(end=SIGNAL_DATE, periods=21).strftime("%Y-%m-%d").tolist()
+
+    class EmptyHistoryBaoStock(_SyntheticBaoStock):
+        """只返回带正确字段名的空行情响应，不模拟真实价格。"""
+
+        def history(
+            self, symbol: str, start_date: str, end_date: str, adjustflag: str, fields: str,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(columns=fields.split(","))
+
+    start = datetime(2026, 11, 20, 16, 0, tzinfo=SHANGHAI)
+    run_dir = daily_paper_run.run_daily_paper_workflow(
+        output_root=tmp_path / "data" / "private" / "daily-paper-runs",
+        pool_path=pool,
+        config_path=config,
+        identity_events_path=identity,
+        brief_output_root=tmp_path / "outputs" / "daily-briefs",
+        model_mode="llm",
+        now=start,
+        clock_fn=_clock(start),
+        session_factory=lambda **kwargs: EmptyHistoryBaoStock(dates=dates, **kwargs),
+    )
+
+    manifest_path = run_dir / "daily-run-manifest.json"
+    capture_path = run_dir / "capture-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    capture_seal = json.loads((run_dir / "capture-manifest.seal.json").read_text(encoding="utf-8"))
+    response_paths = [run_dir / item["path"] for item in capture["raw_responses"]]
+
+    assert manifest["status"] == capture["status"] == capture["capture_manifest_status"] == "NEEDS_DATA"
+    assert manifest["finished_at_utc"] == capture["finished_at_utc"]
+    assert any("未形成任何有效规范行情" in item for item in manifest["blocking_reasons"])
+    assert any(item["status"] == "FAILED_VALIDATION" for item in capture["requests"].values())
+    assert capture_seal["capture_manifest_sha256"] == daily_paper_run._sha(capture_path)
+    assert capture["raw_response_sha256"] == {
+        item["path"]: item["sha256"] for item in capture["raw_responses"]
+    }
+    assert all(path.is_file() for path in response_paths)
+    assert all(daily_paper_run._sha(path) == capture["raw_response_sha256"][str(path.relative_to(run_dir))] for path in response_paths)
+    assert not (run_dir / "bars.csv").exists()
+    assert not (run_dir / "ranking" / "paper-ranking-manifest.json").exists()
+    assert manifest["rankings_generated"] is False
+    assert manifest["model_calls"] == 0
+    assert not list((tmp_path / "outputs" / "daily-briefs").glob("*/brief-manifest.json"))
+
+
 def test_before_close_is_needs_data_without_provider_or_model_request(tmp_path: Path, monkeypatch) -> None:
     """验证之前收盘需要数据缺少供应商或模型请求。本用例通过断言确认该边界；失败时由 pytest 报告具体断言位置。 参数：`tmp_path`：pytest 提供的临时目录；`monkeypatch`：pytest 提供的环境/属性替换工具。无业务返回值；涉及文件写入时限定在测试夹具目录。"""
     monkeypatch.setattr(daily_paper_run, "REPO_ROOT", tmp_path)

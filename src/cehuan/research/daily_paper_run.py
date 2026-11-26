@@ -377,8 +377,8 @@ def run_daily_paper_workflow(
             manifest=manifest,
         )
         signal_status.to_csv(status_path, index=False, lineterminator="\n")
-    if bars is not None:
-        write_bars(normalize_bar_frame(bars), bars_path)
+    if bars is not None and not bars.empty:
+        write_bars(bars, bars_path)
     status_frame = pd.read_csv(status_path, dtype=str, keep_default_na=False) if status_path.is_file() else pd.DataFrame()
     manifest["status_requests"] = _signal_status_requests(
         pool_symbols, signal_day.isoformat(), manifest, status_frame,
@@ -693,7 +693,12 @@ def _build_daily_frames(
             })
 
     universe = pd.DataFrame(universe_rows)
-    bar_frame = normalize_bar_frame(pd.concat(bars, ignore_index=True)) if bars else pd.DataFrame()
+    if bars:
+        bar_frame = normalize_bar_frame(pd.concat(bars, ignore_index=True))
+    else:
+        # 无任何证券通过行情窗口校验时保留“无行情”状态；不能用空表补字段伪造可排名输入。
+        bar_frame = pd.DataFrame()
+        reasons.append("未形成任何有效规范行情；所有证券行情缺失或未通过窗口校验")
     return universe, bar_frame, sorted(set(reasons))
 
 
